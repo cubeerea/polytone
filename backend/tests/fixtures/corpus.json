@@ -1,0 +1,23 @@
+{
+  "_comment": "Hand-written human-style messages for two personas of one user. Boss: sentence case, fuller sentences, em-dashes, colons, few emoji, 'Quick update' openers. Friend: lowercase, short Slack-style lines, emoji, '!!', ellipses, 'honestly'/'anyway'. Some include quoted replies / signatures that must be stripped.",
+  "Boss": [
+    "Quick update on the Q3 launch: we're on track for the 14th. The only open risk is the billing migration — I'll have a clearer read by Thursday.",
+    "Hi Dana,\n\nQuick update on hiring: we closed the backend role and the offer was accepted. I'd like to start interviews for the designer role next week, if that works for you.\n\nBest,\nSam\n\nOn Mon, Oct 12, 2026 at 9:14 AM Dana Ruiz <dana@acme.com> wrote:\n> Can you send me a hiring status before the offsite?\n> Thanks, D",
+    "Thanks for the feedback on the roadmap. I agree the analytics work should move up — I'll rework the plan and share a revised version by Friday.",
+    "Quick update on the outage: root cause was an expired certificate on the API gateway. We've rotated it, added an alert 30 days before expiry, and I'll write up the postmortem today.\n\n--\nSam Lee\nEngineering Manager, Acme Corp.",
+    "Here's where we landed on the vendor decision:\n- We're going with Northwind for the data pipeline.\n- Contract is $48k/yr, about 20% under the alternative.\n- Legal review starts Monday.\nLet me know if you want to discuss before I sign.",
+    "I'd recommend we hold the pricing change until January. Churn is already elevated this quarter, and a price increase on top of that is a risk I don't think we need to take.",
+    "Happy to take the lead on the customer advisory board. I'll draft an agenda and a shortlist of accounts, and we can review it in our 1:1 on Wednesday.\n\nSent from my iPhone",
+    "Quick update on the migration: about 80% of tenants are moved, and the remaining ones are scheduled for this weekend. No customer impact so far — I'll confirm once we're done."
+  ],
+  "Friend": [
+    "omg yes!! i'm so down for tacos tonight 🌮\nwhat time works for u",
+    "honestly i'm wiped... work was a lot today lol\nmaybe tmrw instead?",
+    "haha that video is amazing 😂 sending it to the group chat rn",
+    "ok so i finally finished the puzzle!! took like 3 weeks but it's on the wall now",
+    "anyway i'm around all weekend if u wanna hang\nno pressure tho 🙂",
+    "lol no way. did he actually say that??",
+    "honestly the new album is growing on me... first listen was meh but now i can't stop",
+    "yesss congrats on the new job!! so proud of u 🎉 drinks on me this friday"
+  ]
+}

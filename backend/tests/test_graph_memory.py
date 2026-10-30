@@ -32,7 +32,7 @@ def test_write_and_constraints():
     assert "honestly" in c["top_openers"] and "so" in c["top_transitions"]
     assert "deck" in c["lexicon"] and "the" not in c["lexicon"]
     assert all(len(b) == 3 for b in c["top_bigrams"])
-    assert abs(sum(x["weight"] for x in c["structures"]) - 1.0) < 0.01
+    assert abs(sum(x["weight"] for x in c["structures"]) - 1.0) < 0.01  # all structures fit in top-k
 
 
 def test_persona_scoping_and_fallback():
@@ -42,7 +42,8 @@ def test_persona_scoping_and_fallback():
     inv, fr = s.get_constraints("Investor"), s.get_constraints("Friend")
     assert inv["sample_count"] == 1 and fr["sample_count"] == 1
     assert "growth" in inv["lexicon"] and "growth" not in fr["lexicon"]
-    assert inv["casing"] == "sentence" and fr["casing"] == "lower"
+    # 1 sample each → alpha = 0.25: cadence is shrunk towards the overall style, but still differs
+    assert fr["casing"] == "lower" and inv["casing"] != "lower"
     # a persona with no data falls back to all personas
     boss = s.get_constraints("Boss")
     assert boss["sample_count"] == 2 and "growth" in boss["lexicon"]

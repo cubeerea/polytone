@@ -82,7 +82,7 @@ def test_firewall_rejects_resubmitted_draft(client, runtime):
     r = client.post("/ingest/manual", json={"text": draft["text"]}).json()
     assert r["accepted"] == 0 and r["rejected"] == 1 and "draft" in r["reasons"][0]
     r = client.post("/ingest/manual", json={"text": draft["text"] + " thanks"}).json()
-    assert r["rejected"] == 1 and "near-duplicate" in r["reasons"][0]
+    assert r["rejected"] == 1 and "draft" in r["reasons"][0]
     assert dict(runtime.store.words) == words_before
     assert client.get("/stats").json()["samples"] == 1
 
@@ -99,13 +99,15 @@ def test_sources_list_and_run(client, monkeypatch):
 
     fake = types.ModuleType("backend.mcp_servers.wispr")
     fake.collect = lambda settings: [
-        {"text": "yo i'm on it. back in five.", "provenance": {"generated": False}},
-        {"text": "AI wrote this", "provenance": {"generated": True}},
-        "plain string item works too.",
+        {"text": "yo i'm on it. back in five.", "provenance": {"generated": False, "raw_transcript": True}},
+        {"text": "AI wrote this one", "provenance": {"generated": True, "raw_transcript": True}},
+        {"text": "raw dictation works too.", "provenance": {"text_kind": "raw"}},
+        "a bare string has no raw-transcript provenance.",
     ]
     monkeypatch.setitem(sys.modules, "backend.mcp_servers.wispr", fake)
     r = client.post("/ingest/sources/wispr/run").json()
-    assert r["accepted"] == 2 and r["rejected"] == 1 and r["reasons"] == ["flagged as generated"]
+    assert r["accepted"] == 2 and r["rejected"] == 2
+    assert r["reasons"][0] == "flagged as generated" and "raw transcript" in r["reasons"][1]
     w = {s["name"]: s for s in client.get("/ingest/sources").json()}["wispr"]
     assert w["enabled"] is True and w["items_ingested"] == 2 and w["last_run"]
 

@@ -29,13 +29,18 @@ Every component builds against this file. Change it only with the orchestrator's
 4. Rust inject: put draft on clipboard, send Cmd+V (field text is still selected, so it is replaced),
    then restore the original clipboard after ~300ms. Fallback `inject_mode=type` types chars via enigo.
 5. End-to-end budget: 5s. Rust HTTP timeout 8s → notification "Polytone timed out".
+6. `/generate` errors → Rust shows a notification and injects NOTHING (field text untouched):
+   `502 {"error":"llm_failed","detail":str}` (LLM error, empty completion, or `POLYTONE_LLM=anthropic`
+   without a key) · `504 {"error":"llm_timeout","detail":str}` (LLM timed out) · `422` (empty intent).
+   The backend never substitutes mock text for a failed real LLM call; the mock LLM is used only when
+   `settings.llm_backend == "mock"`. Failed generations record no draft.
 
 ## HTTP API (JSON, all on 127.0.0.1:8765, CORS allows tauri://localhost + http://localhost:1420)
 
 | Method | Path | Request | Response |
 |---|---|---|---|
 | GET | `/health` | – | `{"status":"ok","neo4j":bool,"llm":"anthropic"\|"mock","embeddings":"qwen"\|"none","graph_store":"neo4j"\|"memory"}` |
-| POST | `/generate` | `{"intent":str,"persona":str\|null,"app_context":str\|null}` | `{"draft_id":str,"text":str,"persona":str,"latency_ms":int,"constraints":Constraints}` |
+| POST | `/generate` | `{"intent":str,"persona":str\|null,"app_context":str\|null}` | `{"draft_id":str,"text":str,"persona":str,"latency_ms":int,"constraints":Constraints}`; errors `502/504 {"error":"llm_failed"\|"llm_timeout","detail":str}` |
 | POST | `/ingest/manual` | `{"text":str,"persona":str\|null}` | `IngestResult` |
 | GET | `/ingest/sources` | – | `[{"name":"manual"\|"gmail"\|"wispr"\|"watcher","enabled":bool,"status":str,"last_run":iso\|null,"items_ingested":int}]` |
 | POST | `/ingest/sources/{name}/run` | – | `IngestResult` |
@@ -48,9 +53,17 @@ Every component builds against this file. Change it only with the orchestrator's
 
 `Constraints` = `{"avg_sentence_len":float,"sentence_len_p90":float,"top_openers":[str],"top_transitions":[str],"top_bigrams":[[str,str,float]],"punctuation_rates":{str:float},"structures":[{"signature":str,"weight":float}],"lexicon":[str],"casing":"lower"|"sentence"|"mixed","contractions_rate":float,"sample_count":int}`
 
+Constraints semantics (`graph/constraints.py`): persona stats are blended with all-persona stats,
+`alpha = n_p/(n_p+3)` (0 samples → pure global and `sample_count` = global count; else `sample_count` = persona's).
+Scalars and cadence lists (openers, transitions, structures, punctuation) blend; once a persona has ≥3 samples,
+marks/items it never used are dropped. `lexicon`/`top_bigrams` are persona-only (lexicon = distinctive,
+non-generic words). `structures[].weight` = blended share of sentences. `top_openers` may hold 2–3 word
+phrases ("quick update on"). `punctuation_rates` keys: `, . ; : ( " ! ? !! — … emoji` (`!`/`?` per run).
+Signature format `LEN|<n>c|<skeleton>|<opener>|<end>`, e.g. `M|2c|,—|conj|.` (see `ingestion/extract.py`).
+
 `IngestResult` = `{"accepted":int,"rejected":int,"reasons":[str],"sentences":int,"words_merged":int}`
 
-`ScoreBreakdown` = `{"score":float /*0-100, 100 = identical style*/,"distance":float /*0-1*/,"components":{"sentence_length":float,"punctuation":float,"lexical":float,"function_words":float,"embedding":float|null}}`
+`ScoreBreakdown` = `{"score":float /*0-100, 100 = identical style*/,"distance":float /*0-1*/,"components":{"sentence_length":float,"punctuation":float,"lexical":float,"function_words":float,"embedding":float|null},"confidence":"low"|"medium"|"high" /*additive: trust in the number given baseline size + draft length*/}`
 
 ## Python module boundaries (backend/)
 
@@ -58,15 +71,26 @@ Every component builds against this file. Change it only with the orchestrator's
 - `storage/db.py` — SQLite (`data/polytone.sqlite3`): tables `config`, `drafts`, `samples` (ingested human text + provenance + sha256), `ingest_runs`. Functions documented in that file.
 - `graph/store.py` — `GraphStore` protocol + `Neo4jGraphStore` + `InMemoryGraphStore` (tests). Cypher templates live in `graph/queries.py`.
 - `ingestion/extract.py` — `extract(text) -> Extraction` (pure python, deterministic, no network). Triplets: Word FOLLOWED_BY Word (weight), Word PART_OF_STRUCTURE SentenceStructure, SentenceStructure USED_IN IntentContext, PunctuationMark nodes.
-- `ingestion/firewall.py` — `HumanText` provenance gate. Rejects: empty, text whose sha256 or near-duplicate (shingle Jaccard ≥ 0.8) matches any stored draft, inbound mail, text flagged `generated=True`. **Generated drafts never reach the graph.**
-- `langgraph/ingest_graph.py` — LangGraph: `validate → firewall → extract → write_graph → record`.
+- `ingestion/firewall.py` — `HumanText` provenance gate; every rejection returns a reason string. Rejects: empty,
+  `generated=True`/`origin="polytone"`, inbound mail, per-source provenance failures, < 3 words / < 10 chars,
+  duplicate samples (sha256), and anything draft-like: sha256 match, a draft (≥4 tokens) contained in the text or the
+  text contained in a draft, shingle Jaccard ≥ 0.8, or ≥ 80% of a draft's shingles inside the text.
+  **Generated drafts never reach the graph.** Required source provenance:
+  gmail → `from_me=True` or `label`/`labels` containing `SENT` (`from_me=False` always rejects);
+  watcher → `.mbox` items (`kind`/`format`="mbox" or `file`/`path` *.mbox) need `from_me=True`;
+  wispr → `raw_transcript=True` (or `text_kind="raw"`); `formatted`/`edited`/`ai_edited`/`polished` = reject.
+- `langgraph/ingest_graph.py` — LangGraph: `validate → firewall → extract → write_graph → record`. `validate` strips
+  quoted reply chains and signatures (`ingestion/text.clean_message`); the cleaned text is what is checked, learned, stored.
 - `langgraph/generate_graph.py` — LangGraph: `capture → retrieve_constraints → build_prompt → generate → postprocess → record → score`.
+  `retrieve_constraints` also selects 2–3 few-shot excerpts from SQLite `samples` (`langgraph/examples.py`; never drafts).
+  LLM failure raises `LLMFailedError`/`LLMTimeoutError` (→ 502/504), never a mock fallback.
 - `llm/client.py` — `LLM.complete(system, user) -> str`; `AnthropicLLM`, `MockLLM`.
-- `evaluation/style_distance.py` — `score(text, baseline_texts) -> ScoreBreakdown`.
+- `evaluation/style_distance.py` — `score(text, baseline_texts, persona=None) -> ScoreBreakdown`; `score_draft(draft_id, runtime_or_db)` re-scores + persists. Features in `evaluation/features.py`, optional Qwen3 embedding in `evaluation/embeddings.py`, `python -m backend.evaluation.calibrate` prints sanity numbers.
 - `mcp_servers/` — FastMCP stdio servers: `graph_server.py` (tool `execute_read`, `get_constraints`), `gmail_outbound.py` (only `in:sent from:me`; inbound blocked), `wispr.py` (WebSocket client; falls back to local Wispr history), `file_watcher.py` (.txt, .mbox [only messages From: the user], SQLite dumps).
 - `daemon/server.py` — FastAPI app wiring everything (`create_app(runtime)`).
 - `runtime.py` — `Runtime(settings, db, store, llm, scorer)`; `build_runtime(...)`, `get_runtime()`, `set_runtime()`.
 - `ingestion/types.py` — `Extraction` dataclass (producer: `extract`, consumer: `GraphStore.write_extraction`).
+  Additive fields: `opener_ngrams, contractions, expansions, lower_i, upper_i` (all defaulted).
 - `ingestion/sources.py` — source registry. Each `mcp_servers` source module may expose
   `collect(settings) -> Iterable[{"text", "provenance"?, "persona"?} | str]`, optional `is_enabled(settings)`,
   `status(settings)`; items go through `run_ingest_batch` (full firewall). Modules: gmail→`gmail_outbound`,
@@ -86,4 +110,5 @@ Implementation notes (backend core, additive — see `graph/queries.py`):
   expansions, opener_keys/opener_counts, transition_keys/transition_counts`).
 - Neo4j properties cannot be maps, so `persona_weights` is a list parallel to `personas`
   (`r.personas[i]` ↔ `r.persona_weights[i]`); `Word` likewise has `weight, personas, persona_counts`.
-- `get_constraints(persona)` falls back to all-persona data when that persona has no samples yet.
+- `get_constraints(persona)` blends the persona with all-persona data (see Constraints semantics above).
+- `IntentContext` also stores `opener_phrase_keys/opener_phrase_counts` (2–3 word openers).

@@ -6,16 +6,18 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import asynccontextmanager
 from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from backend.config import get_settings
 from backend.ingestion.sources import SOURCES, list_sources, run_source
-from backend.langgraph.generate_graph import run_generation
+from backend.langgraph.generate_graph import GenerationError, run_generation
 from backend.langgraph.ingest_graph import run_ingest_batch
 from backend.langgraph.prompts import PERSONAS
 from backend.runtime import Runtime, build_runtime, get_runtime, set_runtime
@@ -50,6 +52,23 @@ def _config_out(cfg: dict[str, str]) -> dict[str, str]:
     }
 
 
+def _start_watcher(r: Runtime) -> Any:
+    """Start the drop-folder watcher thread if POLYTONE_WATCHER (default 1) and the dir exists."""
+    if os.environ.get("POLYTONE_WATCHER", "1").strip().lower() in ("0", "false", "no", "off"):
+        return None
+    if not r.settings.polytone_watch_dir.is_dir():
+        return None
+    try:
+        from backend.mcp_servers.file_watcher import start_watcher
+
+        t = start_watcher(r)
+        log.info("watching %s for new writing samples", r.settings.polytone_watch_dir)
+        return t
+    except Exception as e:  # noqa: BLE001 - the API must start even if the watcher can't
+        log.warning("file watcher not started: %s", e)
+        return None
+
+
 def create_app(runtime: Runtime | None = None) -> FastAPI:
     holder: dict[str, Runtime] = {}
 
@@ -64,7 +83,12 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         log.info("graph store: %s, llm: %s", r.store.kind, r.llm.name)
         if r.store.kind != "neo4j":
             log.warning("Neo4j not in use — style graph is in-memory and will not persist")
+        watcher = _start_watcher(r)
         yield
+        if watcher is not None:
+            from backend.mcp_servers.file_watcher import stop_watcher
+
+            stop_watcher(watcher)
         if runtime is None:
             r.close()
 
@@ -89,12 +113,14 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             "graph_store": r.store.kind,
         }
 
-    @app.post("/generate")
-    def generate(req: GenerateRequest) -> dict[str, Any]:
+    @app.post("/generate", response_model=None)
+    def generate(req: GenerateRequest) -> dict[str, Any] | JSONResponse:
         if not req.intent or not req.intent.strip():
             raise HTTPException(status_code=422, detail="intent is empty")
         try:
             return run_generation(req.intent, req.persona, req.app_context, runtime=rt())
+        except GenerationError as e:  # never inject placeholder text: tell the client it failed
+            return JSONResponse(status_code=e.status_code, content={"error": e.code, "detail": str(e)})
         except ValueError as e:
             raise HTTPException(status_code=422, detail=str(e)) from e
 

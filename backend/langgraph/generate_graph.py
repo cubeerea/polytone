@@ -5,6 +5,14 @@
 ``run_generation(intent, persona, app_context) -> dict`` returns the ``/generate`` response
 (``draft_id, text, persona, latency_ms, constraints``). Generated text is recorded in SQLite
 ``drafts`` only — it is NEVER written to the graph.
+
+``retrieve_constraints`` also picks 2–3 few-shot excerpts of the user's real samples
+(``langgraph/examples.py``) for the prompt.
+
+LLM failures are never papered over: the mock LLM is used only when
+``settings.llm_backend == "mock"``. A failing / empty real completion raises
+``LLMFailedError`` (HTTP 502 ``{"error":"llm_failed"}``) or ``LLMTimeoutError`` (HTTP 504
+``{"error":"llm_timeout"}``) and no draft is recorded.
 """
 from __future__ import annotations
 
@@ -16,11 +24,42 @@ from typing import Any, TypedDict
 from langgraph.graph import END, START, StateGraph
 
 from backend.graph.constraints import empty_constraints
+from backend.langgraph.examples import select_examples
 from backend.langgraph.prompts import build_system_prompt, build_user_prompt
-from backend.llm.client import MockLLM
 from backend.runtime import Runtime, get_runtime
 
 log = logging.getLogger(__name__)
+
+
+class GenerationError(RuntimeError):
+    """The draft could not be produced; maps to an HTTP error body ``{"error", "detail"}``."""
+
+    status_code = 502
+    code = "llm_failed"
+
+
+class LLMFailedError(GenerationError):
+    pass
+
+
+class LLMTimeoutError(GenerationError):
+    status_code = 504
+    code = "llm_timeout"
+
+
+def _is_timeout(e: BaseException | None) -> bool:
+    seen = 0
+    while e is not None and seen < 5:
+        if isinstance(e, TimeoutError) or "timeout" in type(e).__name__.lower():
+            return True
+        e = e.__cause__ or e.__context__
+        seen += 1
+    return False
+
+
+def _detail(e: BaseException) -> str:
+    msg = str(e).strip()
+    return f"{type(e).__name__}: {msg}"[:300] if msg else type(e).__name__
 
 
 class GenState(TypedDict, total=False):
@@ -31,6 +70,7 @@ class GenState(TypedDict, total=False):
     t0: float
     constraints: dict[str, Any]
     constraints_source: str  # "graph" | "fallback"
+    examples: list[str]
     system: str
     user: str
     raw_output: str
@@ -92,28 +132,40 @@ def build_generate_graph(rt: Runtime):
     def retrieve_constraints(state: GenState) -> GenState:
         try:
             c = rt.store.get_constraints(state["persona"])
-            return {"constraints": dict(c), "constraints_source": "graph"}
+            out: GenState = {"constraints": dict(c), "constraints_source": "graph"}
         except Exception as e:  # noqa: BLE001 - graph trouble must never break generation
             log.warning("constraint retrieval failed (%s); using empty constraints", e)
-            return {"constraints": dict(empty_constraints()), "constraints_source": "fallback"}
+            out = {"constraints": dict(empty_constraints()), "constraints_source": "fallback"}
+        try:
+            out["examples"] = select_examples(rt.db, state["persona"], state["intent"], out["constraints"])
+        except Exception as e:  # noqa: BLE001 - examples are an optional boost
+            log.warning("few-shot example selection failed: %s", e)
+            out["examples"] = []
+        return out
 
     def build_prompt(state: GenState) -> GenState:
         return {
-            "system": build_system_prompt(state["constraints"], state["persona"], state.get("app_context")),
+            "system": build_system_prompt(
+                state["constraints"], state["persona"], state.get("app_context"), state.get("examples") or []
+            ),
             "user": build_user_prompt(state["intent"]),
         }
 
     def generate(state: GenState) -> GenState:
+        if getattr(rt.llm, "name", "") == "mock" and rt.settings.llm_backend != "mock":
+            raise LLMFailedError("no LLM configured: POLYTONE_LLM=anthropic but ANTHROPIC_API_KEY is empty")
         try:
             return {"raw_output": rt.llm.complete(state["system"], state["user"]), "llm_fallback": False}
-        except Exception as e:  # noqa: BLE001 - degrade to the deterministic mock
-            log.warning("LLM call failed (%s); falling back to MockLLM", e)
-            return {"raw_output": MockLLM().complete(state["system"], state["user"]), "llm_fallback": True}
+        except Exception as e:
+            log.warning("LLM call failed: %s", _detail(e))
+            if _is_timeout(e):
+                raise LLMTimeoutError(_detail(e)) from e
+            raise LLMFailedError(_detail(e)) from e
 
     def postprocess(state: GenState) -> GenState:
         text = postprocess_text(state.get("raw_output", ""))
         if not text:
-            text = MockLLM().complete(state["system"], state["user"])
+            raise LLMFailedError("the model returned an empty completion")
         return {"text": text}
 
     def record(state: GenState) -> GenState:

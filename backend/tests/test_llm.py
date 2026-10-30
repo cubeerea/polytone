@@ -24,8 +24,8 @@ def test_anthropic_call_shape():
 
 def test_anthropic_client_config():
     llm = AnthropicLLM("sk-test", "claude-sonnet-5-5")
-    assert llm._client.max_retries == 1
-    assert float(llm._client.timeout) == 6.0
+    assert llm._client.max_retries == 0
+    assert float(llm._client.timeout) == 6.5
 
 
 def test_get_llm_selection():

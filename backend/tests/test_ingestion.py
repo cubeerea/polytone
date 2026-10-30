@@ -32,6 +32,8 @@ def test_firewall(db):
     ok, reason = check("Sam, the meeting has moved to 3pm. Could you send the slides? ", "manual", {}, db)
     assert not ok
     ok, reason = check("sam, the meeting has moved to 3pm. could you send the slides please", "manual", {}, db)
+    assert not ok and "contains a Polytone-generated draft" in reason
+    ok, reason = check("Sam, the meeting has moved to 3pm. Could you send the deck?", "manual", {}, db)
     assert not ok and "near-duplicate" in reason
     assert check("totally my own words here", "gmail", {"direction": "inbound"}, db)[0] is False
     assert check("totally my own words here", "wispr", {"generated": True}, db)[0] is False

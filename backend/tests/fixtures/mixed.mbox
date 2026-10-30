@@ -1,0 +1,52 @@
+From hank@example.com Mon Oct  6 10:00:00 2026
+From: Hank <hank@example.com>
+To: Pal <pal@example.com>
+Subject: Re: slides
+Date: Mon, 6 Oct 2026 10:00:00 -0700
+Message-ID: <out-1@example.com>
+Content-Type: text/plain; charset=utf-8
+
+sounds good — i'll bring the slides tomorrow. honestly can't wait to show you.
+
+--
+Hank
+
+On Mon, Oct 6, 2026 at 9:00 AM Pal <pal@example.com> wrote:
+> can you bring the slides?
+> thanks!
+
+From pal@example.com Mon Oct  6 09:00:00 2026
+From: Pal <pal@example.com>
+To: Hank <hank@example.com>
+Subject: slides
+Date: Mon, 6 Oct 2026 09:00:00 -0700
+Message-ID: <in-1@example.com>
+Content-Type: text/plain; charset=utf-8
+
+can you bring the slides? this is inbound and must never be learned.
+
+From hank@example.com Tue Oct  7 08:30:00 2026
+From: hank@example.com
+To: team@example.com
+Subject: friday
+Date: Tue, 7 Oct 2026 08:30:00 -0700
+Message-ID: <out-2@example.com>
+MIME-Version: 1.0
+Content-Type: multipart/alternative; boundary="XYZ"
+
+--XYZ
+Content-Type: text/html; charset=utf-8
+
+<div>quick heads up: we're moving standup to <b>10am</b> on friday.</div>
+--XYZ--
+
+From newsletter@shop.example Wed Oct  8 12:00:00 2026
+From: Shop <newsletter@shop.example>
+To: hank@example.com
+Subject: deals
+Date: Wed, 8 Oct 2026 12:00:00 -0700
+Message-ID: <in-2@example.com>
+Content-Type: text/plain; charset=utf-8
+
+HUGE SALE!!! buy now, limited time only.
+

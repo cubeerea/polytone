@@ -3,10 +3,12 @@
 Only human text (post-firewall) is ever written here — generated drafts never are.
 
 Persona semantics: every write is attributed to ``IntentContext {name: persona}``.
-``get_constraints(persona)`` uses that persona's data; if the persona has no samples yet it
-falls back to the aggregate over all personas (``persona=None``), so a fresh "Boss" persona
-still sounds like the user. ``sample_count`` in the result tells which data was used.
-Constraints are cached per persona and the cache is invalidated on every write.
+``get_constraints(persona)`` reads two aggregates via parameterized Cypher — the persona's and
+the all-persona one — and blends them (``graph/constraints.py`` documents the blend: a persona
+with few samples leans on the user's overall style; with none it is pure global, so a fresh
+"Boss" persona still sounds like the user). ``sample_count`` is the persona's own sample count
+(the global count when it has none). Constraints are cached per (persona, k) and the cache is
+invalidated on every write.
 """
 from __future__ import annotations
 
@@ -28,6 +30,8 @@ from backend.ingestion.types import Extraction
 log = logging.getLogger(__name__)
 
 _WORD_FETCH = 400  # words pulled for lexicon computation
+_BIGRAM_SEED = 150  # bigrams are expanded from this many top words
+_STRUCT_FETCH = 100  # structures pulled per aggregate before blending
 
 
 @runtime_checkable
@@ -82,10 +86,9 @@ class _BaseStore:
             hit = self._cache.get(key)
         if hit is not None:
             return _copy(hit)
-        agg = self._aggregate(persona or None, k)
-        if persona and agg.sample_count == 0:
-            agg = self._aggregate(None, k)
-        c = compute_constraints(agg, k) if agg.sample_count else empty_constraints()
+        g = self._aggregate(None, k)
+        p = self._aggregate(persona, k) if persona and g.sample_count else g
+        c = compute_constraints(p, k, global_agg=g) if g.sample_count else empty_constraints()
         with self._cache_lock:
             self._cache[key] = c
         return _copy(c)
@@ -148,7 +151,8 @@ def _copy(c: Constraints) -> Constraints:
 
 
 def _top_items(d: dict[Any, int | float], n: int) -> list[tuple[Any, int | float]]:
-    return sorted(d.items(), key=lambda kv: (-kv[1], str(kv[0])))[:n]
+    """Top ``n`` by value desc, key asc (keys are all str or all str-tuples — same order as Cypher)."""
+    return sorted(d.items(), key=lambda kv: (-kv[1], kv[0]))[:n]
 
 
 # ============================================================================ in-memory
@@ -187,6 +191,7 @@ class InMemoryGraphStore(_BaseStore):
                     "name": persona, "sample_count": 0, "sentence_count": 0, "lower_starts": 0,
                     "upper_starts": 0, "len_sum": 0, "len_hist": [], "contractions": 0,
                     "expansions": 0, "opener_keys": [], "opener_counts": [],
+                    "opener_phrase_keys": [], "opener_phrase_counts": [],
                     "transition_keys": [], "transition_counts": [],
                 },
             )
@@ -197,6 +202,7 @@ class InMemoryGraphStore(_BaseStore):
             ctx["len_hist"] = [(old[i] if i < len(old) else 0) + n for i, n in enumerate(d["len_hist"])]
             for kf, cf, src in (
                 ("opener_keys", "opener_counts", d["openers"]),
+                ("opener_phrase_keys", "opener_phrase_counts", d["opener_phrases"]),
                 ("transition_keys", "transition_counts", d["transitions"]),
             ):
                 for key, n in src.items():
@@ -236,13 +242,16 @@ class InMemoryGraphStore(_BaseStore):
             else:
                 words = {w: p[persona] for w, p in self.word_p.items() if p.get(persona)}
                 bigrams = {bg: p[persona] for bg, p in self.bigram_p.items() if p.get(persona)}
-            agg.words = dict(_top_items(words, _WORD_FETCH))
-            agg.bigrams = dict(_top_items(bigrams, k))
+            top = _top_items(words, _WORD_FETCH)
+            agg.words = dict(top)
+            agg.word_totals = {w: self.words[w] for w in agg.words}
+            seed = {w for w, _ in top[:_BIGRAM_SEED]}
+            agg.bigrams = dict(_top_items({bg: n for bg, n in bigrams.items() if bg[0] in seed}, k))
             structs: dict[str, int] = defaultdict(int)
             for (sig, ctx), n in self.struct_ctx.items():
                 if persona is None or ctx == persona:
                     structs[sig] += n
-            agg.structures = dict(_top_items(structs, k))
+            agg.structures = dict(_top_items(structs, max(k, _STRUCT_FETCH)))
             punct: dict[str, int] = defaultdict(int)
             for (sym, ctx), n in self.punct_ctx.items():
                 if persona is None or ctx == persona:
@@ -373,11 +382,18 @@ class Neo4jGraphStore(_BaseStore):
             agg.merge_context(row["c"])
         if agg.sample_count == 0:
             return agg
-        agg.words = {r["text"]: int(r["n"] or 0) for r in self._read(Q.READ_TOP_WORDS, persona=persona, limit=_WORD_FETCH)}
+        rows = self._read(Q.READ_TOP_WORDS, persona=persona, limit=_WORD_FETCH)
+        agg.words = {r["text"]: int(r["n"] or 0) for r in rows}
+        agg.word_totals = {r["text"]: int(r["total"] or 0) for r in rows}
+        seed = [r["text"] for r in rows[:_BIGRAM_SEED]]
         agg.bigrams = {
-            (r["a"], r["b"]): int(r["n"] or 0) for r in self._read(Q.READ_TOP_BIGRAMS, persona=persona, limit=k)
+            (r["a"], r["b"]): int(r["n"] or 0)
+            for r in self._read(Q.READ_TOP_BIGRAMS, persona=persona, seed=seed, limit=k)
         }
-        agg.structures = {r["sig"]: int(r["n"] or 0) for r in self._read(Q.READ_STRUCTURES, persona=persona, limit=k)}
+        agg.structures = {
+            r["sig"]: int(r["n"] or 0)
+            for r in self._read(Q.READ_STRUCTURES, persona=persona, limit=max(k, _STRUCT_FETCH))
+        }
         agg.punctuation = {r["sym"]: int(r["n"] or 0) for r in self._read(Q.READ_PUNCTUATION, persona=persona)}
         return agg
 

@@ -6,7 +6,7 @@ Schema (CONTRACTS.md):
   (:PunctuationMark {symbol, weight})
   (:IntentContext {name, sample_count, sentence_count, lower_starts, upper_starts, len_sum,
                    len_hist, contractions, expansions, opener_keys, opener_counts,
-                   transition_keys, transition_counts})
+                   opener_phrase_keys, opener_phrase_counts, transition_keys, transition_counts})
   (:Word)-[:FOLLOWED_BY {weight, personas, persona_weights}]->(:Word)
   (:Word)-[:PART_OF_STRUCTURE {weight}]->(:SentenceStructure)
   (:SentenceStructure)-[:USED_IN {weight}]->(:IntentContext)
@@ -30,7 +30,8 @@ MERGE_CONTEXT = """
 MERGE (c:IntentContext {name: $persona})
 ON CREATE SET c.sample_count = 0, c.sentence_count = 0, c.lower_starts = 0, c.upper_starts = 0,
               c.len_sum = 0, c.len_hist = [], c.contractions = 0, c.expansions = 0,
-              c.opener_keys = [], c.opener_counts = [], c.transition_keys = [], c.transition_counts = []
+              c.opener_keys = [], c.opener_counts = [], c.transition_keys = [], c.transition_counts = [],
+              c.opener_phrase_keys = [], c.opener_phrase_counts = []
 SET c.sample_count = c.sample_count + 1,
     c.sentence_count = c.sentence_count + $d.sentence_count,
     c.lower_starts = c.lower_starts + $d.lower_starts,
@@ -38,15 +39,22 @@ SET c.sample_count = c.sample_count + 1,
     c.len_sum = c.len_sum + $d.len_sum,
     c.contractions = c.contractions + $d.contractions,
     c.expansions = c.expansions + $d.expansions,
-    c.len_hist = [i IN range(0, size($d.len_hist) - 1) | coalesce(c.len_hist[i], 0) + $d.len_hist[i]]
+    c.len_hist = [i IN range(0, size($d.len_hist) - 1) | coalesce(c.len_hist[i], 0) + $d.len_hist[i]],
+    c.opener_phrase_keys = coalesce(c.opener_phrase_keys, []),
+    c.opener_phrase_counts = coalesce(c.opener_phrase_counts, [])
 WITH c
 SET c.opener_keys = c.opener_keys + [k IN keys($d.openers) WHERE NOT k IN c.opener_keys],
-    c.transition_keys = c.transition_keys + [k IN keys($d.transitions) WHERE NOT k IN c.transition_keys]
+    c.transition_keys = c.transition_keys + [k IN keys($d.transitions) WHERE NOT k IN c.transition_keys],
+    c.opener_phrase_keys = c.opener_phrase_keys
+                           + [k IN keys($d.opener_phrases) WHERE NOT k IN c.opener_phrase_keys]
 WITH c
 SET c.opener_counts = [i IN range(0, size(c.opener_keys) - 1) |
                          coalesce(c.opener_counts[i], 0) + coalesce($d.openers[c.opener_keys[i]], 0)],
     c.transition_counts = [i IN range(0, size(c.transition_keys) - 1) |
-                         coalesce(c.transition_counts[i], 0) + coalesce($d.transitions[c.transition_keys[i]], 0)]
+                         coalesce(c.transition_counts[i], 0) + coalesce($d.transitions[c.transition_keys[i]], 0)],
+    c.opener_phrase_counts = [i IN range(0, size(c.opener_phrase_keys) - 1) |
+                         coalesce(c.opener_phrase_counts[i], 0)
+                         + coalesce($d.opener_phrases[c.opener_phrase_keys[i]], 0)]
 """
 
 MERGE_WORDS = """
@@ -114,19 +122,23 @@ WHERE $persona IS NULL OR c.name = $persona
 RETURN properties(c) AS c
 """
 
+# n = the persona's count (all-persona weight when $persona is null), total = global weight
 READ_TOP_WORDS = """
 MATCH (w:Word)
 WHERE $persona IS NULL OR $persona IN w.personas
 WITH w, CASE WHEN $persona IS NULL THEN w.weight
              ELSE w.persona_counts[[i IN range(0, size(w.personas) - 1) WHERE w.personas[i] = $persona][0]]
         END AS n
-RETURN w.text AS text, n
+RETURN w.text AS text, n, w.weight AS total
 ORDER BY n DESC, text ASC
 LIMIT $limit
 """
 
+# Bigrams are expanded from the persona's top words ($seed, index lookups on Word.text) instead
+# of scanning every FOLLOWED_BY relationship: frequent bigrams start with frequent words.
 READ_TOP_BIGRAMS = """
-MATCH (a:Word)-[r:FOLLOWED_BY]->(b:Word)
+MATCH (a:Word) WHERE a.text IN $seed
+MATCH (a)-[r:FOLLOWED_BY]->(b:Word)
 WHERE $persona IS NULL OR $persona IN r.personas
 WITH a, b, CASE WHEN $persona IS NULL THEN r.weight
              ELSE r.persona_weights[[i IN range(0, size(r.personas) - 1) WHERE r.personas[i] = $persona][0]]

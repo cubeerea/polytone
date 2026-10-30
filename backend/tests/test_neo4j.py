@@ -9,6 +9,7 @@ import uuid
 import pytest
 
 from backend.config import Settings
+from backend.graph.constraints import compute_constraints
 from backend.graph.store import InMemoryGraphStore, Neo4jGraphStore
 from backend.ingestion.extract import extract
 
@@ -28,10 +29,16 @@ def neo():
     created: dict[str, set] = {"sigs": set(), "syms": set()}
     yield store, tag, persona, created
     store._driver.execute_query(
-        "MATCH (c:IntentContext {name: $p}) DETACH DELETE c", {"p": persona}
+        "MATCH (c:IntentContext) WHERE c.name STARTS WITH $p DETACH DELETE c", {"p": persona}
     )
     store._driver.execute_query(
         "MATCH (w:Word) WHERE w.text STARTS WITH $t DETACH DELETE w", {"t": tag}
+    )
+    # robust to tokenization changes: also drop any Word only this test's personas ever used
+    store._driver.execute_query(
+        "MATCH (w:Word) WHERE size(w.personas) > 0 AND all(p IN w.personas WHERE p STARTS WITH $p) "
+        "DETACH DELETE w",
+        {"p": persona},
     )
     store._driver.execute_query(
         "MATCH (s:SentenceStructure) WHERE s.signature IN $sigs AND NOT (s)--() DELETE s",
@@ -67,9 +74,12 @@ def test_neo4j_matches_in_memory(neo):
     for t in _texts(tag):
         _write(store, created, t, persona)
         mem.write_extraction(extract(t), persona)
-    c_neo = store.get_constraints(persona)
-    c_mem = mem.get_constraints(persona)
-    assert c_neo == c_mem
+    # the live DB may hold other data (global blend), so compare the persona aggregate — the
+    # Cypher reads — and persona-only constraints computed from it
+    assert store._aggregate(persona, 20) == mem._aggregate(persona, 20)
+    c_neo = compute_constraints(store._aggregate(persona, 20), 20)
+    assert c_neo == compute_constraints(mem._aggregate(persona, 20), 20)
+    assert store.get_constraints(persona)["sample_count"] == 3
     assert c_neo["sample_count"] == 3 and c_neo["casing"] == "lower"
     assert c_neo["top_openers"][0] == f"{tag}hey"
     assert c_neo["contractions_rate"] == 1.0 and c_neo["punctuation_rates"]["—"] > 0
@@ -131,3 +141,46 @@ def test_neo4j_end_to_end_runtime(neo, settings, tmp_path):
     r = run_ingest(out["text"], "manual", persona, {}, runtime=rt)
     assert r["rejected"] == 1
     assert store.get_constraints(persona)["sample_count"] == 3
+
+
+def _tagged(tag: str, text: str) -> str:
+    """Prefix every word with the test tag (keeping its case) so cleanup can find it."""
+    import re
+
+    return re.sub(r"(?<![\w'’@.])([A-Za-z])", lambda m: (tag.upper() if m.group(1).isupper() else tag) + m.group(1), text)
+
+
+def test_neo4j_fixture_corpus_personas(neo):
+    """The realistic corpus through the live graph: parity with memory, personas differ, fast."""
+    import json
+    from pathlib import Path
+
+    store, tag, persona, created = neo
+    corpus = json.loads((Path(__file__).parent / "fixtures" / "corpus.json").read_text())
+    boss, friend = f"{persona}_boss", f"{persona}_friend"
+    mem = InMemoryGraphStore()
+    try:
+        for p, key in ((boss, "Boss"), (friend, "Friend")):
+            for t in corpus[key]:
+                tt = _tagged(tag, t)
+                _write(store, created, tt, p)
+                mem.write_extraction(extract(tt), p)
+        for p in (boss, friend):
+            assert store._aggregate(p, 20) == mem._aggregate(p, 20)
+        store.invalidate()
+        t0 = time.perf_counter()
+        b = store.get_constraints(boss)
+        assert time.perf_counter() - t0 < 0.3
+        f = store.get_constraints(friend)
+        assert b["sample_count"] == 8 and f["sample_count"] == 8
+        assert b["casing"] == "sentence" and f["casing"] == "lower"
+        assert b["avg_sentence_len"] > f["avg_sentence_len"]
+        assert "emoji" not in b["punctuation_rates"] and f["punctuation_rates"]["emoji"] > 0.1
+        assert b["top_openers"][0] == f"{tag}quick {tag}update {tag}on"
+        # (tag-prefixed words defeat the stopword lists, so check distinctive words directly)
+        assert f"{tag}migration" in b["lexicon"] and f"{tag}migration" not in f["lexicon"]
+        assert f"{tag}lol" in f["lexicon"] and f"{tag}lol" not in b["lexicon"]
+        assert [f"{tag}quick", f"{tag}update", 4.0] in b["top_bigrams"]
+    finally:
+        for p in (boss, friend):
+            store._driver.execute_query("MATCH (c:IntentContext {name: $p}) DETACH DELETE c", {"p": p})

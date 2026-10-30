@@ -33,7 +33,7 @@ def test_prompt_empty_and_full():
              top_bigrams=[["sounds", "good", 3.0]])
     p = build_system_prompt(c, "Friend", None)
     for frag in ("HARD STYLE RULES", "average 8.0 words", "±2", "all lowercase", "Contraction rate 0.90",
-                 "em-dashes (—): often", "exclamation marks: never", '"so"', '"anyway"', "ship",
+                 "em-dashes (—): often", "Never use exclamation marks", '"so"', '"anyway"', "ship",
                  '"sounds good"', "Never invent facts"):
         assert frag in p, frag
 
@@ -74,16 +74,26 @@ def test_generation_survives_graph_failure(runtime):
     assert out["constraints"] == empty_constraints() and out["text"]
 
 
-def test_generation_survives_llm_failure(runtime):
+def test_llm_failure_raises_instead_of_mock_fallback(runtime):
+    import pytest
+
+    from backend.langgraph.generate_graph import LLMFailedError, LLMTimeoutError
+
     class BadLLM:
         name = "anthropic"
 
-        def complete(self, system, user):
-            raise TimeoutError("slow")
+        def __init__(self, exc):
+            self.exc = exc
 
-    runtime.llm = BadLLM()
-    runtime._graphs.clear()
-    assert run_generation("- say thanks", runtime=runtime)["text"]
+        def complete(self, system, user):
+            raise self.exc
+
+    for exc, err in ((TimeoutError("slow"), LLMTimeoutError), (RuntimeError("500 overloaded"), LLMFailedError)):
+        runtime.llm = BadLLM(exc)
+        runtime._graphs.clear()
+        with pytest.raises(err):
+            run_generation("- say thanks", runtime=runtime)
+    assert runtime.db.list_drafts() == []  # nothing recorded, nothing to inject
 
 
 def test_score_hook(runtime):

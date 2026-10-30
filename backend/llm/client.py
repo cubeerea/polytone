@@ -8,8 +8,9 @@ from typing import Any, Protocol, runtime_checkable
 log = logging.getLogger(__name__)
 
 DEFAULT_MAX_TOKENS = 1024
-DEFAULT_TIMEOUT_S = 6.0
-DEFAULT_MAX_RETRIES = 1
+# Rust gives up at 8s; one 6.5s attempt keeps the whole loop inside that budget.
+DEFAULT_TIMEOUT_S = 6.5
+DEFAULT_MAX_RETRIES = 0
 
 
 @runtime_checkable

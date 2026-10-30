@@ -1,5 +1,8 @@
 """Ingestion LangGraph:  validate → firewall → extract → write_graph → record
 
+``validate`` strips quoted reply chains / signatures (``text.clean_message``); ``firewall``
+enforces provenance, minimum length, sample de-duplication and the never-a-draft rules.
+
 ``run_ingest(text, source, persona, provenance) -> IngestResult`` ingests ONE human sample.
 ``run_ingest_batch(items, source, persona)`` ingests many and logs an ``ingest_runs`` row.
 
@@ -16,9 +19,10 @@ from langgraph.graph import END, START, StateGraph
 
 from backend.ingestion import extract as extract_mod
 from backend.ingestion import firewall as firewall_mod
+from backend.ingestion.text import clean_message
 from backend.ingestion.types import Extraction
 from backend.runtime import Runtime, get_runtime
-from backend.storage.db import sha256_text, utcnow_iso
+from backend.storage.db import utcnow_iso
 
 log = logging.getLogger(__name__)
 
@@ -44,13 +48,16 @@ def empty_result() -> dict[str, Any]:
 
 def build_ingest_graph(rt: Runtime):
     def validate(state: IngestState) -> IngestState:
-        text = (state.get("text") or "").strip()
-        if not text:
+        raw = (state.get("text") or "").strip()
+        if not raw:
             return {"ok": False, "reason": "empty text"}
-        if len(text) > MAX_SAMPLE_CHARS:
+        if len(raw) > MAX_SAMPLE_CHARS:
             return {"ok": False, "reason": f"sample too long (> {MAX_SAMPLE_CHARS} chars)"}
-        if rt.db.sample_exists(sha256_text(text)):
-            return {"ok": False, "reason": "duplicate sample"}
+        # keep only the user's own words: drop quoted reply chains and signatures; the cleaned
+        # text is what the firewall checks, the graph learns and SQLite stores
+        text = clean_message(raw)
+        if not text:
+            return {"ok": False, "reason": "nothing written by the user (only quoted reply / signature)"}
         return {"ok": True, "text": text}
 
     def firewall(state: IngestState) -> IngestState:
