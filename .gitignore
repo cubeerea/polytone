@@ -1,0 +1,14 @@
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/schemas/
+.env
+credentials.json
+token.json
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+data/
+*.sqlite3
+.DS_Store

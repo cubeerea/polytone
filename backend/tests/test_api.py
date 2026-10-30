@@ -1,0 +1,152 @@
+import sys
+import time
+import types
+
+from .conftest import HUMAN_SAMPLES
+
+CONSTRAINT_KEYS = {
+    "avg_sentence_len", "sentence_len_p90", "top_openers", "top_transitions", "top_bigrams",
+    "punctuation_rates", "structures", "lexicon", "casing", "contractions_rate", "sample_count",
+}
+INGEST_KEYS = {"accepted", "rejected", "reasons", "sentences", "words_merged"}
+
+
+def test_health(client):
+    r = client.get("/health")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "ok" and body["neo4j"] is False
+    assert body["llm"] == "mock" and body["embeddings"] == "none" and body["graph_store"] == "memory"
+
+
+def test_cors(client):
+    r = client.options(
+        "/health", headers={"Origin": "tauri://localhost", "Access-Control-Request-Method": "GET"}
+    )
+    assert r.headers.get("access-control-allow-origin") == "tauri://localhost"
+    r = client.get("/health", headers={"Origin": "http://localhost:1420"})
+    assert r.headers.get("access-control-allow-origin") == "http://localhost:1420"
+
+
+def test_generate_and_drafts(client):
+    r = client.post("/generate", json={"intent": "- tell sam meeting moved to 3\n- ask for slides",
+                                       "persona": None, "app_context": None})
+    assert r.status_code == 200
+    body = r.json()
+    assert set(body) == {"draft_id", "text", "persona", "latency_ms", "constraints"}
+    assert body["persona"] == "Default" and set(body["constraints"]) == CONSTRAINT_KEYS
+    assert body["constraints"]["sample_count"] == 0
+    assert "Sam" in body["text"] and isinstance(body["latency_ms"], int)
+    drafts = client.get("/drafts?limit=5").json()
+    assert drafts[0]["draft_id"] == body["draft_id"]
+    assert set(drafts[0]) == {"draft_id", "created_at", "persona", "intent", "text", "latency_ms", "score"}
+    assert client.post("/generate", json={"intent": "  \n - "}).status_code == 422
+    assert client.post("/generate", json={}).status_code == 422
+
+
+def test_generate_latency(client):
+    for t in HUMAN_SAMPLES:
+        client.post("/ingest/manual", json={"text": t})
+    client.post("/generate", json={"intent": "warmup"})
+    t0 = time.perf_counter()
+    r = client.post("/generate", json={"intent": "- tell sam meeting moved to 3\n- ask for slides"})
+    assert r.status_code == 200
+    assert (time.perf_counter() - t0) * 1000 < 500
+    assert r.json()["latency_ms"] < 500
+
+
+def test_ingest_manual_and_stats_and_graph(client):
+    assert client.get("/stats").json() == {"words": 0, "structures": 0, "samples": 0, "avg_sentence_len": None}
+    r = client.post("/ingest/manual", json={"text": HUMAN_SAMPLES[0], "persona": "Friend"})
+    body = r.json()
+    assert set(body) == INGEST_KEYS and body["accepted"] == 1 and body["sentences"] == 3
+    assert body["words_merged"] > 0
+    dup = client.post("/ingest/manual", json={"text": HUMAN_SAMPLES[0]}).json()
+    assert dup["rejected"] == 1 and dup["reasons"] == ["duplicate sample"]
+    assert client.post("/ingest/manual", json={"text": "   "}).json()["reasons"] == ["empty text"]
+    st = client.get("/stats").json()
+    assert st["samples"] == 1 and st["words"] > 0 and st["structures"] > 0 and st["avg_sentence_len"] > 0
+    g = client.get("/graph?limit=20&persona=Friend").json()
+    assert 0 < len(g["nodes"]) <= 20 and g["edges"]
+    assert set(g["nodes"][0]) == {"id", "label", "name", "weight"}
+    assert set(g["edges"][0]) == {"source", "target", "type", "weight"}
+    assert client.get("/graph?persona=").status_code == 200
+    gen = client.post("/generate", json={"intent": "- hi", "persona": "Friend"}).json()
+    assert gen["constraints"]["sample_count"] == 1
+
+
+def test_firewall_rejects_resubmitted_draft(client, runtime):
+    client.post("/ingest/manual", json={"text": HUMAN_SAMPLES[1]})
+    words_before = dict(runtime.store.words)
+    draft = client.post("/generate", json={"intent": "- tell sam meeting moved to 3\n- ask for slides"}).json()
+    r = client.post("/ingest/manual", json={"text": draft["text"]}).json()
+    assert r["accepted"] == 0 and r["rejected"] == 1 and "draft" in r["reasons"][0]
+    r = client.post("/ingest/manual", json={"text": draft["text"] + " thanks"}).json()
+    assert r["rejected"] == 1 and "near-duplicate" in r["reasons"][0]
+    assert dict(runtime.store.words) == words_before
+    assert client.get("/stats").json()["samples"] == 1
+
+
+def test_sources_list_and_run(client, monkeypatch):
+    srcs = client.get("/ingest/sources").json()
+    assert [s["name"] for s in srcs] == ["manual", "gmail", "wispr", "watcher"]
+    for s in srcs:
+        assert set(s) == {"name", "enabled", "status", "last_run", "items_ingested"}
+    assert srcs[0]["enabled"] is True
+    assert client.post("/ingest/sources/nope/run").status_code == 404
+    r = client.post("/ingest/sources/manual/run").json()
+    assert set(r) == INGEST_KEYS and r["accepted"] == 0
+
+    fake = types.ModuleType("backend.mcp_servers.wispr")
+    fake.collect = lambda settings: [
+        {"text": "yo i'm on it. back in five.", "provenance": {"generated": False}},
+        {"text": "AI wrote this", "provenance": {"generated": True}},
+        "plain string item works too.",
+    ]
+    monkeypatch.setitem(sys.modules, "backend.mcp_servers.wispr", fake)
+    r = client.post("/ingest/sources/wispr/run").json()
+    assert r["accepted"] == 2 and r["rejected"] == 1 and r["reasons"] == ["flagged as generated"]
+    w = {s["name"]: s for s in client.get("/ingest/sources").json()}["wispr"]
+    assert w["enabled"] is True and w["items_ingested"] == 2 and w["last_run"]
+
+    broken = types.ModuleType("backend.mcp_servers.file_watcher")
+
+    def boom(settings):
+        raise RuntimeError("disk gone")
+        yield  # pragma: no cover
+
+    broken.collect = boom
+    monkeypatch.setitem(sys.modules, "backend.mcp_servers.file_watcher", broken)
+    r = client.post("/ingest/sources/watcher/run").json()
+    assert r["accepted"] == 0 and "disk gone" in r["reasons"][0]
+    w = {s["name"]: s for s in client.get("/ingest/sources").json()}["watcher"]
+    assert w["status"] == "error"
+
+
+def test_personas(client):
+    names = [p["name"] for p in client.get("/personas").json()]
+    assert {"Boss", "Friend", "Investor", "Default"} <= set(names)
+    client.post("/ingest/manual", json={"text": "custom persona words.", "persona": "Mom"})
+    assert "Mom" in [p["name"] for p in client.get("/personas").json()]
+
+
+def test_config(client):
+    assert client.get("/config").json() == {
+        "active_persona": "Default", "hotkey": "CmdOrCtrl+Shift+P", "inject_mode": "paste"}
+    r = client.put("/config", json={"active_persona": "Boss", "hotkey": "Alt+P", "inject_mode": "type"})
+    assert r.json() == {"active_persona": "Boss", "hotkey": "Alt+P", "inject_mode": "type"}
+    assert client.put("/config", json={"inject_mode": "telepathy"}).status_code == 422
+    assert client.put("/config", json={"inject_mode": "paste"}).json()["active_persona"] == "Boss"
+    assert client.post("/generate", json={"intent": "hi"}).json()["persona"] == "Boss"
+
+
+def test_scores_summary(client, runtime):
+    assert client.get("/scores/summary").json() == {"mean": None, "count": 0, "trend": []}
+    runtime.scorer = lambda text, base: {"score": 60.0, "distance": 0.4, "components": {}}
+    client.post("/ingest/manual", json={"text": HUMAN_SAMPLES[2]})
+    client.post("/generate", json={"intent": "a"})
+    runtime.scorer = lambda text, base: {"score": 80.0, "distance": 0.2, "components": {}}
+    client.post("/generate", json={"intent": "b"})
+    s = client.get("/scores/summary").json()
+    assert s["count"] == 2 and s["mean"] == 70.0 and [x["score"] for x in s["trend"]] == [60.0, 80.0]
+    assert client.get("/drafts").json()[0]["score"]["score"] == 80.0
