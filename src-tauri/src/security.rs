@@ -370,16 +370,6 @@ pub async fn unlock(app: AppHandle) -> Result<UnlockResult, String> {
     let client = app.state::<AppState>().client.clone();
     let session = match client.create_session().await {
         Ok(s) => s,
-        Err(crate::backend_client::BackendError::Http { status: 404, .. }) => {
-            // An engine from before the security contract: it has no sessions to issue (and
-            // no 401s to send). The owner check above still gates the window.
-            log::warn!("backend has no /session; unlocking without a session token");
-            crate::backend_client::SessionInfo {
-                token: String::new(),
-                idle_timeout_s: 0,
-                expires_at: None,
-            }
-        }
         Err(e) => {
             finish(false);
             audit(
