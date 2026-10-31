@@ -71,7 +71,7 @@ export function Settings({ config, configError, online, health, onUpdate, lastRu
   return (
     <div className="space-y-7 pt-1">
       {tauri ? (
-        perm && !perm.accessibility && <PermissionsCard onRecheck={refreshPerm} />
+        perm && !perm.accessibility && <PermissionsCard perm={perm} onRecheck={refreshPerm} />
       ) : (
         <p className="rounded-lg bg-fill px-3 py-2 text-[12px] text-text-2">
           Running in a browser. The shortcut, permissions and typing capture only work inside the Polytone app.
@@ -114,8 +114,9 @@ function Row({ title, subtitle, children }: { title: ReactNode; subtitle?: React
 
 /* ---------------- Permissions (first launch) ---------------- */
 
-function PermissionsCard({ onRecheck }: { onRecheck: () => void }) {
+function PermissionsCard({ perm, onRecheck }: { perm: PermissionStatus; onRecheck: () => void }) {
   const [dismissed, setDismissed] = useLocalStorage(ONBOARDING_KEY, null);
+  const host = perm.launched_from_other_app ? perm.grant_to : undefined;
   const [openErr, setOpenErr] = useState<string | null>(null);
 
   const open = async (kind: PermissionKind) => {
@@ -131,7 +132,9 @@ function PermissionsCard({ onRecheck }: { onRecheck: () => void }) {
     return (
       <div className="flex items-center gap-2 rounded-lg bg-fill px-3 py-2 text-[12px]">
         <StatusDot state="down" />
-        <span className="flex-1 text-text-2">Accessibility access is off, so the shortcut can't paste.</span>
+        <span className="flex-1 text-text-2">
+          {host ? `Accessibility is off for ${host}, so the shortcut can't paste.` : "Accessibility access is off, so the shortcut can't paste."}
+        </span>
         <button type="button" className="btn btn-plain" onClick={() => setDismissed(null)}>
           Set up
         </button>
@@ -146,9 +149,18 @@ function PermissionsCard({ onRecheck }: { onRecheck: () => void }) {
         Polytone reads your selection and types the rewrite back, so macOS needs to trust it.
       </p>
       <ol className="mt-3 list-decimal space-y-1.5 pl-5 text-[13px] text-text-2 marker:text-text-3">
-        <li>
-          In <span className="text-text">Privacy &amp; Security → Accessibility</span>, switch Polytone on.
-        </li>
+        {host ? (
+          <li>
+            Polytone was started from <span className="text-text">{host}</span>, so macOS checks {host}&apos;s
+            permission, not Polytone&apos;s. In{" "}
+            <span className="text-text">Privacy &amp; Security → Accessibility</span>, switch{" "}
+            <span className="text-text">{host}</span> on (add it with + if it isn&apos;t listed).
+          </li>
+        ) : (
+          <li>
+            In <span className="text-text">Privacy &amp; Security → Accessibility</span>, switch Polytone on.
+          </li>
+        )}
         <li>
           If the shortcut still does nothing, also allow it under{" "}
           <button type="button" className="btn-plain btn h-auto p-0 text-[13px]" onClick={() => open("input_monitoring")}>
@@ -156,7 +168,7 @@ function PermissionsCard({ onRecheck }: { onRecheck: () => void }) {
           </button>
           .
         </li>
-        <li>Come back here. You may need to relaunch Polytone.</li>
+        <li>{host ? `Quit and reopen ${host}, then start Polytone again.` : "Come back here. You may need to relaunch Polytone."}</li>
       </ol>
       <div className="mt-3 flex items-center gap-2">
         <button type="button" className="btn btn-primary" onClick={() => open("accessibility")}>
@@ -554,7 +566,7 @@ function AdvancedGroup({
         )}
         <Row
           title="Accessibility"
-          subtitle={!tauri ? "Only inside the app" : permError ? permError : perm ? (perm.accessibility ? "Granted" : "Not granted") : "Checking…"}
+          subtitle={!tauri ? "Only inside the app" : permError ? permError : perm ? (perm.accessibility ? "Granted" : perm.launched_from_other_app ? `Not granted for ${perm.grant_to}` : "Not granted") : "Checking…"}
         >
           {perm && <StatusDot state={perm.accessibility ? "ok" : "down"} />}
         </Row>

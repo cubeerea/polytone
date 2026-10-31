@@ -628,10 +628,7 @@ pub fn run_loop(app: &AppHandle) -> RunResult {
 fn run_loop_inner(state: &AppState, started: Instant) -> RunResult {
     if !crate::permissions::accessibility_trusted() {
         let _ = crate::permissions::open_permission_settings("accessibility".into());
-        return RunResult::err(
-            started,
-            "Polytone needs Accessibility permission (System Settings > Privacy & Security)",
-        );
+        return RunResult::err(started, crate::permissions::missing_accessibility_message());
     }
 
     wait_for_trigger_release(state);

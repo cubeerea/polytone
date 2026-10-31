@@ -119,7 +119,8 @@ pub fn run() {
             let start_hidden = std::env::var("POLYTONE_START_HIDDEN").is_ok_and(|v| v == "1");
             if !permissions::accessibility_trusted() {
                 log::warn!(
-                    "Accessibility permission not granted yet; showing the onboarding window"
+                    "Accessibility not granted for {}; showing the onboarding window",
+                    permissions::status().grant_to
                 );
                 tray::show_main_window(&handle);
             } else if !start_hidden {

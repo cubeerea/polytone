@@ -9,6 +9,9 @@ export const inTauri = (): boolean =>
 export interface PermissionStatus {
   accessibility: boolean;
   platform: string;
+  /** App macOS checks the permission against: a terminal/IDE when Polytone was started from one. */
+  grant_to?: string;
+  launched_from_other_app?: boolean;
 }
 
 export interface RunResult {
