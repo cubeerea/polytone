@@ -242,6 +242,9 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     # "constraint already exists" etc. are INFO-level server notifications — just noise here
     logging.getLogger("neo4j.notifications").setLevel(logging.WARNING)
+    from backend.daemon.watchdog import start_parent_watchdog
+
+    start_parent_watchdog()
     settings = get_settings()
     rt = build_runtime(settings, score_async=True)
     set_runtime(rt)

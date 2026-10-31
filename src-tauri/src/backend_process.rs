@@ -37,15 +37,47 @@ pub fn uv_candidates(home: Option<&str>) -> Vec<PathBuf> {
     v
 }
 
+/// Where the backend's output goes: the terminal under `pnpm tauri dev`, else `data/backend.log`
+/// (a Finder-launched app has no terminal, so inherited output would vanish).
+fn backend_output(root: &Path) -> (Stdio, Stdio, Option<PathBuf>) {
+    use std::io::IsTerminal;
+    if std::io::stderr().is_terminal() {
+        return (Stdio::inherit(), Stdio::inherit(), None);
+    }
+    let path = root.join("data").join("backend.log");
+    let _ = std::fs::create_dir_all(root.join("data"));
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        Ok(f) => match f.try_clone() {
+            Ok(f2) => (Stdio::from(f), Stdio::from(f2), Some(path)),
+            Err(_) => (Stdio::from(f), Stdio::null(), Some(path)),
+        },
+        Err(e) => {
+            log::warn!("cannot open {}: {e}", path.display());
+            (Stdio::null(), Stdio::null(), None)
+        }
+    }
+}
+
 fn spawn_backend(root: &Path) -> Option<Child> {
     let home = std::env::var("HOME").ok();
     for uv in uv_candidates(home.as_deref()) {
+        let (out, err, log_path) = backend_output(root);
         let mut cmd = Command::new(&uv);
         cmd.args(["run", "polytone-api"])
             .current_dir(root)
+            // The backend exits when this pid disappears, so a crashed or force-quit app
+            // never leaves a backend behind serving stale code.
+            .env("POLYTONE_PARENT_PID", std::process::id().to_string())
             .stdin(Stdio::null())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit());
+            .stdout(out)
+            .stderr(err);
+        if let Some(p) = &log_path {
+            log::info!("backend output → {}", p.display());
+        }
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
@@ -89,23 +121,50 @@ pub fn autostart(app: &AppHandle) {
                     "backend not running and repo root unknown (set POLYTONE_REPO); skipping autostart"
                 ),
             }
-            // Wait up to ~30s for it to come up.
+            // First start can be slow (uv sync, embedding model load), so wait up to ~3 min,
+            // but stop early and say so if the process we spawned has already died.
             let mut healthy = false;
-            for _ in 0..60 {
+            for i in 0..360 {
                 tokio_sleep(Duration::from_millis(500)).await;
                 if client.health().await.is_ok() {
                     healthy = true;
                     break;
                 }
+                if let Some(code) = child_exit(&app) {
+                    log::warn!("backend exited during startup ({code})");
+                    crate::notify(
+                        &app,
+                        "Backend failed to start. See data/backend.log, or run `uv run polytone-api`.",
+                    );
+                    return;
+                }
+                if i == 60 {
+                    log::info!("backend still starting…");
+                }
             }
             if !healthy {
                 log::warn!("backend still not healthy; hotkey will report 'backend not running'");
+                crate::notify(&app, "Backend didn't come up. See data/backend.log.");
                 return;
             }
         }
         log::info!("backend healthy");
         crate::sync_from_backend_config(&app).await;
     });
+}
+
+/// Exit status of the backend we spawned, if it has already exited.
+fn child_exit(app: &AppHandle) -> Option<String> {
+    let state = app.state::<AppState>();
+    let mut guard = state.backend_child.lock().unwrap();
+    let child = guard.as_mut()?;
+    match child.try_wait() {
+        Ok(Some(status)) => {
+            guard.take();
+            Some(status.to_string())
+        }
+        _ => None,
+    }
 }
 
 async fn tokio_sleep(d: Duration) {

@@ -88,6 +88,12 @@ pub fn run() {
     .try_init();
 
     let app = tauri::Builder::default()
+        // Must be the first plugin: a second launch hands off to the running instance and exits,
+        // instead of starting a duplicate tray icon whose hotkey registration fails.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            log::info!("second launch: showing the running instance");
+            tray::show_main_window(app);
+        }))
         .manage(AppState::default())
         .plugin(tauri_plugin_notification::init())
         .plugin(
@@ -105,15 +111,16 @@ pub fn run() {
             backend_process::autostart(&handle);
             #[cfg(unix)]
             backend_process::exit_on_signals(&handle);
-            // First launch (or permission revoked): open the window so the user sees the
-            // onboarding guide instead of a silent menu-bar icon. POLYTONE_SHOW_WINDOW=1 forces it.
-            let force_show = std::env::var("POLYTONE_SHOW_WINDOW").is_ok_and(|v| v == "1");
+            // Launching the app should visibly open it: a menu-bar-only app with no window looks
+            // like it failed to start (and the tray icon can sit behind the notch).
+            // POLYTONE_START_HIDDEN=1 starts in the menu bar only, unless permissions are missing.
+            let start_hidden = std::env::var("POLYTONE_START_HIDDEN").is_ok_and(|v| v == "1");
             if !permissions::accessibility_trusted() {
                 log::warn!(
                     "Accessibility permission not granted yet; showing the onboarding window"
                 );
                 tray::show_main_window(&handle);
-            } else if force_show {
+            } else if !start_hidden {
                 tray::show_main_window(&handle);
             }
             Ok(())
@@ -142,6 +149,9 @@ pub fn run() {
         RunEvent::ExitRequested {
             code: None, api, ..
         } => api.prevent_exit(),
+        // Opening the app again (Finder, Spotlight, `open`) while it runs: bring the window back.
+        #[cfg(target_os = "macos")]
+        RunEvent::Reopen { .. } => tray::show_main_window(handle),
         RunEvent::Exit => backend_process::shutdown(handle),
         _ => {}
     });

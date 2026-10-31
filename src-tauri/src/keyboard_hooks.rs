@@ -197,10 +197,13 @@ pub struct CaptureResult {
     pub saved: SavedClipboard,
 }
 
-/// A clipboard value is usable intent if it is non-blank and not our sentinel.
+/// A clipboard value is usable intent if it is non-blank and not a sentinel — ours, or one left
+/// behind by an earlier run (stale on the clipboard, or pasted into the field and copied back).
 pub fn usable(sentinel: &str, value: Option<&str>) -> Option<String> {
     match value {
-        Some(v) if v != sentinel && !v.trim().is_empty() => Some(v.trim().to_string()),
+        Some(v) if v != sentinel && !v.contains(SENTINEL_MARK) && !v.trim().is_empty() => {
+            Some(v.trim().to_string())
+        }
         _ => None,
     }
 }
@@ -1043,6 +1046,11 @@ mod tests {
         assert_eq!(usable(S, Some(S)), None);
         assert_eq!(usable(S, Some("   \n")), None);
         assert_eq!(usable(S, Some("  hi  ")), Some("hi".into()));
+        // a sentinel from an earlier run is not intent either
+        assert_eq!(
+            usable(S, Some("polytone-sentinel-1793414545740352000")),
+            None
+        );
     }
 
     #[test]

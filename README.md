@@ -47,15 +47,18 @@ and the module layout.
 Requirements: macOS, Docker, [uv](https://docs.astral.sh/uv/), Node 20+ with pnpm, and Rust (stable).
 
 ```bash
-docker compose up -d                              # Neo4j on 127.0.0.1:7687 (neo4j / polytone-local)
-uv sync --extra embeddings --extra gmail          # Python 3.11 env (Qwen embeddings + Gmail are optional)
 cp .env.example .env                              # then set ANTHROPIC_API_KEY=sk-ant-…
-pnpm install
-pnpm tauri dev                                    # builds the app, starts the backend if it isn't running
+npm run tauri:dev                                 # or: pnpm start
 ```
 
-The app lives in the menu bar. On first launch, or whenever Accessibility isn't granted, it opens its
-window on the Settings tab with a three-step permissions guide.
+`npm run tauri:dev` runs `scripts/dev.sh`, which installs missing JS/Python deps, starts Docker and Neo4j,
+stops leftovers from an earlier run (a stale backend or a vite still holding port 1420), then runs
+`pnpm tauri dev`. The app starts the backend itself (output in the terminal, or `data/backend.log` when
+launched from Finder) and the backend exits when the app does, even if the app is force-quit.
+
+Launching opens the Polytone window; it also lives in the menu bar. Closing the window keeps it running.
+Opening the app again while it runs brings the window back instead of starting a second copy. Without
+Accessibility permission it opens on the Settings tab with a three-step permissions guide.
 
 - With no `ANTHROPIC_API_KEY` (or with `POLYTONE_LLM=mock`), a deterministic **mock LLM** produces drafts.
   This is useful for development. If you set `POLYTONE_LLM=anthropic` without a key, `/generate` answers
@@ -142,7 +145,7 @@ background when the backend starts. Run `uv run python -m backend.evaluation.cal
 `POLYTONE_LLM` (`anthropic`/`mock`), `NEO4J_*`, `POLYTONE_API_PORT` (8765), `POLYTONE_DATA_DIR`,
 `POLYTONE_WATCH_DIR`, `POLYTONE_USER_EMAILS`, `POLYTONE_WISPR_LOCAL`, `POLYTONE_WATCHER`,
 `POLYTONE_EMBEDDINGS` (`qwen`/`none`), `GMAIL_*`, `WISPR_*`. App-side variables: `POLYTONE_REPO` (backend
-location for a bundled app) and `POLYTONE_SHOW_WINDOW=1` (always open the window on launch).
+location for a bundled app) and `POLYTONE_START_HIDDEN=1` (start in the menu bar only; the window still opens when permissions are missing).
 
 ## Running tests
 
