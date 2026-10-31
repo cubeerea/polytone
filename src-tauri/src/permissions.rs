@@ -26,20 +26,11 @@ pub const INPUT_MONITORING_URL: &str =
 pub const INPUT_MONITORING_NOTE: &str = "If Polytone's hotkey fires but copy/paste does nothing, \
 also enable Polytone under System Settings > Privacy & Security > Input Monitoring.";
 
-#[cfg(target_os = "macos")]
-mod ffi {
-    #[link(name = "ApplicationServices", kind = "framework")]
-    unsafe extern "C" {
-        pub fn AXIsProcessTrusted() -> bool;
-    }
-}
-
 /// Whether this process is trusted for Accessibility (always true off macOS).
 pub fn accessibility_trusted() -> bool {
     #[cfg(target_os = "macos")]
     {
-        // SAFETY: AXIsProcessTrusted takes no arguments and has no preconditions.
-        unsafe { ffi::AXIsProcessTrusted() }
+        crate::macos::ax::is_process_trusted()
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -102,11 +93,31 @@ fn ancestor_paths() -> Vec<String> {
     out
 }
 
+/// Walking the ancestors spawns one `ps` per level, so it is done once (see [`warm_up`]).
 fn responsible_app() -> Option<String> {
     static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     CACHE
         .get_or_init(|| responsible_from_chain(&ancestor_paths()))
         .clone()
+}
+
+/// Resolve the responsible app on a background thread at launch, so neither startup nor the
+/// first `check_permissions` waits on `ps`. Logs a warning if Accessibility is missing.
+pub fn warm_up() {
+    let spawned = std::thread::Builder::new()
+        .name("polytone-permissions".into())
+        .spawn(|| {
+            let s = status();
+            if !s.accessibility {
+                log::warn!(
+                    "Accessibility not granted for {}; showing the onboarding window",
+                    s.grant_to
+                );
+            }
+        });
+    if let Err(e) = spawned {
+        log::warn!("permission check thread not started: {e}");
+    }
 }
 
 /// What to tell the user when Accessibility is missing.
@@ -132,9 +143,17 @@ pub fn settings_url(kind: &str) -> Option<&'static str> {
     }
 }
 
+/// Async: the first call may walk the process tree (`ps`), which must not block the main thread.
 #[tauri::command]
-pub fn check_permissions() -> PermissionStatus {
-    status()
+pub async fn check_permissions() -> PermissionStatus {
+    tauri::async_runtime::spawn_blocking(status)
+        .await
+        .unwrap_or_else(|_| PermissionStatus {
+            accessibility: accessibility_trusted(),
+            platform: std::env::consts::OS.to_string(),
+            grant_to: "Polytone".into(),
+            launched_from_other_app: false,
+        })
 }
 
 #[tauri::command]

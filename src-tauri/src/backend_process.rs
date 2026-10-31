@@ -125,7 +125,7 @@ pub fn autostart(app: &AppHandle) {
             // but stop early and say so if the process we spawned has already died.
             let mut healthy = false;
             for i in 0..360 {
-                tokio_sleep(Duration::from_millis(500)).await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
                 if client.health().await.is_ok() {
                     healthy = true;
                     break;
@@ -165,11 +165,6 @@ fn child_exit(app: &AppHandle) -> Option<String> {
         }
         _ => None,
     }
-}
-
-async fn tokio_sleep(d: Duration) {
-    // Avoid a direct tokio dependency: sleep on a blocking thread.
-    let _ = tauri::async_runtime::spawn_blocking(move || std::thread::sleep(d)).await;
 }
 
 /// Kill the spawned backend (and its process group) on exit.
