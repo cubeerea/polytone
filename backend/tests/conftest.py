@@ -22,6 +22,8 @@ from backend.storage.db import Database
 
 get_settings.cache_clear()
 
+TEST_APP_TOKEN = "test-app-token-0123456789abcdefghijklmnopqrstuv"
+
 HUMAN_SAMPLES = [
     "hey — i don't think we can make it today. let's push to friday! thanks so much.",
     "honestly it's fine. i'll send the deck later — no rush.",
@@ -56,11 +58,34 @@ def runtime(settings, tmp_path):
     rt.close()
 
 
-@pytest.fixture
-def client(runtime):
+@pytest.fixture(autouse=True)
+def _no_keychain(monkeypatch):
+    """Tests never read or write the real Keychain (POLYTONE_DATA_KEY covers the data key)."""
+    import keyring
+
+    def refuse(*a, **k):
+        raise AssertionError("tests must not touch the real Keychain")
+
+    for name in ("get_password", "set_password", "delete_password"):
+        monkeypatch.setattr(keyring, name, refuse)
+
+
+def api_client(runtime, *, token: str | None = TEST_APP_TOKEN, **kw):
+    """A TestClient for ``create_app(runtime)`` that talks to 127.0.0.1:<port> with the app token."""
     from fastapi.testclient import TestClient
 
     from backend.daemon.server import create_app
 
-    with TestClient(create_app(runtime)) as c:
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    return TestClient(
+        create_app(runtime, api_token=TEST_APP_TOKEN),
+        base_url=f"http://127.0.0.1:{runtime.settings.polytone_api_port}",
+        headers=headers,
+        **kw,
+    )
+
+
+@pytest.fixture
+def client(runtime):
+    with api_client(runtime) as c:
         yield c

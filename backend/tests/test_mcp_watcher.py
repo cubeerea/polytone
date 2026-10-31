@@ -132,12 +132,10 @@ def test_watcher_thread_picks_up_new_files(runtime, inbox):
 
 
 def test_daemon_starts_and_stops_watcher(runtime, inbox, monkeypatch):
-    from fastapi.testclient import TestClient
-
-    from backend.daemon.server import create_app
+    from backend.tests.conftest import api_client
 
     monkeypatch.setenv("POLYTONE_WATCHER", "1")
-    with TestClient(create_app(runtime)) as c:
+    with api_client(runtime) as c:
         c.app.state.warmup.join(5)  # the watcher starts in the background warm-up thread
         th = fw._active_thread
         assert th is not None and th.is_alive()
@@ -146,11 +144,9 @@ def test_daemon_starts_and_stops_watcher(runtime, inbox, monkeypatch):
 
 
 def test_daemon_watcher_disabled(runtime, inbox, monkeypatch):
-    from fastapi.testclient import TestClient
-
-    from backend.daemon.server import create_app
+    from backend.tests.conftest import api_client
 
     monkeypatch.setenv("POLYTONE_WATCHER", "0")
-    with TestClient(create_app(runtime)) as c:
+    with api_client(runtime) as c:
         c.app.state.warmup.join(5)
         assert fw._active_thread is None

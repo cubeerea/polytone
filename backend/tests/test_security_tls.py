@@ -119,9 +119,8 @@ def test_httpx_rejects_untrusted_cert(servers):
     import httpx
 
     _, u13, _ = servers
-    with tls.httpx_client(timeout=5, anthropic_defaults=False) as c:  # default CA store
-        with pytest.raises(httpx.ConnectError):
-            c.get(u13)
+    with tls.httpx_client(timeout=5, anthropic_defaults=False) as c, pytest.raises(httpx.ConnectError):
+        c.get(u13)  # default CA store: the throwaway CA is not trusted
 
 
 def test_requests_refuses_tls12(servers):

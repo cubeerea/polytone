@@ -165,6 +165,11 @@ def run_ingest_batch(
             source=source, started_at=started, finished_at=utcnow_iso(),
             accepted=total["accepted"], rejected=total["rejected"], status=status,
         )
+        if total["accepted"] or total["rejected"] or status != "ok":
+            rt.audit_event_soon(
+                "ingest", {"source": source, "accepted": total["accepted"], "rejected": total["rejected"],
+                           "status": status},
+            )
     if total["accepted"] and rt.score_async:
         rt.submit(rt.prime_constraints)  # the write invalidated the cache; refill it off the hot path
     return total

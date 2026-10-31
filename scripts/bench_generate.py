@@ -168,7 +168,12 @@ def main() -> None:
 
         from backend.daemon.server import create_app
 
-        with TestClient(create_app(rt)) as c:
+        app = create_app(rt)
+        with TestClient(
+            app,
+            base_url=f"http://127.0.0.1:{settings.polytone_api_port}",  # the Host check wants loopback
+            headers={"Authorization": f"Bearer {app.state.auth.app_token}"},
+        ) as c:
             for i in range(args.warmup + args.runs):
                 t0 = time.perf_counter()
                 r = c.post("/generate", json={"intent": INTENTS[i % 5], "persona": _PERSONAS[i % 4]})

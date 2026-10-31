@@ -143,6 +143,8 @@ def ingest_typed(
         rt.db.insert_draft_edit(
             app=app or "", text=text, nearest_draft_id=rt.db.recent_draft_id(DRAFT_EDIT_WINDOW_S)
         )
+        rt.audit_event_soon("ingest", {"source": "typed", "accepted": 0, "rejected": 1, "draft_edit": True,
+                                       "app": (app or "")[:100]})
         res = empty_result()
         res.update(rejected=1, reasons=[AFTER_INJECT_REASON])
         return res

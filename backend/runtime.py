@@ -18,9 +18,12 @@ from typing import Any
 from backend.config import Settings, get_settings
 from backend.graph.store import GraphStore, connect_graph_store
 from backend.llm.client import LLM, get_llm
+from backend.security.audit import AuditLog
 from backend.storage.db import Database
 
 log = logging.getLogger(__name__)
+
+AUDIT_FILE = "audit.sqlite3"
 
 # scorer(text, baseline_texts, persona) -> ScoreBreakdown
 Scorer = Callable[[str, list[str], str | None], dict]
@@ -47,6 +50,8 @@ class Runtime:
     # background work allowed (the server): the score node and constraint-cache priming run on a
     # worker thread so they never delay /generate; tests keep everything synchronous
     score_async: bool = False
+    # tamper-evident audit log (backend/security/audit.py); None → events are dropped
+    audit: AuditLog | None = None
     _graphs: dict[str, Any] = field(default_factory=dict, repr=False)
     _executor: ThreadPoolExecutor | None = field(default=None, repr=False)
 
@@ -65,6 +70,18 @@ class Runtime:
         except Exception as e:  # noqa: BLE001 - generation falls back to empty constraints anyway
             log.warning("constraint warm-up failed: %s", e)
 
+    def audit_event(self, event: str, detail: dict[str, Any] | None = None, actor: str = "backend") -> None:
+        """Append an audit event (never user text: counts, ids, lengths, bundle ids)."""
+        if self.audit is not None:
+            self.audit.append(event, detail or {}, actor)
+
+    def audit_event_soon(self, event: str, detail: dict[str, Any] | None = None, actor: str = "backend") -> None:
+        """Like ``audit_event`` but off the request thread in the server (``score_async``)."""
+        if self.score_async:
+            self.submit(self.audit_event, event, detail, actor)
+        else:
+            self.audit_event(event, detail, actor)
+
     def submit(self, fn: Callable[..., Any], *args: Any) -> None:
         if self._executor is None:
             self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="polytone-score")
@@ -78,6 +95,8 @@ class Runtime:
             self.store.close()
         except Exception as e:  # noqa: BLE001
             log.debug("closing graph store failed: %s", e)
+        if self.audit is not None:
+            self.audit.close()
 
 
 def build_runtime(
@@ -89,16 +108,27 @@ def build_runtime(
     scorer: Scorer | None | bool = None,
     score_async: bool = False,
 ) -> Runtime:
+    from backend.security import keys
+
     settings = settings or get_settings()
-    db = Database(db_path or settings.sqlite_path)
-    return Runtime(
+    keys.master_key()  # read (or create) the data key now: fail at start, not on the first write
+    audit = AuditLog(Path(settings.polytone_data_dir) / AUDIT_FILE)
+    db = Database(db_path or settings.sqlite_path)  # migrates plaintext rows (creates the key if new)
+    rt = Runtime(
         settings=settings,
         db=db,
         store=store if store is not None else connect_graph_store(settings),
         llm=llm if llm is not None else get_llm(settings),
         scorer=scorer,
         score_async=score_async,
+        audit=audit,
     )
+    if keys.consume_created():
+        rt.audit_event("key.created", {"service": keys.KEYCHAIN_SERVICE, "account": keys.KEYCHAIN_ACCOUNT})
+    graph_migration = getattr(rt.store, "migration", None) or {}
+    if db.migration or graph_migration:
+        rt.audit_event("migration.encrypted", {"sqlite": dict(db.migration), "neo4j": dict(graph_migration)})
+    return rt
 
 
 _runtime: Runtime | None = None
