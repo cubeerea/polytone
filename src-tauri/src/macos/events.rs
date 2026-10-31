@@ -221,6 +221,41 @@ impl Drop for KeyTap {
     }
 }
 
+/// Synthetic keyboard input for the end-to-end capture test only.
+#[cfg(test)]
+pub mod synth {
+    use std::ffi::c_void;
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGEventCreateKeyboardEvent(src: *const c_void, key: u16, down: bool) -> *mut c_void;
+        fn CGEventKeyboardSetUnicodeString(ev: *mut c_void, len: usize, s: *const u16);
+        fn CGEventSetFlags(ev: *mut c_void, flags: u64);
+        fn CGEventPost(tap: u32, ev: *mut c_void);
+    }
+
+    /// Post a key down + up at the HID level (seen by session taps, delivered to the
+    /// frontmost app). `text` (if any) is the typed character(s), like enigo's `text()`.
+    pub fn key(keycode: u16, flags: u64, text: Option<&str>) {
+        let utf16: Vec<u16> = text.unwrap_or("").encode_utf16().collect();
+        for down in [true, false] {
+            // SAFETY: plain CG calls on an event we own and release.
+            unsafe {
+                let ev = CGEventCreateKeyboardEvent(std::ptr::null(), keycode, down);
+                if ev.is_null() {
+                    continue;
+                }
+                CGEventSetFlags(ev, flags);
+                if !utf16.is_empty() {
+                    CGEventKeyboardSetUnicodeString(ev, utf16.len(), utf16.as_ptr());
+                }
+                CGEventPost(0, ev); // kCGHIDEventTap
+                super::CFRelease(ev as super::CFTypeRef);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

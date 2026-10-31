@@ -5,37 +5,45 @@
 //! 1. [`tap`]: a listen-only `CGEventTap` (keyDown) on its own thread. The callback only
 //!    forwards `(keycode, flags)` over a channel (re-enabling a timed-out tap) — it never blocks.
 //! 2. [`worker`]: gates every key: capture enabled, hotkey not paused, secure input off,
-//!    frontmost app allowlisted. Edit keys schedule a debounced ([`DEBOUNCE`]) read of the focused
-//!    element's `AXValue`, cached per app. Password fields (`AXSecureTextField`) are never read.
+//!    frontmost app allowlisted. The first key in a process opts Electron apps / Chromium
+//!    browsers into building their AX tree. Edit keys schedule a read of the focused element's
+//!    `AXValue` [`READ_DELAY`] later (once the app applied the key) and again after a
+//!    [`DEBOUNCE`] pause, cached per app. Password fields (`AXSecureTextField`) are never read.
 //! 3. A send key ([`classify_key`]: Return without Shift in chat-like apps, Cmd+Return, Cmd+Shift+D
 //!    in Mail) takes the cached text (or a fresher immediate read of the same element) and then
-//!    confirms the send ([`confirm_sent`]): the field must clear or lose focus within ~1s. A Return
-//!    that just inserts a newline (a browser textarea, a long email) is therefore never captured.
-//! 4. Filters ([`prepare_text`], [`SentLog`]): ≥ [`MIN_WORDS`] words, capped at [`MAX_CHARS`],
-//!    identical text per app is never resent. A send within [`INJECT_WINDOW`] of a Polytone inject
-//!    in the same app ([`InjectionTracker`]) is posted with `after_inject=true`, which the backend
-//!    stores for edit learning and never learns style from.
-//! 5. `POST /ingest/typed` fire-and-forget on the async runtime; failures are logged and shown in
-//!    [`CaptureStatus::last_error`], never as per-item notifications.
+//!    confirms the send ([`confirm_sent`]) by re-reading *that element*: it must clear, vanish or
+//!    hold something unrelated within ~1s. A Return that inserts a newline or accepts an
+//!    autocomplete is therefore never captured.
+//! 4. Filters ([`prepare_text`], [`SentLog`]): ≥ [`MIN_WORDS`] words, no slash commands, capped
+//!    at [`MAX_CHARS`], identical text per app is never resent. A send within [`INJECT_WINDOW`] of
+//!    a Polytone inject in the same app ([`InjectionTracker`]) is posted with `after_inject=true`,
+//!    which the backend stores for edit learning and never learns style from.
+//! 5. `POST /ingest/typed` fire-and-forget on the async runtime (retried while the backend is
+//!    starting); failures are logged and shown in [`CaptureStatus::last_error`], never as
+//!    per-item notifications. Why the last send key was ignored is in
+//!    [`CaptureStatus::last_skip`] and logged at debug
+//!    (`RUST_LOG=polytone_lib::typing_capture=debug`).
 //!
 //! Text is never captured on app switch (that would grab half-written drafts) — only on sends.
-//! The decision logic lives in [`policy`].
+//! The decision logic lives in [`policy`] and [`worker`] (both OS-free and unit-tested).
 
+#[cfg(target_os = "macos")]
+mod os;
 pub mod policy;
 #[cfg(target_os = "macos")]
 mod tap;
-#[cfg(target_os = "macos")]
-mod worker;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub mod worker;
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde::Serialize;
 use tauri::{AppHandle, Manager};
 
 use crate::AppState;
-use crate::backend_client::{BackendConfig, TypedIngestRequest};
+use crate::backend_client::{BackendConfig, BackendError, TypedIngestRequest};
 
 pub use policy::*;
 
@@ -51,6 +59,9 @@ pub struct CaptureStatus {
     pub captured_this_session: u32,
     pub last_captured_at: Option<String>,
     pub last_error: Option<String>,
+    /// Additive: why the last send key in an allowlisted app was not learned from (local skip
+    /// or the engine's rejection reason); cleared by the next learned message.
+    pub last_skip: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -73,6 +84,7 @@ struct StatusInner {
     apps: Vec<String>,
     last_captured_at: Option<String>,
     last_error: Option<String>,
+    last_skip: Option<String>,
 }
 
 static SHARED: OnceLock<Shared> = OnceLock::new();
@@ -96,6 +108,54 @@ pub fn status() -> CaptureStatus {
         captured_this_session: s.captured.load(Ordering::SeqCst),
         last_captured_at: st.last_captured_at.clone(),
         last_error: st.last_error.clone(),
+        last_skip: st.last_skip.clone(),
+    }
+}
+
+const NO_ACCESSIBILITY: &str = "Accessibility permission is needed to read what you type \
+     (System Settings > Privacy & Security > Accessibility)";
+
+/// A send key that was not captured: debug log + `last_skip` (gate-level reasons such as an
+/// app outside the list are only logged, or every Return in Terminal would show up).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn on_skip(bundle_id: &str, why: &Skip) {
+    let app = if bundle_id.is_empty() { "?" } else { bundle_id };
+    log::debug!("typing capture: send key in {app} ignored: {why}");
+    if matches!(
+        why,
+        Skip::Off | Skip::Paused | Skip::NoFrontApp | Skip::NotAllowlisted(_)
+    ) {
+        return;
+    }
+    let mut st = shared().status.lock().unwrap();
+    st.last_skip = Some(format!("{app}: {why}"));
+    if *why == Skip::NoAccessibility {
+        st.last_error = Some(NO_ACCESSIBILITY.into());
+    }
+}
+
+/// Capture on and the hotkey not paused.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn active() -> Result<(), Skip> {
+    if !shared().enabled.load(Ordering::SeqCst) {
+        Err(Skip::Off)
+    } else if paused() {
+        Err(Skip::Paused)
+    } else {
+        Ok(())
+    }
+}
+
+/// The worker's OS bindings wired to the app state.
+#[cfg(target_os = "macos")]
+fn app_os() -> os::MacOs {
+    os::MacOs {
+        frontmost: Box::new(os::front_app),
+        active: Box::new(active),
+        allowlisted: Box::new(allowlisted),
+        after_inject: Box::new(after_inject),
+        dispatch: Box::new(dispatch),
+        skipped: Box::new(on_skip),
     }
 }
 
@@ -132,11 +192,7 @@ pub fn apply(app: &AppHandle, enabled: bool, apps: Vec<String>) -> CaptureStatus
         match platform::start() {
             Ok(()) => {
                 if !crate::permissions::accessibility_trusted() {
-                    set_error(Some(
-                        "Accessibility permission is needed to read what you type \
-                         (System Settings > Privacy & Security > Accessibility)"
-                            .into(),
-                    ));
+                    set_error(Some(NO_ACCESSIBILITY.into()));
                 } else {
                     set_error(None);
                 }
@@ -193,18 +249,45 @@ fn paused() -> bool {
         .is_some_and(|a| a.state::<AppState>().paused.load(Ordering::SeqCst))
 }
 
+/// Waits between retries of a typed POST while the backend isn't listening (~20s in all).
+const DISPATCH_RETRIES: [Duration; 3] = [
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+    Duration::from_secs(13),
+];
+
 /// Fire-and-forget `POST /ingest/typed`.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn dispatch(req: TypedIngestRequest) {
     let Some(app) = APP.get() else { return };
     let client = app.state::<AppState>().client.clone();
     tauri::async_runtime::spawn(async move {
-        match client.ingest_typed(&req).await {
+        let mut attempt = 0;
+        let result = loop {
+            let r = client.ingest_typed(&req).await;
+            // the backend restarts / boots after the app: keep the message for a little while
+            match (&r, DISPATCH_RETRIES.get(attempt)) {
+                (Err(BackendError::NotRunning), Some(delay)) => {
+                    attempt += 1;
+                    log::debug!("typed capture: backend not running, retry in {delay:?}");
+                    tokio::time::sleep(*delay).await;
+                }
+                _ => break r,
+            }
+        };
+        match result {
             Ok(res) => {
                 let s = shared();
                 s.captured.fetch_add(1, Ordering::SeqCst);
                 let mut st = s.status.lock().unwrap();
                 st.last_captured_at = Some(iso_utc(SystemTime::now()));
+                st.last_skip = (res.accepted == 0).then(|| {
+                    format!(
+                        "{}: not learned: {}",
+                        req.app,
+                        res.reasons.first().map_or("rejected", String::as_str)
+                    )
+                });
                 if st
                     .last_error
                     .as_deref()

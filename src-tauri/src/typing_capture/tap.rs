@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use crate::macos::events::{self, KeyDown, KeyTap, RunLoopHandle};
 
+use super::os;
 use super::shared;
 use super::worker::Worker;
 
@@ -29,7 +30,7 @@ pub fn start() -> Result<(), String> {
     let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
     thread::Builder::new()
         .name("polytone-capture-worker".into())
-        .spawn(move || Worker::default().run(rx))
+        .spawn(move || os::run(Worker::new(super::app_os()), rx))
         .map_err(|e| e.to_string())?;
     thread::Builder::new()
         .name("polytone-capture-tap".into())

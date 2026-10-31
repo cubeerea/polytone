@@ -50,9 +50,18 @@ impl Element {
         }))
     }
 
-    /// The UI element that has keyboard focus (any app).
+    /// The UI element that has keyboard focus (any app). Note: on macOS 26 the system-wide
+    /// element can answer kAXErrorCannotComplete for every query; prefer [`Element::focused_in`]
+    /// when the frontmost pid is known.
     pub fn focused(timeout_secs: f32) -> Option<Element> {
         Element::system_wide(timeout_secs)?.element_attr("AXFocusedUIElement")
+    }
+
+    /// The focused UI element of the app `pid` (asks the app itself).
+    pub fn focused_in(pid: i32, timeout_secs: f32) -> Option<Element> {
+        let app = Element::application(pid)?;
+        app.set_timeout(timeout_secs);
+        app.element_attr("AXFocusedUIElement")
     }
 
     pub fn set_timeout(&self, secs: f32) {
@@ -84,6 +93,24 @@ impl Element {
     /// A string attribute (`AXRole`, `AXValue`, `AXSelectedText`, ...).
     pub fn string_attr(&self, name: &str) -> Option<String> {
         self.attr(name)?.to_rust_string()
+    }
+
+    /// Whether the element answers attribute `name` at all (Electron apps answer
+    /// `AXManualAccessibility`; Chromium browsers and native apps don't).
+    pub fn has_attr(&self, name: &str) -> bool {
+        self.attr(name).is_some()
+    }
+
+    /// A boolean attribute (`None` if unsupported or not a CFBoolean).
+    pub fn bool_attr(&self, name: &str) -> Option<bool> {
+        let v = self.attr(name)?;
+        // SAFETY: v is live; the boolean constants are static CF objects.
+        unsafe {
+            if CFGetTypeID(v.as_ptr()) != CFGetTypeID(kCFBooleanTrue) {
+                return None;
+            }
+            Some(v.as_ptr() == kCFBooleanTrue)
+        }
     }
 
     pub fn pid(&self) -> Option<i32> {

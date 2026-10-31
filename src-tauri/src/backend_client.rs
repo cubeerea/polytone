@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:8765";
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
+/// `/ingest/typed` may wait ~1.5s for Wispr Flow and then runs the ingest graph (embeddings).
+pub const TYPED_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub const MSG_EMPTY: &str = "Type or select your rough intent first";
 pub const MSG_NOT_RUNNING: &str = "Polytone backend not running";
@@ -235,6 +237,7 @@ impl BackendClient {
         let resp = self
             .http
             .post(self.url("/ingest/typed"))
+            .timeout(TYPED_TIMEOUT)
             .json(req)
             .send()
             .await?;
