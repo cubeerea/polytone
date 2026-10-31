@@ -39,6 +39,11 @@ Every component builds against this file. Change it only with the orchestrator's
 
 ## HTTP API (JSON, all on 127.0.0.1:8765, CORS allows tauri://localhost + http://localhost:1420)
 
+Every route except `GET /health` needs `Authorization: Bearer <app token | session token>` (missing /
+invalid / expired → `401 {"detail":"locked"}`), and every request's `Host` must be `127.0.0.1:<port>` or
+`localhost:<port>` (else `403 {"detail":"forbidden host"}`). Routes marked *app* refuse a session token
+with `403 {"detail":"app token required"}`. See Security → Local API auth.
+
 | Method | Path | Request | Response |
 |---|---|---|---|
 | GET | `/health` | – | `{"status":"ok","neo4j":bool,"llm":"anthropic"\|"mock","embeddings":"qwen"\|"none","graph_store":"neo4j"\|"memory","llm_ready":bool,"wispr_live":bool}` (`llm` = configured backend; `llm_ready` false → `/generate` will 502; additive `wispr_live` = the live Wispr Flow watcher is running). Answers as soon as uvicorn is up; graph compile, constraint priming, the drop-folder watcher, the live Wispr watcher and the embedding model warm in a background thread afterwards. |
@@ -48,11 +53,18 @@ Every component builds against this file. Change it only with the orchestrator's
 | GET | `/ingest/sources` | – | `[{"name":"manual"\|"gmail"\|"wispr"\|"watcher"\|"typed","enabled":bool,"status":str,"last_run":iso\|null,"items_ingested":int}]` (`typed`: `enabled` = `capture_enabled`, `status` `"listening"`\|`"disabled"`; `wispr` while live: `"live (watching flow.sqlite; last dictation picked up <iso> (<app>); <n> ingested live)"`, else `"ready (local history: flow.sqlite)"` / `"needs credentials: …"`) |
 | POST | `/ingest/sources/{name}/run` | – | `IngestResult`; `typed` → `400 {"detail":"typed is push-only"}`; unknown → 404 |
 | GET | `/personas` | – | `[{"name":str,"description":str}]` (defaults: Boss, Friend, Investor, Default) |
-| GET/PUT | `/config` | `{"active_persona":str,"hotkey":str,"inject_mode":"paste"\|"type","capture_enabled":bool,"capture_apps":[str]}` (PUT: every field optional, omitted = unchanged) | same (full config) |
+| GET/PUT | `/config` | `{"active_persona":str,"hotkey":str,"inject_mode":"paste"\|"type","capture_enabled":bool,"capture_apps":[str],"lock_idle_minutes":int /*1–240, default 15*/,"retention_days":int /*0–3650, 0 = keep forever (default)*/}` (PUT: every field optional, omitted = unchanged; out of range → 422; setting a non-zero `retention_days` purges at once) | same (full config) |
 | GET | `/drafts?limit=50` | – | `[{"draft_id","created_at","persona","intent","text","latency_ms","score":ScoreBreakdown\|null}]` |
 | GET | `/scores/summary` | – | `{"mean":float\|null,"count":int,"trend":[{"t":iso,"score":float}]}` |
 | GET | `/graph?limit=60&persona=` | – | `{"nodes":[{"id":str,"label":"Word"\|"SentenceStructure"\|"PunctuationMark"\|"IntentContext","name":str,"weight":float}],"edges":[{"source":str,"target":str,"type":"FOLLOWED_BY"\|"PART_OF_STRUCTURE"\|"USED_IN","weight":float}]}` |
 | GET | `/stats` | – | `{"words":int,"structures":int,"samples":int,"avg_sentence_len":float\|null}` |
+| POST | `/session` *app* | – | `{"token":str,"idle_timeout_s":int,"expires_at":iso /*absolute cap: now + 12 h*/}` |
+| DELETE | `/session` *app* | – | `{"revoked":int}` (every UI session) |
+| DELETE | `/session/current` | – (session token) | `{"revoked":1}`; with the app token → `400` |
+| GET | `/audit?limit=100&before_seq=` | – | `{"entries":[{"seq","ts","event","actor","detail","prev","mac"}] /*newest first*/,"head_seq":int}` |
+| GET | `/audit/verify` | – | `{"ok":bool,"count":int,"first_bad_seq":int\|null,"reason":str\|null}` |
+| POST | `/audit/event` *app* | `{"event":str /*e.g. "session.unlock_failed"; [a-z0-9_.]*/,"detail":{}}` | `{"seq":int}` (actor `app`) |
+| POST | `/data/wipe` | `{"confirm":"delete everything"}` (anything else → 400) | `{"deleted":{"samples":int,"drafts":int,"draft_edits":int,"graph_nodes":int}}` |
 
 `Constraints` = `{"avg_sentence_len":float,"sentence_len_p90":float,"top_openers":[str],"top_transitions":[str],"top_bigrams":[[str,str,float]],"punctuation_rates":{str:float},"structures":[{"signature":str,"weight":float}],"lexicon":[str],"casing":"lower"|"sentence"|"mixed","contractions_rate":float,"sample_count":int}`
 
@@ -136,7 +148,7 @@ Learns from messages the user types and **sends** in allowlisted native apps.
 ## Python module boundaries (backend/)
 
 - `config.py` — `Settings`, `get_settings()`.
-- `storage/db.py` — SQLite (`data/polytone.sqlite3`): tables `config`, `drafts`, `samples` (ingested human text + provenance + sha256), `ingest_runs`, `draft_edits` (post-inject sends; never learned). `Database(path)` methods documented in that file (the old module-level wrappers are gone; use `Runtime.db`). One persistent connection per thread, WAL + `synchronous=NORMAL`; `draft_watermark()`/`drafts_since(rowid)`/`samples_watermark()` let in-process caches stay exact across processes.
+- `storage/db.py` — SQLite (`data/polytone.sqlite3`): tables `config`, `drafts`, `samples` (ingested human text + provenance + blind index in column `sha256`), `ingest_runs`, `draft_edits` (post-inject sends; never learned). User-text columns are `enc1:` ciphertext, decrypted on read (see Security). `Database(path)` methods documented in that file (the old module-level wrappers are gone; use `Runtime.db`). One persistent connection per thread, WAL + `synchronous=NORMAL`; `draft_watermark()`/`drafts_since(rowid)`/`samples_watermark()` let in-process caches stay exact across processes.
 - `graph/store.py` — `GraphStore` protocol + `Neo4jGraphStore` + `InMemoryGraphStore` (tests). Cypher templates live in `graph/queries.py`.
 - `ingestion/extract.py` — `extract(text) -> Extraction` (pure python, deterministic, no network). Triplets: Word FOLLOWED_BY Word (weight), Word PART_OF_STRUCTURE SentenceStructure, SentenceStructure USED_IN IntentContext, PunctuationMark nodes.
 - `ingestion/firewall.py` — `HumanText` provenance gate; every rejection returns a reason string. Rejects: empty,
@@ -165,7 +177,8 @@ Learns from messages the user types and **sends** in allowlisted native apps.
 - `evaluation/style_distance.py` — `score(text, baseline_texts, persona=None) -> ScoreBreakdown`; `score_draft(draft_id, runtime_or_db)` re-scores + persists. Features in `evaluation/features.py`, optional Qwen3 embedding in `evaluation/embeddings.py`, `python -m backend.evaluation.calibrate` prints sanity numbers.
 - `mcp_servers/` — FastMCP stdio servers: `graph_server.py` (tool `execute_read`, `get_constraints`), `gmail_outbound.py` (only `in:sent from:me`; inbound blocked), `wispr.py` (WebSocket client; falls back to local Wispr history), `wispr_live.py` (live Wispr watcher + insertion index), `file_watcher.py` (.txt, .mbox [only messages From: the user], SQLite dumps).
 - `daemon/server.py` — FastAPI app wiring everything (`create_app(runtime)`).
-- `runtime.py` — `Runtime(settings, db, store, llm, scorer)`; `build_runtime(...)`, `get_runtime()`, `set_runtime()`.
+- `runtime.py` — `Runtime(settings, db, store, llm, scorer, audit)`; `build_runtime(...)` (reads/creates the data key, opens `data/audit.sqlite3`, audits `key.created` / `migration.encrypted`), `get_runtime()`, `set_runtime()`; `rt.audit_event(event, detail, actor)`.
+- `security/` — `keys.py` (master key, HKDF subkeys, Keychain secrets), `crypto.py` (AES-GCM + blind index), `audit.py`, `auth.py` (app token, sessions, ASGI middleware), `tls.py` (TLS 1.3 transports), `retention.py` (purge, wipe, daily task), `files.py` (permissions).
 - `ingestion/types.py` — `Extraction` dataclass (producer: `extract`, consumer: `GraphStore.write_extraction`).
   Additive fields: `opener_ngrams, contractions, expansions, lower_i, upper_i` (all defaulted).
 - `ingestion/sources.py` — source registry. Each `mcp_servers` source module may expose
@@ -176,11 +189,11 @@ Learns from messages the user types and **sends** in allowlisted native apps.
 
 ## Neo4j schema
 
-Nodes: `(:Word {text})`, `(:SentenceStructure {signature})`, `(:PunctuationMark {symbol})`, `(:IntentContext {name})`.
+Nodes: `(:Word {key /*blind index*/, text /*enc1: ciphertext*/})`, `(:SentenceStructure {signature})`, `(:PunctuationMark {symbol})`, `(:IntentContext {name})`, `(:PolytoneMeta {name:"schema", enc_version})` (migration marker).
 Rels: `(:Word)-[:FOLLOWED_BY {weight, persona_weights}]->(:Word)`, `(:Word)-[:PART_OF_STRUCTURE {weight}]->(:SentenceStructure)`, `(:SentenceStructure)-[:USED_IN {weight}]->(:IntentContext)`, `(:PunctuationMark)-[:USED_IN {weight}]->(:IntentContext)`.
-Constraints: unique `Word.text`, `SentenceStructure.signature`, `PunctuationMark.symbol`, `IntentContext.name`.
+Constraints: unique `Word.key`, `SentenceStructure.signature`, `PunctuationMark.symbol`, `IntentContext.name` (the old `word_text` constraint is dropped by the migration).
 Writes are always `MERGE ... ON CREATE SET weight=0 SET weight = weight + $n`.
-Neo4j: `bolt://localhost:7687`, user `neo4j`, password `polytone-local`.
+Neo4j: `bolt://localhost:7687`, user `neo4j`, password `NEO4J_PASSWORD` from `.env` (shipped default `polytone-local`, replaced by a random one by `scripts/rotate-neo4j-password.sh`).
 
 Implementation notes (backend core, additive — see `graph/queries.py`):
 - `IntentContext.name` is the persona. It also carries the persona's aggregate style counters
@@ -193,6 +206,10 @@ Implementation notes (backend core, additive — see `graph/queries.py`):
   counter keeps a computation that raced a write out of the cache). After an accepted ingest the server re-primes
   the active persona's constraints in the background. Each Neo4j aggregate is read in one read transaction.
 - `IntentContext` also stores `opener_phrase_keys/opener_phrase_counts` (2–3 word openers).
+- Encryption: `MERGE`/`MATCH` on `Word.key`; `opener_keys`/`opener_phrase_keys`/`transition_keys` hold blind
+  indexes (context `neo4j:IntentContext.<prop>`) with the ciphertexts in parallel `opener_texts`/
+  `opener_phrase_texts`/`transition_texts`. Ranking ties break on `key` (`ORDER BY n DESC, key ASC`); the
+  in-memory store does the same so aggregates match exactly. Reads decrypt through an in-memory key→word map.
 
 ## Security
 
@@ -210,29 +227,48 @@ an attacker running as the same user with the Polytone window unlocked, or root.
 ### Encryption at rest (`backend/security/crypto.py`)
 - AES-256-GCM, random 96-bit nonce, AAD = a context string (`"<table>.<column>"` / `"neo4j:<Label>.<prop>"`).
   Stored as text `enc1:<base64url(nonce||ciphertext||tag)>`. Decrypt failure raises, never returns garbage.
-- Blind index for anything looked up / made unique by content: `idx1:<base64url(HMAC-SHA256(subkey("index"), context||value))[:32]>`.
-  Replaces the plain `sha256` dedupe column (a plain hash of short text is guessable).
-- Every column/property holding user text is encrypted: SQLite `drafts.intent/text`, `samples.text`,
-  `samples.provenance` (if it carries text), `draft_edits.text`, and Neo4j word/bigram/opener/text
-  properties (lookup key = blind index, display value = ciphertext). Counts, timestamps, persona names,
-  config and cursors stay plain.
-- Migration runs once at backend start: idempotent (already-`enc1:` values skipped), one transaction
-  per table / Neo4j batch, then `VACUUM` + WAL checkpoint so plaintext pages don't linger.
-- Embedding vectors (if stored) are encrypted too.
+- Blind index for anything looked up / made unique by content: `idx1:<base64url(HMAC-SHA256(subkey("index"), context||0x00||value))[:32]>`.
+  Replaces the plain sha256 dedupe value (a plain hash of short text is guessable). The SQLite column keeps
+  its name `sha256` but holds `idx1:` of the stripped text with context `content.text` (shared by `drafts`
+  and `samples`: the firewall compares them). Neo4j contexts: `neo4j:Word.text`, `neo4j:IntentContext.<keys prop>`.
+- Every column/property holding user text is encrypted: SQLite `drafts.intent/text/constraints_json`
+  (constraints carry lexicon/openers/bigrams), `samples.text`, `samples.provenance_json` (always),
+  `draft_edits.text`, and Neo4j `Word.text` + IntentContext opener/phrase/transition lists (lookup key =
+  blind index, display value = ciphertext; bigrams are relationships between keyed Words). Counts,
+  timestamps, persona names, structure signatures, punctuation symbols, `drafts.score_json`, app bundle
+  ids, config, cursors and `watcher_files` (file hashes + paths) stay plain.
+- Decryption is memoized in process memory (bounded LRU keyed by ciphertext, plus the graph store's
+  key→word map), so the hot path does not decrypt per request. A legacy plaintext value read after the
+  migration (written by an older build) is returned as is and encrypted at the next start; a corrupt or
+  wrong-key `enc1:` value raises.
+- Migration runs at every start (`Database.init`, `connect_graph_store`) and is a no-op once done:
+  idempotent (already-`enc1:`/`idx1:` values skipped), one transaction per table (two legacy samples whose
+  stripped text collides are deduped) then `VACUUM` + `wal_checkpoint(TRUNCATE)` so plaintext pages don't
+  linger; Neo4j: batches of 2000 nodes, one write transaction each, selecting only unmigrated nodes
+  (`Word.key IS NULL`, `IntentContext.opener_texts IS NULL`), then drops `word_text` and sets the
+  `PolytoneMeta` marker (resumable after a crash). Neo4j does not compact store files, so freed plaintext
+  pages may persist until reused (documented in the README). SQLite runs with `secure_delete=ON`.
+- Embedding vectors are never stored (in-memory cache only).
 
 ### Local API auth (backend ↔ Rust ↔ UI)
 - **App token**: backend uses `POLYTONE_API_TOKEN` if set, else generates 32 random bytes (base64url).
   It always writes the token to `<data_dir>/.api_token` (mode 0600, atomic replace). Rust generates the
   token and passes it in the env when it spawns the backend; when it attaches to an already-running
   backend it reads the file. Sent as `Authorization: Bearer <token>`. Only Rust holds it. Full scope.
+  The backend sets `umask 077` at start.
 - **UI session** ("auto-logout"): `POST /session` (app token only) → `{"token":str,"idle_timeout_s":int,"expires_at":iso}`.
   Session tokens are in memory only (backend and UI; never localStorage). Sliding idle timeout =
-  config `lock_idle_minutes` (int 1–240, default 15); absolute cap 12 h. `DELETE /session` (app token)
-  revokes all sessions; `DELETE /session/current` (session token) locks this session.
+  config `lock_idle_minutes` (int 1–240, default 15; a change applies to existing sessions at once);
+  absolute cap 12 h (`expires_at`). Every authenticated session request slides the idle timer.
+  `DELETE /session` (app token) revokes all sessions; `DELETE /session/current` (session token) locks this
+  session. Session tokens are held only as SHA-256 digests.
   Session scope = every endpoint except `POST /session` / `DELETE /session` / `POST /audit/event`.
 - Unauthenticated: `GET /health` only (no user content in it). Missing/invalid/expired token → 401
-  `{"detail":"locked"}`. Tokens compared in constant time. Requests whose `Host` isn't
-  `127.0.0.1:<port>` / `localhost:<port>` → 403 (DNS rebinding). CORS list unchanged.
+  `{"detail":"locked"}` (+ `WWW-Authenticate: Bearer`). Tokens compared in constant time (digest compare).
+  Requests whose `Host` isn't `127.0.0.1:<port>` / `localhost:<port>` → 403 `{"detail":"forbidden host"}`
+  (DNS rebinding; applies to `/health` too). CORS list unchanged; CORS wraps auth, so 401s carry CORS
+  headers and preflights need no token. A session token on an app-only route → 403
+  `{"detail":"app token required"}`.
 - Rust (Tauri commands): `unlock() -> {token, idle_timeout_s}` = LocalAuthentication
   `deviceOwnerAuthentication` (Touch ID or Mac password), then `POST /session`; `lock()`;
   `get_lock_state() -> {locked: bool}`. Rust locks (DELETE /session + emits event `locked`) on screen
@@ -249,22 +285,48 @@ an attacker running as the same user with the Polytone window unlocked, or root.
   `auth.denied`, `generate` (persona, chars in/out, model, latency), `ingest` (source, accepted/rejected),
   `config.change` (keys changed, not values of secrets), `capture.start`/`capture.stop`,
   `data.wipe`, `data.retention_purge`, `key.created`, `migration.encrypted`.
+  Backend emitters: `session.unlock` (`POST /session`), `session.lock` (`DELETE /session[/current]`,
+  detail `reason` `app`|`user`), `session.expired` (detail `reason` `idle`|`max_age`), `auth.denied`
+  (rate-limited to one row per 60 s with a `count`), `generate` (also failures: `ok:false, error`),
+  `ingest` (every `run_ingest_batch` that saw items, and typed after-inject edits), `config.change` +
+  `capture.start/stop` (`PUT /config`), `data.*`, `key.created` and `migration.encrypted` (`build_runtime`).
+  `session.unlock_failed` and Rust-side capture events come via `POST /audit/event`. Actors: `app`, `ui`,
+  `backend`, `unknown` (denied requests). `generate`/`ingest` rows are written off the request thread.
+- Verify also fails when `.audit_head` is missing while rows exist, or its mac doesn't match the last row;
+  `.audit_head` behind the log (crash between commit and head write) is fine. Appends are serialized
+  across processes (`flock` on `data/.audit.lock`). Strings longer than 200 chars in `detail` are replaced
+  by `<n chars dropped>`. Limitation: an attacker with the data dir can delete the tail AND rewrite
+  `.audit_head` to the new last row (its mac is in the log); detecting that needs an external anchor.
 - `GET /audit?limit=&before_seq=` → `{"entries":[...], "head_seq":int}`; `GET /audit/verify` →
   `{"ok":bool,"count":int,"first_bad_seq":int|null,"reason":str|null}`; `POST /audit/event`
   (app token only) `{event, detail}` for Rust-side events (actor `app`).
 
 ### Network
-- Outbound HTTPS (Anthropic, Google APIs): TLS 1.3 minimum, certificate verification on (default CA store).
+- Outbound HTTPS (Anthropic, Google APIs): TLS 1.3 minimum, certificate verification on (certifi CA
+  bundle). `security/tls.py`: Anthropic SDK → `anthropic.DefaultHttpxClient(verify=<TLS 1.3 SSLContext>)`
+  (SDK timeout 6.5 s / 0 retries / prompt caching unchanged); googleapiclient → `AuthorizedHttp` over
+  `httplib2.Http(tls_minimum_version=TLSv1_3)` (API calls, discovery doc and its token refreshes);
+  google-auth refresh at load and the OAuth code exchange → a `requests` session whose HTTPS adapter
+  carries the context.
 - Loopback (UI/Rust ↔ backend, backend ↔ Neo4j on 127.0.0.1): no TLS; protected by tokens / password.
   Neo4j ports stay bound to 127.0.0.1.
-- Neo4j password: `scripts/rotate-neo4j-password.sh` generates a random one, applies it in the running
-  container, writes it to `.env` (0600). `dev.sh` runs it when `.env` still has the default.
+- Neo4j password: `scripts/rotate-neo4j-password.sh` generates a random 32-char one, applies it in the
+  running container (`docker compose exec -T -e NEO4J_PASSWORD neo4j cypher-shell -u neo4j -d system`,
+  the `ALTER CURRENT USER SET PASSWORD FROM … TO …` statement on stdin so neither password is in argv),
+  and only after that succeeds rewrites `NEO4J_PASSWORD` in `.env` (atomic, 0600). `dev.sh` runs it when
+  `.env` still has the default (or no `NEO4J_PASSWORD`). `docker-compose.yml` takes the initial
+  `NEO4J_AUTH` password from `.env` (`${NEO4J_PASSWORD:-polytone-local}`; Neo4j only reads it on first init).
 
 ### Retention and files
-- Config `retention_days` (0 = keep forever, default 0): daily purge of `samples` from `typed`/`wispr`,
-  `draft_edits` and `drafts` older than N days (style graph aggregates stay). `POST /data/wipe`
-  `{"confirm":"delete everything"}` deletes all samples, drafts, draft_edits and the style graph.
-- `data/` is 0700, files in it 0600 (including `backend.log`, `gmail_token.json`, `.env`).
-  Logs never contain user text.
+- Config `retention_days` (0 = keep forever, default 0, max 3650): purge at server start, then every
+  24 h, and right after `PUT /config` sets a non-zero value — `samples` from `typed`/`wispr`, `draft_edits`
+  and `drafts` older than N days (by `created_at`; style graph aggregates stay). `POST /data/wipe`
+  `{"confirm":"delete everything"}` deletes all samples, drafts, draft_edits and the style graph, VACUUMs,
+  and clears in-memory copies (decryption memo, few-shot caches). Both audited. (Ingest cursors such as
+  `wispr.history_rowid` are kept, so wiped history is not re-imported.)
+- `data/` is 0700, files in it 0600 (including `backend.log`, `gmail_token.json`, `.env`); the backend
+  fixes modes at start (`security/files.py`: `data/` and its subdirs 0700, its regular files 0600, plus
+  `.env` and `GMAIL_TOKEN_PATH`) and writes tokens atomically with 0600. `dev.sh` chmods `.env` 0600.
+  Logs never contain user text (exceptions on content paths are logged by class name only).
 - `ANTHROPIC_API_KEY` may live in the Keychain (service `com.polytone.app`, account `anthropic-api-key`)
   instead of `.env`; env wins when both exist.

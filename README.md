@@ -151,8 +151,42 @@ has been downloaded). Run `uv run python -m backend.evaluation.calibrate` for sa
 `.env` (see `.env.example`): `ANTHROPIC_API_KEY`, `POLYTONE_MODEL` (default `claude-sonnet-5-5`),
 `POLYTONE_LLM` (`anthropic`/`mock`), `POLYTONE_EFFORT` (`low` default; higher = more thinking, slower drafts), `NEO4J_*`, `POLYTONE_API_PORT` (8765), `POLYTONE_DATA_DIR`,
 `POLYTONE_WATCH_DIR`, `POLYTONE_USER_EMAILS`, `POLYTONE_WISPR_LOCAL`, `POLYTONE_WISPR_LIVE`, `POLYTONE_WATCHER`,
-`POLYTONE_EMBEDDINGS` (`qwen`/`none`), `GMAIL_*`, `WISPR_*`. App-side variables: `POLYTONE_REPO` (backend
+`POLYTONE_EMBEDDINGS` (`qwen`/`none`), `GMAIL_*`, `WISPR_*`, `POLYTONE_API_TOKEN` (normally set by the app),
+`POLYTONE_DATA_KEY` (base64 32-byte key overriding the Keychain — tests/CI only). App-side variables: `POLYTONE_REPO` (backend
 location for a bundled app) and `POLYTONE_START_HIDDEN=1` (start in the menu bar only; the window still opens when permissions are missing).
+
+## Security and privacy
+
+Full spec: `CONTRACTS.md` → *Security*. In short:
+
+- **Encrypted at rest.** Everything you wrote (samples, drafts and their intents, post-inject edits,
+  provenance) is stored in SQLite as AES-256-GCM ciphertext (`enc1:…`), and the Neo4j style graph holds
+  only blind indexes (`idx1:…`, keyed hashes used for lookups) plus ciphertext — never your words. The
+  256-bit key lives in the macOS Keychain (`com.polytone.app` / `data-key-v1`) and is created on first
+  start. **Back it up with the data**: without the Keychain item the data can't be read. On the first start
+  of this version, existing plaintext data is encrypted in place (SQLite: one transaction per table, then
+  `VACUUM`; Neo4j: batched and resumable) and recorded as `migration.encrypted` in the audit log. Neo4j does
+  not compact its store files, so old plaintext pages may remain on disk until Neo4j reuses them; for a
+  clean store, `POST /data/wipe` and re-ingest, or recreate the `polytone_neo4j_data` volume.
+- **Locked API.** Every endpoint except `GET /health` needs a bearer token. The Rust shell holds the app
+  token (`POLYTONE_API_TOKEN`, also written to `data/.api_token`, mode 0600); the UI gets a short-lived
+  session after Touch ID / your Mac password and locks after `lock_idle_minutes` (Settings, default 15) of
+  inactivity, on screen lock and on sleep. Requests with a non-loopback `Host` are refused.
+  To call the API by hand: `curl -H "Authorization: Bearer $(cat data/.api_token)" http://127.0.0.1:8765/stats`.
+- **Audit log.** `data/audit.sqlite3` is an append-only, HMAC-chained log of security events (unlock/lock,
+  denied requests, generations, ingests, config changes, wipes, purges) — counts and ids only, never text.
+  `GET /audit/verify` re-checks the chain and reports the first altered or missing row.
+- **Retention.** `retention_days` (Settings; 0 = keep forever) purges typed / Wispr samples, drafts and
+  edits older than N days, at start and daily. `POST /data/wipe {"confirm":"delete everything"}` deletes
+  all samples, drafts, edits and the style graph.
+- **Network.** Calls to Anthropic and Google require TLS 1.3. `ANTHROPIC_API_KEY` may live in the Keychain
+  instead of `.env`: `security add-generic-password -s com.polytone.app -a anthropic-api-key -w sk-ant-…`
+  (`.env` wins when both are set).
+- **Files.** `data/` is 0700 and its files 0600; `.env` is 0600. Logs never contain your text.
+- **Neo4j password.** `scripts/dev.sh` replaces the shipped `polytone-local` password with a random one on
+  the first run (`scripts/rotate-neo4j-password.sh`; it changes the password in the running container and
+  only then rewrites `NEO4J_PASSWORD` in `.env`). Run the script yourself any time to rotate again, then
+  restart the backend. Neo4j stays bound to 127.0.0.1.
 
 ## Running tests
 
@@ -167,6 +201,8 @@ cargo test -- --ignored real_pasteboard   # optional: round-trips an image throu
 The Neo4j integration tests never touch your real graph: they skip unless you point them at a scratch container:
 `docker run -d --rm --name polytone-test -p 7688:7687 -e NEO4J_AUTH=neo4j/test-pass neo4j:5-community`, then
 `POLYTONE_TEST_NEO4J_URI=bolt://localhost:7688 uv run pytest -q`.
+
+Tests and benchmarks never touch the real Keychain (they use a fixed or random `POLYTONE_DATA_KEY`).
 
 Benchmarks (mock LLM, scratch SQLite, never touch `data/`):
 
