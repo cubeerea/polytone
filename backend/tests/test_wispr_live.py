@@ -294,3 +294,150 @@ def test_strip_prefers_verbatim_pasted_text_over_raw_coverage():
     text = "So I think we should push the launch to Friday, because the deck isn't ready yet."
     r = wispr_live.strip_insertions(text, [ins])
     assert r.matched == [7] and r.text == ""
+
+
+# ------------------------------------------------------------------ real-world row lifecycles
+def _update(fake, rowid, asr, formatted, status="formatted"):
+    """Wispr filling in a row it inserted earlier (from its own connection, WAL mode)."""
+    pasted = None if formatted is None else formatted + " "
+    fake.conn.execute(
+        "UPDATE History SET asrText=?, formattedText=?, pastedText=?, serverFinalizedText=?, status=?,"
+        " app=? WHERE rowid=?", (asr, formatted, pasted, formatted, status, SLACK, rowid))
+    fake.conn.commit()
+
+
+def test_row_inserted_with_an_interim_status_then_filled_is_picked_up(fake, runtime):
+    # a row written when the dictation starts, with a non-final status and no text yet
+    rid = fake.add(None, None, status="transcribing", pasted=None)
+    assert wispr.collect_local(runtime.settings, db=runtime.db)[0] == []
+    _update(fake, rid, "the transcript showed up once the status was final", "The transcript showed up.")
+    items, _ = wispr.collect_local(runtime.settings, db=runtime.db)
+    assert [i["text"] for i in items] == ["the transcript showed up once the status was final"]
+    # a final status with no text (no speech detected) is not re-checked forever
+    fake.add("", "", status="no_audio", pasted=None)
+    wispr.collect_local(runtime.settings, db=runtime.db)
+    assert not [k for k in wispr._pending if k[0] == str(fake.path)]
+
+
+def test_live_watcher_default_timing_picks_up_new_and_filled_rows_within_2s(fake, runtime):
+    """Default poll (1 s) + debounce (300 ms), rows written by another connection in WAL mode."""
+    t = wispr_live.WisprLiveWatcher(runtime, fake.path)
+    t.start()
+    try:
+        assert _wait(lambda: t.stats["reads"] >= 1, timeout=3)
+        writer = sqlite3.connect(fake.path)  # a second writer connection, like Wispr's
+        writer.execute(
+            "INSERT INTO History (transcriptEntityId, asrText, formattedText, timestamp, status, app, duration,"
+            " isArchived, pastedText) VALUES (?,?,?,?,?,?,?,?,?)",
+            (str(uuid.uuid4()), "a brand new dictation arriving while the server runs", "A brand new dictation.",
+             ts(), "formatted", SLACK, 3.0, 0, "A brand new dictation. "))
+        writer.commit()
+        t0 = time.monotonic()
+        assert _wait(lambda: runtime.db.count_samples(source="wispr") == 1, timeout=2.5)
+        assert time.monotonic() - t0 < 2.0
+        # inserted empty first (dictation running), filled in ~1.2 s later
+        cur = writer.execute(
+            "INSERT INTO History (transcriptEntityId, timestamp, isArchived) VALUES (?,?,0)",
+            (str(uuid.uuid4()), ts()))
+        writer.commit()
+        rid = cur.lastrowid
+        time.sleep(1.2)
+        assert runtime.db.count_samples(source="wispr") == 1
+        writer.execute("UPDATE History SET asrText=?, status='formatted', app=? WHERE rowid=?",
+                       ("and this one was filled in after it was inserted", SLACK, rid))
+        writer.commit()
+        t0 = time.monotonic()
+        assert _wait(lambda: runtime.db.count_samples(source="wispr") == 2, timeout=2.5)
+        assert time.monotonic() - t0 < 2.0
+        writer.close()
+    finally:
+        t.stop()
+    assert t.stats["last_error"] is None
+
+
+def _rebuild_table(fake):
+    """What a Sequelize SQLite migration (changeColumn / removeColumn) does to History: copy into a
+    backup table, drop, recreate, copy back. History's primary key is TEXT, so rowids renumber."""
+    c = fake.conn
+    c.execute("CREATE TABLE History_backup AS SELECT * FROM History ORDER BY rowid")
+    c.execute("DROP TABLE History")
+    c.executescript(SCHEMA)
+    c.execute("INSERT INTO History SELECT * FROM History_backup")
+    c.execute("DROP TABLE History_backup")
+    c.commit()
+
+
+def test_cursor_survives_rowids_renumbered_by_a_migration(fake, runtime):
+    """The cursor is re-found by the transcript id it points at."""
+    for i in range(3):
+        fake.add(f"older dictation number {i} with enough words")
+    assert len(wispr.collect_local(runtime.settings, db=runtime.db)[0]) == 3
+    fake.conn.execute("DELETE FROM History WHERE rowid IN (1, 2)")
+    fake.conn.commit()
+    _rebuild_table(fake)
+    assert [r[0] for r in fake.conn.execute("SELECT rowid FROM History")] == [1]  # renumbered
+    fake.add("the first dictation after the migration")
+    fake.add("and the second dictation after the migration")
+    items, info = wispr.collect_local(runtime.settings, db=runtime.db)
+    assert [i["text"] for i in items] == ["the first dictation after the migration",
+                                          "and the second dictation after the migration"]
+    assert info["cursor"] == 3
+
+
+def test_cursor_past_the_end_after_the_db_was_replaced(fake, runtime):
+    base = datetime.now(UTC) - timedelta(hours=2)
+    for i in range(3):
+        fake.add(f"dictation {i} from the old install of wispr", stamp=ts(base, minutes=i))
+    wispr.collect_local(runtime.settings, db=runtime.db)
+    fake.conn.execute("DELETE FROM History")
+    fake.conn.commit()
+    fake.conn.execute("VACUUM")
+    fake.add("the very first dictation in a fresh install")  # rowid 1, newer timestamp
+    items, info = wispr.collect_local(runtime.settings, db=runtime.db)
+    assert [i["text"] for i in items] == ["the very first dictation in a fresh install"]
+    assert info["cursor"] == 1
+
+
+def test_typed_check_sees_a_row_filled_in_after_the_index_read_it(fake, runtime):
+    """Watcher off: the on-demand index read a row while Wispr had only inserted it; the
+    insertion text arrives later and must still be recognised."""
+    _enable_capture(runtime)
+    rid = fake.add(None, None, status=None, app=None, pasted=None)
+    sources.ingest_typed(runtime, "warm up the insertion index with this message", SLACK)
+    _update(fake, rid, "ok see you at the offsite on friday then", "OK, see you at the offsite on Friday then.")
+    r = sources.ingest_typed(runtime, "OK, see you at the offsite on Friday then.", SLACK)
+    assert r["accepted"] == 0 and r["reasons"][0].startswith("wispr_inserted"), r
+
+
+def test_ingest_typed_route_strips_wispr_and_respects_the_switch(fake, client, runtime):
+    fake.add("sounds good ill send the deck over tonight after the call", PASTED)
+    body = {"text": PASTED + " also loop in priya on the budget thread please", "app": SLACK}
+    off = client.post("/ingest/typed", json=body).json()
+    assert off["accepted"] == 0 and off["reasons"][0].startswith("typing capture is disabled")
+    client.put("/config", json={"capture_enabled": True})
+    on = client.post("/ingest/typed", json=body).json()
+    assert on["accepted"] == 1, on
+    [s] = runtime.db.list_samples(source="typed")
+    assert s["text"] == "also loop in priya on the budget thread please"
+    only = client.post("/ingest/typed", json={"text": PASTED, "app": SLACK}).json()
+    assert only["accepted"] == 0 and only["reasons"][0].startswith("wispr_inserted")
+    # after a Polytone inject: stored for edit learning, never learned, no Wispr wait
+    t0 = time.monotonic()
+    inj = client.post("/ingest/typed", json={**body, "after_inject": True}).json()
+    assert inj["reasons"] == ["after_polytone_inject: stored for edit learning"]
+    assert time.monotonic() - t0 < 1.0
+    assert len(runtime.db.list_draft_edits()) == 1
+    assert runtime.db.count_samples(source="typed") == 1
+
+
+def test_typed_check_after_rowids_were_renumbered(fake, runtime):
+    _enable_capture(runtime)
+    for i in range(3):
+        fake.add(f"older dictation number {i} with enough words", f"Older dictation {i}.")
+    sources.ingest_typed(runtime, "warm up the insertion index with this message", SLACK)
+    fake.conn.execute("DELETE FROM History WHERE rowid IN (1, 2)")
+    fake.conn.commit()
+    _rebuild_table(fake)
+    fake.add("sounds good ill send the deck over tonight after the call", PASTED)  # rowid 2 now
+    r = sources.ingest_typed(runtime, PASTED, SLACK)
+    assert r["accepted"] == 0 and r["reasons"][0].startswith("wispr_inserted"), r
