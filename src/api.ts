@@ -51,7 +51,7 @@ export interface IngestResult {
   words_merged: number;
 }
 
-export type SourceName = "manual" | "gmail" | "wispr" | "watcher";
+export type SourceName = "manual" | "gmail" | "wispr" | "watcher" | "typed";
 
 export interface IngestSource {
   name: SourceName | string;
@@ -72,6 +72,10 @@ export interface AppConfig {
   active_persona: string;
   hotkey: string;
   inject_mode: InjectMode;
+  /** "Learn from what I type" — opt-in, default off. Optional: older backends omit it. */
+  capture_enabled?: boolean;
+  /** macOS bundle ids the typing capture is allowed to read from. */
+  capture_apps?: string[];
 }
 
 /** Each component is a 0-1 DISTANCE (0 = identical to your baseline). */

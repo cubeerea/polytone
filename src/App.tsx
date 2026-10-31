@@ -2,11 +2,9 @@ import { useCallback, useEffect, useState } from "react";
 import { api, DEFAULT_PERSONAS, type AppConfig, type Health, type Persona } from "./api";
 import { ONBOARDING_KEY, useLocalStorage, useResource } from "./hooks";
 import { native, onNative, type RunResult } from "./tauri";
-import { Header } from "./components/Header";
-import { Tabs, type TabId } from "./components/Tabs";
-import { Feed } from "./views/Feed";
-import { Scoreboard } from "./views/Scoreboard";
-import { GraphView } from "./views/Graph";
+import { Header, type ViewId } from "./components/Header";
+import { Drafts } from "./views/Drafts";
+import { Style } from "./views/Style";
 import { Settings } from "./views/Settings";
 
 const TAB_KEY = "polytone.tab";
@@ -14,9 +12,13 @@ const TAB_KEY = "polytone.tab";
 const FALLBACK_CONFIG: AppConfig = { active_persona: "Default", hotkey: "CmdOrCtrl+Shift+P", inject_mode: "paste" };
 
 export default function App() {
-  const [storedTab, setStoredTab] = useLocalStorage(TAB_KEY, "feed");
-  const tab = (["feed", "scoreboard", "graph", "settings"].includes(storedTab ?? "") ? storedTab : "feed") as TabId;
-  const setTab = (t: TabId) => setStoredTab(t);
+  const [storedTab, setStoredTab] = useLocalStorage(TAB_KEY, "drafts");
+  // Older builds stored feed/scoreboard/graph; map them onto the merged views.
+  const LEGACY: Record<string, ViewId> = { feed: "style", graph: "style", scoreboard: "drafts" };
+  const tab: ViewId = (["drafts", "style", "settings"] as const).includes(storedTab as ViewId)
+    ? (storedTab as ViewId)
+    : (LEGACY[storedTab ?? ""] ?? "drafts");
+  const setTab = useCallback((t: ViewId) => setStoredTab(t), [setStoredTab]);
 
   const health = useResource<Health>(api.health, [], 5000);
   const online = health.data != null && !health.error;
@@ -94,6 +96,8 @@ export default function App() {
   return (
     <div className="mx-auto flex h-full max-w-[560px] flex-col">
       <Header
+        view={tab}
+        onView={setTab}
         health={health.data}
         healthError={health.error}
         healthLoading={health.loading && !health.data && !health.error}
@@ -103,13 +107,11 @@ export default function App() {
         personaDisabled={!online}
         generating={generating}
       />
-      <Tabs value={tab} onChange={setTab} />
-      <main className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-4 pb-5 pt-3" key={tab}>
-        {tab === "feed" && (
-          <Feed personas={personas} activePersona={config?.active_persona ?? null} online={online} />
+      <main className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-4 pb-6" key={tab}>
+        {tab === "drafts" && <Drafts tick={dataTick} hotkey={config?.hotkey ?? FALLBACK_CONFIG.hotkey} />}
+        {tab === "style" && (
+          <Style personas={personas} activePersona={config?.active_persona ?? null} online={online} tick={dataTick} />
         )}
-        {tab === "scoreboard" && <Scoreboard tick={dataTick} hotkey={config?.hotkey ?? FALLBACK_CONFIG.hotkey} />}
-        {tab === "graph" && <GraphView personas={personas} tick={dataTick} />}
         {tab === "settings" && (
           <Settings
             config={config}

@@ -1,16 +1,19 @@
-import { useCallback, useEffect, useState, type KeyboardEvent } from "react";
+import { useCallback, useEffect, useState, type KeyboardEvent, type ReactNode } from "react";
 import { errorMessage, type AppConfig, type Health, type InjectMode } from "../api";
-import { ONBOARDING_KEY, useLocalStorage } from "../hooks";
+import { ONBOARDING_KEY, relativeTime, useLocalStorage } from "../hooks";
 import {
   inTauri,
   native,
   nativeErrorMessage,
+  type CaptureStatus,
   type HotkeyStatus,
   type PermissionKind,
   type PermissionStatus,
   type RunResult,
+  type RunningApp,
 } from "../tauri";
-import { ErrorLine, OfflineNotice, SectionHead, Spinner, StatusDot } from "../components/bits";
+import { Disclosure, ErrorLine, StatusDot, Switch, prettyHotkey } from "../components/bits";
+import { MinusIcon } from "../components/Icons";
 
 interface Props {
   config: AppConfig | null;
@@ -66,47 +69,53 @@ export function Settings({ config, configError, online, health, onUpdate, lastRu
   }, [lastRunFromEvent, refreshStatus]);
 
   return (
-    <div className="space-y-6">
-      <PermissionsCard tauri={tauri} perm={perm} error={permError} onRecheck={refreshPerm} />
-      <HotkeySection
-        tauri={tauri}
-        online={online}
-        config={config}
-        status={status}
-        onUpdate={onUpdate}
-        onSaved={refreshStatus}
-      />
-      <InjectSection online={online} config={config} onUpdate={onUpdate} />
+    <div className="space-y-7 pt-1">
+      {tauri ? (
+        perm && !perm.accessibility && <PermissionsCard onRecheck={refreshPerm} />
+      ) : (
+        <p className="rounded-lg bg-fill px-3 py-2 text-[12px] text-text-2">
+          Running in a browser. The shortcut, permissions and typing capture only work inside the Polytone app.
+        </p>
+      )}
+
+      <ShortcutGroup tauri={tauri} online={online} config={config} status={status} onUpdate={onUpdate} onSaved={refreshStatus} />
       {configError != null && <ErrorLine error={configError} />}
-      <RunSection
-        tauri={tauri}
-        status={status}
-        lastRun={status?.last_run ?? lastRunFromEvent}
-        generating={generating}
-        onTriggered={refreshStatus}
-      />
-      <BackendSection online={online} health={health} />
+
+      <CaptureGroup tauri={tauri} online={online} config={config} onUpdate={onUpdate} />
+
+      <Disclosure title="Advanced">
+        <AdvancedGroup
+          tauri={tauri}
+          online={online}
+          health={health}
+          perm={perm}
+          permError={permError}
+          status={status}
+          lastRun={status?.last_run ?? lastRunFromEvent}
+          generating={generating}
+          onTriggered={refreshStatus}
+        />
+      </Disclosure>
     </div>
   );
 }
 
-/* ---------------- Permissions / first-launch onboarding ---------------- */
+function Row({ title, subtitle, children }: { title: ReactNode; subtitle?: ReactNode; children?: ReactNode }) {
+  return (
+    <div className="row">
+      <div className="min-w-0 flex-1">
+        <div className="text-[13px]">{title}</div>
+        {subtitle && <div className="text-[11.5px] leading-snug text-text-3">{subtitle}</div>}
+      </div>
+      {children}
+    </div>
+  );
+}
 
-function PermissionsCard({
-  tauri,
-  perm,
-  error,
-  onRecheck,
-}: {
-  tauri: boolean;
-  perm: PermissionStatus | null;
-  error: string | null;
-  onRecheck: () => void;
-}) {
+/* ---------------- Permissions (first launch) ---------------- */
+
+function PermissionsCard({ onRecheck }: { onRecheck: () => void }) {
   const [dismissed, setDismissed] = useLocalStorage(ONBOARDING_KEY, null);
-  const missing = perm != null && !perm.accessibility;
-  const [expanded, setExpanded] = useState(false);
-  const showGuide = missing && (!dismissed || expanded);
   const [openErr, setOpenErr] = useState<string | null>(null);
 
   const open = async (kind: PermissionKind) => {
@@ -118,112 +127,54 @@ function PermissionsCard({
     }
   };
 
-  return (
-    <section>
-      <SectionHead
-        kicker="Permissions"
-        title="Let Polytone reach the keys"
-        right={
-          tauri && (
-            <button type="button" className="keycap keycap-sm" onClick={onRecheck}>
-              Re-check
-            </button>
-          )
-        }
-      />
+  if (dismissed) {
+    return (
+      <div className="flex items-center gap-2 rounded-lg bg-fill px-3 py-2 text-[12px]">
+        <StatusDot state="down" />
+        <span className="flex-1 text-text-2">Accessibility access is off, so the shortcut can't paste.</span>
+        <button type="button" className="btn btn-plain" onClick={() => setDismissed(null)}>
+          Set up
+        </button>
+      </div>
+    );
+  }
 
-      {!tauri ? (
-        <p className="text-ink-soft">
-          Running in a plain browser — permission checks, the hotkey and injection only work inside the Polytone app (
-          <code className="text-ink">pnpm tauri dev</code>).
-        </p>
-      ) : error ? (
-        <p className="text-ribbon">Couldn't check permissions: {error}</p>
-      ) : perm == null ? (
-        <Spinner label="checking" />
-      ) : perm.accessibility ? (
-        <div className="flex items-center gap-2">
-          <StatusDot state="ok" />
-          <span className="text-ink">Accessibility granted.</span>
-          <span className="text-ink-faint">Polytone can copy & paste in other apps.</span>
-        </div>
-      ) : !showGuide ? (
-        <div className="flex items-center justify-between gap-2">
-          <div className="flex items-center gap-2">
-            <StatusDot state="down" />
-            <span className="text-ink">Accessibility not granted.</span>
-          </div>
-          <button type="button" className="keycap keycap-sm" onClick={() => setExpanded(true)}>
-            Show guide
+  return (
+    <section className="fade-in">
+      <h2 className="text-[15px] font-semibold">Allow Polytone to paste for you</h2>
+      <p className="mt-1 text-[13px] text-text-2">
+        Polytone reads your selection and types the rewrite back, so macOS needs to trust it.
+      </p>
+      <ol className="mt-3 list-decimal space-y-1.5 pl-5 text-[13px] text-text-2 marker:text-text-3">
+        <li>
+          In <span className="text-text">Privacy &amp; Security → Accessibility</span>, switch Polytone on.
+        </li>
+        <li>
+          If the shortcut still does nothing, also allow it under{" "}
+          <button type="button" className="btn-plain btn h-auto p-0 text-[13px]" onClick={() => open("input_monitoring")}>
+            Input Monitoring
           </button>
-        </div>
-      ) : (
-        <div className="card strike-in border-l-2 py-3 pl-[42px] pr-4" style={{ borderLeftColor: "var(--color-ribbon)" }}>
-          <div className="label text-ribbon">First launch · 3 steps</div>
-          <p className="mt-1 font-display text-[15px] leading-snug text-ink">
-            Polytone reads your selection and types the rewrite back, so macOS needs to trust it.
-          </p>
-          <ol className="mt-3 space-y-3 text-[12px] leading-[18px] text-ink-soft">
-            <Step n={1}>
-              <div>
-                Open <b className="font-medium text-ink">Privacy & Security → Accessibility</b> and switch{" "}
-                <b className="font-medium text-ink">Polytone</b> on.
-              </div>
-              <button type="button" className="keycap keycap-ink keycap-sm mt-1.5" onClick={() => open("accessibility")}>
-                Open System Settings
-              </button>
-            </Step>
-            <Step n={2}>
-              <div>
-                If the hotkey doesn't fire, also enable it under{" "}
-                <b className="font-medium text-ink">Input Monitoring</b>.
-              </div>
-              <button type="button" className="keycap keycap-sm mt-1.5" onClick={() => open("input_monitoring")}>
-                Open Input Monitoring
-              </button>
-            </Step>
-            <Step n={3}>
-              <div>Come back here — this card re-checks automatically. You may need to relaunch Polytone.</div>
-            </Step>
-          </ol>
-          {openErr && <p className="mt-2 text-[11px] text-ribbon">{openErr}</p>}
-          <div className="mt-3 flex justify-end gap-2 border-t hairline pt-2">
-            <button
-              type="button"
-              className="keycap keycap-sm"
-              onClick={() => {
-                setDismissed("1");
-                setExpanded(false);
-              }}
-            >
-              Later
-            </button>
-            <button type="button" className="keycap keycap-sm" onClick={onRecheck}>
-              I've done it
-            </button>
-          </div>
-        </div>
-      )}
-      {perm && <p className="label mt-1.5 normal-case tracking-normal">platform: {perm.platform}</p>}
+          .
+        </li>
+        <li>Come back here. You may need to relaunch Polytone.</li>
+      </ol>
+      <div className="mt-3 flex items-center gap-2">
+        <button type="button" className="btn btn-primary" onClick={() => open("accessibility")}>
+          Open System Settings
+        </button>
+        <button type="button" className="btn" onClick={onRecheck}>
+          Check again
+        </button>
+        <button type="button" className="btn btn-plain ml-auto text-text-3" onClick={() => setDismissed("1")}>
+          Later
+        </button>
+      </div>
+      {openErr && <p className="mt-2 text-[12px] text-bad">{openErr}</p>}
     </section>
   );
 }
 
-function Step({ n, children }: { n: number; children: React.ReactNode }) {
-  return (
-    <li className="relative">
-      <span
-        className="absolute -left-[26px] top-0 flex h-[18px] w-[18px] items-center justify-center rounded-full border border-[var(--color-rule-strong)] bg-paper text-[10px] font-semibold text-ink"
-        aria-hidden
-      >
-        {n}
-      </span>
-      {children}
-    </li>
-  );
-}
-
-/* ---------------- Hotkey ---------------- */
+/* ---------------- Shortcut + delivery ---------------- */
 
 const MOD_ORDER = ["CmdOrCtrl", "Ctrl", "Alt", "Shift"] as const;
 
@@ -247,7 +198,7 @@ function accelFromEvent(e: KeyboardEvent): string | null {
   return [...ordered, key].join("+");
 }
 
-function HotkeySection({
+function ShortcutGroup({
   tauri,
   online,
   config,
@@ -263,19 +214,13 @@ function HotkeySection({
   onSaved: () => void;
 }) {
   const current = status?.hotkey ?? config?.hotkey ?? "CmdOrCtrl+Shift+P";
-  const [value, setValue] = useState(current);
   const [recording, setRecording] = useState(false);
   const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
   const [busy, setBusy] = useState(false);
+  const [pausing, setPausing] = useState(false);
 
-  useEffect(() => {
-    if (!recording) setValue(current);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [current]);
-
-  const save = async () => {
-    const accel = value.trim();
-    if (!accel) return;
+  const save = async (accel: string) => {
+    if (!accel || accel === current) return;
     setBusy(true);
     setMsg(null);
     const errs: string[] = [];
@@ -283,26 +228,23 @@ function HotkeySection({
       try {
         await native.setHotkey(accel);
       } catch (e) {
-        errs.push(`app: ${nativeErrorMessage(e)}`);
+        errs.push(`App: ${nativeErrorMessage(e)}`);
       }
     }
     if (online) {
       try {
         await onUpdate({ hotkey: accel });
       } catch (e) {
-        errs.push(`backend: ${errorMessage(e)}`);
+        errs.push(`Engine: ${errorMessage(e)}`);
       }
     }
     setBusy(false);
-    if (!tauri && !online) setMsg({ ok: false, text: "Nothing to save to — app and backend are both unavailable." });
+    if (!tauri && !online) setMsg({ ok: false, text: "Couldn't save: the app and engine are both unavailable." });
     else if (errs.length) setMsg({ ok: false, text: errs.join(" · ") });
-    else setMsg({ ok: true, text: `Saved. Press ${accel} in any app.` });
+    else setMsg({ ok: true, text: `Saved. Press ${prettyHotkey(accel)} in any app.` });
     onSaved();
   };
 
-  const dirty = value.trim() !== current;
-
-  const [pausing, setPausing] = useState(false);
   const togglePause = async () => {
     if (!status) return;
     setPausing(true);
@@ -310,149 +252,266 @@ function HotkeySection({
     try {
       await native.setHotkeyPaused(!status.paused);
     } catch (e) {
-      setMsg({ ok: false, text: `app: ${nativeErrorMessage(e)}` });
+      setMsg({ ok: false, text: `App: ${nativeErrorMessage(e)}` });
     } finally {
       setPausing(false);
       onSaved();
     }
   };
 
+  const mode = config?.inject_mode ?? "paste";
+  const modes: { id: InjectMode; label: string; desc: string }[] = [
+    { id: "paste", label: "Paste", desc: "Pastes the rewrite, then restores your clipboard." },
+    { id: "type", label: "Type", desc: "Types it out key by key, for apps that block paste." },
+  ];
+
   return (
     <section>
-      <SectionHead
-        kicker="Trigger"
-        title="Hotkey"
-        right={
-          tauri && status ? (
-            <div className="flex items-center gap-2">
-              {status.paused && <span className="label text-warn">paused</span>}
+      <h2 className="group-title">Shortcut</h2>
+      <div className="inset">
+        <Row title="Rewrite selection" subtitle={recording ? "Press the new shortcut, or Esc to cancel" : undefined}>
+          <button
+            type="button"
+            className={`btn min-w-[64px] ${recording ? "ring-2 ring-accent" : ""}`}
+            aria-label={`Shortcut ${prettyHotkey(current)}. Click to record a new one.`}
+            title="Click to record a new shortcut"
+            disabled={busy}
+            onClick={(e) => {
+              e.currentTarget.focus(); // WebKit doesn't focus buttons on click
+              setRecording((r) => !r);
+            }}
+            onBlur={() => setRecording(false)}
+            onKeyDown={(e) => {
+              if (!recording) return;
+              e.preventDefault();
+              if (e.key === "Escape") {
+                setRecording(false);
+                return;
+              }
+              const a = accelFromEvent(e);
+              if (a) {
+                setRecording(false);
+                void save(a);
+              }
+            }}
+          >
+            <span className="kbd">{recording ? "…" : prettyHotkey(current)}</span>
+          </button>
+        </Row>
+        {tauri && status && (
+          <Row title="Pause shortcut" subtitle={status.paused ? "Paused. Also stops typing capture." : undefined}>
+            <Switch checked={status.paused} onChange={togglePause} disabled={pausing} label="Pause shortcut" />
+          </Row>
+        )}
+        <Row title="Insert by" subtitle={modes.find((m) => m.id === mode)?.desc}>
+          <div className="seg" role="radiogroup" aria-label="Insert by">
+            {modes.map((m) => (
               <button
+                key={m.id}
                 type="button"
-                className="keycap keycap-sm"
-                role="switch"
-                aria-checked={status.paused}
-                data-pressed={status.paused}
-                disabled={pausing}
-                onClick={togglePause}
-                title="Same as “Pause hotkey” in the menu-bar icon"
+                role="radio"
+                aria-checked={mode === m.id}
+                disabled={!online || !config}
+                onClick={() => mode !== m.id && onUpdate({ inject_mode: m.id }).catch(() => {})}
               >
-                {status.paused ? "Resume" : "Pause"}
+                {m.label}
               </button>
-            </div>
-          ) : null
-        }
-      />
-      <div className="flex items-center gap-2">
-        <input
-          aria-label="Global hotkey accelerator"
-          className={`field flex-1 ${recording ? "border-ribbon" : ""}`}
-          value={recording ? "press keys…" : value}
-          readOnly={recording}
-          onChange={(e) => setValue(e.target.value)}
-          onKeyDown={(e) => {
-            if (!recording) {
-              if (e.key === "Enter") void save();
-              return;
-            }
-            e.preventDefault();
-            if (e.key === "Escape") {
-              setRecording(false);
-              return;
-            }
-            const a = accelFromEvent(e);
-            if (a) {
-              setValue(a);
-              setRecording(false);
-            }
-          }}
-          onBlur={() => setRecording(false)}
-          spellCheck={false}
-        />
-        <button
-          type="button"
-          className="keycap keycap-sm"
-          data-pressed={recording}
-          onMouseDown={(e) => e.preventDefault()}
-          onClick={(e) => {
-            setRecording((r) => !r);
-            (e.currentTarget.previousElementSibling as HTMLInputElement | null)?.focus();
-          }}
-        >
-          {recording ? "Esc" : "Record"}
-        </button>
-        <button type="button" className="keycap keycap-ink keycap-sm" disabled={busy || !dirty} onClick={save}>
-          {busy ? "…" : "Set"}
-        </button>
+            ))}
+          </div>
+        </Row>
       </div>
-      <p className="mt-1.5 text-[11px] text-ink-faint">
-        Tauri accelerator syntax, e.g. <code className="text-ink-soft">CmdOrCtrl+Shift+P</code>.
-      </p>
-      {msg && <p className={`strike-in mt-1 text-[11px] ${msg.ok ? "text-ok" : "text-ribbon"}`}>{msg.text}</p>}
+      {msg && <p className={`footnote fade-in ${msg.ok ? "" : "!text-bad"}`}>{msg.text}</p>}
     </section>
   );
 }
 
-/* ---------------- Inject mode ---------------- */
+/* ---------------- Learn from what I type ---------------- */
 
-function InjectSection({
+const KNOWN_APPS: Record<string, string> = {
+  "com.tinyspeck.slackmacgap": "Slack",
+  "com.apple.mail": "Mail",
+  "com.apple.Notes": "Notes",
+  "com.apple.MobileSMS": "Messages",
+  "com.apple.TextEdit": "TextEdit",
+  "com.google.Chrome": "Chrome",
+  "com.apple.Safari": "Safari",
+  "notion.id": "Notion",
+  "com.linear": "Linear",
+  "com.microsoft.Outlook": "Outlook",
+};
+
+function CaptureGroup({
+  tauri,
   online,
   config,
   onUpdate,
 }: {
+  tauri: boolean;
   online: boolean;
   config: AppConfig | null;
   onUpdate: Props["onUpdate"];
 }) {
-  const mode = config?.inject_mode ?? "paste";
-  const opts: { id: InjectMode; title: string; desc: string }[] = [
-    { id: "paste", title: "Paste", desc: "Clipboard + ⌘V. Fast; clipboard restored after." },
-    { id: "type", title: "Type", desc: "Types each character. For apps that block paste." },
-  ];
+  const supported = config != null && typeof config.capture_enabled === "boolean";
+  const enabled = config?.capture_enabled ?? false;
+  const apps = config?.capture_apps ?? [];
+  const [cap, setCap] = useState<CaptureStatus | null>(null);
+  const [capErr, setCapErr] = useState<string | null>(null);
+  const [running, setRunning] = useState<RunningApp[]>([]);
+  const [manualId, setManualId] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const refresh = useCallback(() => {
+    native.getCaptureStatus().then((s) => s && setCap(s));
+  }, []);
+
+  useEffect(() => {
+    if (!tauri) return;
+    refresh();
+    const t = setInterval(refresh, 4000);
+    return () => clearInterval(t);
+  }, [tauri, refresh]);
+
+  useEffect(() => {
+    if (enabled && tauri) native.listRunningApps().then(setRunning);
+  }, [enabled, tauri]);
+
+  const apply = async (nextEnabled: boolean, nextApps: string[]) => {
+    setBusy(true);
+    setCapErr(null);
+    try {
+      await onUpdate({ capture_enabled: nextEnabled, capture_apps: nextApps });
+    } catch (e) {
+      setCapErr(errorMessage(e));
+      setBusy(false);
+      return;
+    }
+    const r = await native.setCapture(nextEnabled, nextApps);
+    if (r.status) setCap(r.status);
+    if (r.error) setCapErr(r.error);
+    setBusy(false);
+  };
+
+  const nameOf = (id: string) => running.find((a) => a.bundle_id === id)?.name ?? KNOWN_APPS[id] ?? id;
+  const addable = running.filter((a) => !apps.includes(a.bundle_id)).sort((a, b) => a.name.localeCompare(b.name));
+  const add = (id: string) => {
+    const v = id.trim();
+    if (v && !apps.includes(v)) void apply(enabled, [...apps, v]);
+  };
+
+  const err = capErr ?? cap?.last_error ?? null;
+  const statusLine = !enabled
+    ? "Off"
+    : tauri && cap
+      ? cap.running
+        ? `${cap.captured_this_session.toLocaleString()} captured this session${cap.last_captured_at ? ` · last ${relativeTime(cap.last_captured_at)}` : ""}`
+        : "On, not running"
+      : "On";
+
   return (
     <section>
-      <SectionHead kicker="Delivery" title="Inject mode" />
-      <div className="grid grid-cols-2 gap-2" role="radiogroup" aria-label="Inject mode">
-        {opts.map((o) => {
-          const on = mode === o.id;
-          return (
-            <button
-              key={o.id}
-              type="button"
-              role="radio"
-              aria-checked={on}
-              disabled={!online || !config}
-              onClick={() => !on && onUpdate({ inject_mode: o.id }).catch(() => {})}
-              className={`keycap h-auto flex-col items-start gap-0.5 whitespace-normal px-3 py-2 text-left normal-case tracking-normal ${on ? "keycap-ink" : ""}`}
-              data-pressed={on}
-            >
-              <span className="flex w-full items-center justify-between text-[11px] font-semibold uppercase tracking-[0.08em]">
-                {o.title}
-                <span className={on ? "text-ribbon" : "text-ink-faint"} aria-hidden>
-                  {on ? "●" : "○"}
-                </span>
-              </span>
-              <span className={`text-[10.5px] font-normal leading-snug ${on ? "opacity-75" : "text-ink-soft"}`}>
-                {o.desc}
-              </span>
-            </button>
-          );
-        })}
+      <h2 className="group-title">Learning</h2>
+      <div className="inset">
+        <Row title="Learn from what I type" subtitle={err ? <span className="text-bad">{err}</span> : statusLine}>
+          {enabled && tauri && cap && <StatusDot state={err ? "down" : cap.running ? "ok" : "warn"} />}
+          <Switch
+            checked={enabled}
+            onChange={(v) => void apply(v, apps)}
+            disabled={!online || !supported || busy}
+            label="Learn from what I type"
+          />
+        </Row>
+
+        {enabled &&
+          apps.map((id) => (
+            <div className="row fade-in !min-h-[34px] !py-1" key={id}>
+              <div className="min-w-0 flex-1 truncate text-[13px]" title={id}>
+                {nameOf(id)}
+              </div>
+              <button
+                type="button"
+                className="icon-btn !h-[22px] !w-[22px]"
+                aria-label={`Stop learning from ${nameOf(id)}`}
+                title="Remove"
+                disabled={busy}
+                onClick={() => void apply(enabled, apps.filter((a) => a !== id))}
+              >
+                <MinusIcon width={13} height={13} />
+              </button>
+            </div>
+          ))}
+
+        {enabled && (
+          <div className="row !min-h-[38px]">
+            {addable.length > 0 ? (
+              <select
+                className="select"
+                value=""
+                disabled={busy}
+                aria-label="Add an app"
+                onChange={(e) => add(e.target.value)}
+              >
+                <option value="">{apps.length ? "Add app…" : "Choose apps…"}</option>
+                {addable.map((a) => (
+                  <option key={a.bundle_id} value={a.bundle_id}>
+                    {a.name}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <form
+                className="flex flex-1 items-center gap-2"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  add(manualId);
+                  setManualId("");
+                }}
+              >
+                <input
+                  className="field !py-1 text-[12px]"
+                  placeholder="App bundle id, e.g. com.tinyspeck.slackmacgap"
+                  aria-label="App bundle id"
+                  value={manualId}
+                  onChange={(e) => setManualId(e.target.value)}
+                  spellCheck={false}
+                />
+                <button type="submit" className="btn" disabled={!manualId.trim() || busy}>
+                  Add
+                </button>
+              </form>
+            )}
+            {apps.length === 0 && addable.length > 0 && (
+              <span className="text-[11.5px] text-text-3">Nothing is read until you add an app.</span>
+            )}
+          </div>
+        )}
       </div>
-      {!online && <p className="mt-1.5 text-[11px] text-ink-faint">Saved to the backend — start it to change this.</p>}
+      <p className="footnote">
+        {online && config && !supported
+          ? "This engine version doesn't support typing capture yet."
+          : "Stays on this Mac. Password fields are never read, and pausing the shortcut stops it."}
+      </p>
     </section>
   );
 }
 
-/* ---------------- Last run / test trigger ---------------- */
+/* ---------------- Advanced: test run, engine, permissions ---------------- */
 
-function RunSection({
+function AdvancedGroup({
   tauri,
+  online,
+  health,
+  perm,
+  permError,
   status,
   lastRun,
   generating,
   onTriggered,
 }: {
   tauri: boolean;
+  online: boolean;
+  health: Health | null;
+  perm: PermissionStatus | null;
+  permError: string | null;
   status: HotkeyStatus | null;
   lastRun: RunResult | null;
   generating: boolean;
@@ -474,92 +533,60 @@ function RunSection({
     }
   };
 
+  const runSubtitle = !tauri
+    ? "Only inside the app"
+    : lastRun
+      ? `${lastRun.ok ? "Last run succeeded" : "Last run failed"} · ${lastRun.latency_ms.toLocaleString()} ms${lastRun.latency_ms > 5000 ? " (over the 5 s budget)" : ""}`
+      : `No runs yet${status ? `. Press ${prettyHotkey(status.hotkey)} with text selected.` : ""}`;
+
   return (
-    <section>
-      <SectionHead
-        kicker="Diagnostics"
-        title="Last run"
-        right={
-          <button
-            type="button"
-            className="keycap keycap-ribbon keycap-sm"
-            disabled={!tauri || busy || generating}
-            onClick={trigger}
-            title={tauri ? "Run capture → generate → inject now" : "Only available inside the app"}
-          >
-            {generating ? "running…" : "Test trigger"}
+    <div className="space-y-2">
+      <div className="inset">
+        <Row title="Test the shortcut" subtitle={runSubtitle}>
+          <button type="button" className="btn" disabled={!tauri || busy || generating} onClick={trigger}>
+            {generating ? "Running…" : "Run now"}
           </button>
-        }
-      />
-      {!tauri ? (
-        <p className="text-ink-faint">Run history is available inside the app.</p>
-      ) : !lastRun ? (
-        <p className="text-ink-faint">
-          No runs yet{status ? ` — press ${status.hotkey} with text selected in any app.` : "."}
-        </p>
-      ) : (
-        <div className="flex items-start gap-2.5">
-          <span className="mt-1">
-            <StatusDot state={lastRun.ok ? "ok" : "down"} />
-          </span>
-          <div className="min-w-0 flex-1">
-            <div className="flex items-baseline gap-2">
-              <span className="font-medium text-ink">{lastRun.ok ? "Succeeded" : "Failed"}</span>
-              <span className={`tabular-nums text-[11px] ${lastRun.latency_ms > 5000 ? "text-warn" : "text-ink-soft"}`}>
-                {lastRun.latency_ms} ms {lastRun.latency_ms > 5000 ? "· over 5s budget" : ""}
-              </span>
-            </div>
-            {lastRun.error && <p className="selectable mt-0.5 text-[11px] text-ribbon">{lastRun.error}</p>}
+        </Row>
+        {(lastRun?.error || err) && (
+          <div className="row">
+            <p className="selectable text-[12px] text-bad">{err ?? lastRun?.error}</p>
           </div>
-        </div>
-      )}
-      {err && <p className="mt-1.5 text-[11px] text-ribbon">{err}</p>}
-      <p className="mt-2 text-[11px] text-ink-faint">
-        Test trigger hides Polytone and runs on the app you were in before, so put your cursor in a text field
-        there first.
+        )}
+        <Row
+          title="Accessibility"
+          subtitle={!tauri ? "Only inside the app" : permError ? permError : perm ? (perm.accessibility ? "Granted" : "Not granted") : "Checking…"}
+        >
+          {perm && <StatusDot state={perm.accessibility ? "ok" : "down"} />}
+        </Row>
+        <Row
+          title="Model"
+          subtitle={
+            !online || !health
+              ? "Engine offline"
+              : health.llm === "mock"
+                ? "Mock model (no API key set)"
+                : health.llm_ready === false
+                  ? "Claude, but ANTHROPIC_API_KEY is missing. Add it to .env and restart the engine."
+                  : "Claude"
+          }
+        >
+          <StatusDot state={!online || !health ? "down" : health.llm === "mock" || health.llm_ready === false ? "warn" : "ok"} />
+        </Row>
+        <Row
+          title="Style graph"
+          subtitle={
+            !online || !health
+              ? "Engine offline"
+              : `${health.neo4j ? "Neo4j" : health.graph_store === "memory" ? "In memory, not saved" : "Unavailable"} · embeddings ${health.embeddings}`
+          }
+        >
+          <StatusDot state={!online || !health ? "down" : health.neo4j ? "ok" : "warn"} />
+        </Row>
+      </div>
+      <p className="footnote">
+        Test runs hide Polytone and act on the app you were just in, so put your cursor in a text field there first.
+        {perm?.platform ? ` Platform: ${perm.platform}.` : ""}
       </p>
-    </section>
-  );
-}
-
-/* ---------------- Backend ---------------- */
-
-function BackendSection({ online, health }: { online: boolean; health: Health | null }) {
-  return (
-    <section>
-      <SectionHead kicker="Engine" title="Backend" />
-      {!online || !health ? (
-        <OfflineNotice compact />
-      ) : (
-        <dl className="grid grid-cols-3 gap-2">
-          <KV
-            k="model"
-            v={health.llm === "mock" ? "mock LLM" : health.llm_ready === false ? "Claude · no key" : "Claude"}
-            warn={health.llm === "mock" || health.llm_ready === false}
-          />
-          <KV k="embeddings" v={health.embeddings} warn={health.embeddings === "none"} />
-          <KV
-            k="graph"
-            v={health.neo4j ? "Neo4j" : health.graph_store === "memory" ? "in-memory" : "offline"}
-            warn={!health.neo4j}
-          />
-        </dl>
-      )}
-      {online && health?.llm_ready === false && (
-        <p className="mt-1.5 text-[11px] text-ribbon">
-          POLYTONE_LLM=anthropic but no ANTHROPIC_API_KEY — the hotkey will fail until you add one to{" "}
-          <code>.env</code> and restart the backend.
-        </p>
-      )}
-    </section>
-  );
-}
-
-function KV({ k, v, warn }: { k: string; v: string; warn?: boolean }) {
-  return (
-    <div className="card px-2 py-1.5">
-      <dt className="label text-[8.5px]">{k}</dt>
-      <dd className={`mt-0.5 text-[12px] ${warn ? "text-warn" : "text-ink"}`}>{v}</dd>
     </div>
   );
 }

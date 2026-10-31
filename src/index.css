@@ -1,69 +1,54 @@
 @import "tailwindcss";
 
 /* ------------------------------------------------------------------
-   Polytone — "modern mechanical typewriter workstation"
-   Light: textured off-white paper, carbon ink, ribbon-red accent.
-   Dark: carbon paper — inky blue-black ground, off-white type.
+   Polytone — quiet, native. System type, neutral grounds, one accent.
+   Content leads; chrome recedes. Grouped inset lists for settings,
+   hairline separators, no textures, no costume.
    ------------------------------------------------------------------ */
 
 @theme {
-  --font-display: "Newsreader", "Iowan Old Style", "Palatino", Georgia, serif;
-  --font-mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", system-ui, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, monospace;
 
-  --color-paper: #f2eee3;
-  --color-paper-deep: #e8e2d3;
-  --color-paper-hi: #faf8f2;
-  --color-ink: #1c1b18;
-  --color-ink-soft: #57534a;
-  --color-ink-faint: #8d877a;
-  --color-rule: rgb(28 27 24 / 0.13);
-  --color-rule-strong: rgb(28 27 24 / 0.28);
-  --color-ribbon: #b1261c;
-  --color-ribbon-soft: rgb(177 38 28 / 0.1);
-  --color-ok: #3c6b3a;
-  --color-warn: #a86a12;
-  --color-key-face: #fbf9f3;
-  --color-key-face-2: #ece6d8;
-  --color-key-edge: #b9b1a0;
-  --color-key-ink-face: #2a2925;
-  --color-key-ink-face-2: #1a1916;
-  --color-key-ink-edge: #000000;
+  --color-bg: #f6f6f5;
+  --color-surface: #ffffff;
+  --color-fill: rgb(0 0 0 / 0.05);
+  --color-fill-strong: rgb(0 0 0 / 0.09);
+  --color-text: #1d1d1f;
+  --color-text-2: #6b6b70;
+  --color-text-3: #8e8e93;
+  --color-sep: rgb(0 0 0 / 0.08);
+  --color-sep-strong: rgb(0 0 0 / 0.14);
+  --color-accent: #2563d9;
+  --color-accent-soft: rgb(37 99 217 / 0.12);
+  --color-on-accent: #ffffff;
+  --color-ok: #2f8a4c;
+  --color-warn: #b26a00;
+  --color-bad: #d23b30;
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --color-paper: #15161c;
-    --color-paper-deep: #0f1015;
-    --color-paper-hi: #1d1e26;
-    --color-ink: #ece6d6;
-    --color-ink-soft: #b4ad9d;
-    --color-ink-faint: #7a7568;
-    --color-rule: rgb(236 230 214 / 0.1);
-    --color-rule-strong: rgb(236 230 214 / 0.24);
-    --color-ribbon: #e2584a;
-    --color-ribbon-soft: rgb(226 88 74 / 0.14);
-    --color-ok: #8cbf7f;
-    --color-warn: #e0a64a;
-    --color-key-face: #2a2b34;
-    --color-key-face-2: #22232b;
-    --color-key-edge: #08080b;
-    --color-key-ink-face: #ece6d6;
-    --color-key-ink-face-2: #d6cfbd;
-    --color-key-ink-edge: #8f8878;
+    --color-bg: #1c1c1e;
+    --color-surface: #2a2a2d;
+    --color-fill: rgb(255 255 255 / 0.07);
+    --color-fill-strong: rgb(255 255 255 / 0.12);
+    --color-text: #f2f2f4;
+    --color-text-2: #a1a1a7;
+    --color-text-3: #8a8a90;
+    --color-sep: rgb(255 255 255 / 0.08);
+    --color-sep-strong: rgb(255 255 255 / 0.15);
+    --color-accent: #4c8dff;
+    --color-accent-soft: rgb(76 141 255 / 0.18);
+    --color-on-accent: #ffffff;
+    --color-ok: #4cc26d;
+    --color-warn: #f0a540;
+    --color-bad: #ff6b5e;
   }
 }
 
 :root {
   color-scheme: light dark;
-  --noise: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='3' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 0.1 0 0 0 0 0.09 0 0 0 0 0.07 0 0 0 0.09 0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
-  --fibers: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='400' height='400'%3E%3Cfilter id='f'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.012 .09' numOctaves='2' seed='7'/%3E%3CfeColorMatrix values='0 0 0 0 0.3 0 0 0 0 0.25 0 0 0 0 0.15 0 0 0 0.05 0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23f)'/%3E%3C/svg%3E");
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --noise: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='3' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 0.9 0 0 0 0 0.88 0 0 0 0 0.82 0 0 0 0.05 0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
-    --fibers: none;
-  }
 }
 
 html,
@@ -74,12 +59,11 @@ body,
 
 body {
   margin: 0;
-  background-color: var(--color-paper);
-  background-image: var(--noise), var(--fibers);
-  color: var(--color-ink);
-  font-family: var(--font-mono);
-  font-size: 12.5px;
-  line-height: 1.5;
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.45;
   -webkit-font-smoothing: antialiased;
   overflow: hidden;
   user-select: none;
@@ -88,8 +72,7 @@ body {
 }
 
 ::selection {
-  background: var(--color-ribbon-soft);
-  color: var(--color-ink);
+  background: var(--color-accent-soft);
 }
 
 textarea,
@@ -100,214 +83,268 @@ input,
 }
 
 :focus-visible {
-  outline: 2px solid var(--color-ribbon);
-  outline-offset: 2px;
+  outline: 3px solid var(--color-accent-soft);
+  outline-offset: 1px;
+  border-radius: 6px;
 }
 
-/* Thin, ink-colored scrollbars */
 * {
   scrollbar-width: thin;
-  scrollbar-color: var(--color-rule-strong) transparent;
+  scrollbar-color: var(--color-sep-strong) transparent;
 }
 
 @layer components {
-  /* ----- Keycap buttons ----- */
-  .keycap {
-    --edge: var(--color-key-edge);
-    position: relative;
+  /* ----- Buttons ----- */
+  .btn {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    gap: 0.4rem;
-    padding: 0.38rem 0.8rem 0.42rem;
-    font-family: var(--font-mono);
-    font-size: 11px;
+    gap: 0.3rem;
+    height: 24px;
+    padding: 0 0.7rem;
+    font: inherit;
+    font-size: 12px;
     font-weight: 500;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    color: var(--color-ink);
-    background: linear-gradient(180deg, var(--color-key-face) 0%, var(--color-key-face-2) 100%);
-    border: 1px solid var(--color-rule-strong);
+    color: var(--color-text);
+    background: var(--color-fill);
+    border: 0;
     border-radius: 6px;
-    box-shadow:
-      inset 0 1px 0 rgb(255 255 255 / 0.55),
-      inset 0 -2px 0 rgb(0 0 0 / 0.05),
-      0 2px 0 var(--edge),
-      0 3px 5px rgb(0 0 0 / 0.12);
-    transform: translateY(0);
-    transition:
-      transform 70ms ease-out,
-      box-shadow 70ms ease-out,
-      background 120ms;
     cursor: pointer;
     white-space: nowrap;
+    transition: background 120ms;
   }
-  .keycap:hover:not(:disabled) {
-    background: linear-gradient(180deg, var(--color-paper-hi) 0%, var(--color-key-face) 100%);
+  .btn:hover:not(:disabled) {
+    background: var(--color-fill-strong);
   }
-  .keycap:active:not(:disabled),
-  .keycap[data-pressed="true"] {
-    transform: translateY(2px);
-    box-shadow:
-      inset 0 1px 2px rgb(0 0 0 / 0.12),
-      0 0 0 var(--edge),
-      0 1px 1px rgb(0 0 0 / 0.08);
+  .btn:disabled {
+    opacity: 0.4;
+    cursor: default;
   }
-  .keycap:disabled {
-    opacity: 0.45;
-    cursor: not-allowed;
+  .btn-primary {
+    color: var(--color-on-accent);
+    background: var(--color-accent);
   }
-  .keycap-ink {
-    --edge: var(--color-key-ink-edge);
-    color: var(--color-paper);
-    background: linear-gradient(180deg, var(--color-key-ink-face) 0%, var(--color-key-ink-face-2) 100%);
-    border-color: var(--color-key-ink-edge);
-    box-shadow:
-      inset 0 1px 0 rgb(255 255 255 / 0.14),
-      0 2px 0 var(--edge),
-      0 3px 6px rgb(0 0 0 / 0.22);
+  .btn-primary:hover:not(:disabled) {
+    background: color-mix(in oklab, var(--color-accent) 88%, black);
   }
-  .keycap-ink:hover:not(:disabled) {
-    background: linear-gradient(180deg, var(--color-key-ink-face) 0%, var(--color-key-ink-face) 100%);
-  }
-  .keycap-ribbon {
-    --edge: color-mix(in oklab, var(--color-ribbon) 60%, black);
-    color: #fff8f0;
-    background: linear-gradient(
-      180deg,
-      color-mix(in oklab, var(--color-ribbon) 88%, white) 0%,
-      var(--color-ribbon) 100%
-    );
-    border-color: color-mix(in oklab, var(--color-ribbon) 70%, black);
-  }
-  .keycap-ribbon:hover:not(:disabled) {
-    background: var(--color-ribbon);
-  }
-  .keycap-sm {
-    padding: 0.2rem 0.5rem 0.24rem;
-    font-size: 10px;
-    border-radius: 5px;
-  }
-
-  /* ----- Typographic bits ----- */
-  .label {
-    font-family: var(--font-mono);
-    font-size: 9.5px;
-    font-weight: 500;
-    letter-spacing: 0.16em;
-    text-transform: uppercase;
-    color: var(--color-ink-faint);
-  }
-  .display {
-    font-family: var(--font-display);
-    font-weight: 500;
-    letter-spacing: -0.01em;
-  }
-
-  /* ----- Ruled paper surfaces ----- */
-  .sheet {
-    position: relative;
-    background-color: var(--color-paper-hi);
-    background-image:
-      linear-gradient(90deg, transparent 27px, var(--color-ribbon-soft) 27px, var(--color-ribbon-soft) 28px, transparent 28px),
-      repeating-linear-gradient(180deg, transparent 0 21px, var(--color-rule) 21px 22px);
-    background-position: 0 4px;
-    border: 1px solid var(--color-rule-strong);
-    border-radius: 3px;
-    box-shadow:
-      0 1px 0 var(--color-rule),
-      0 6px 14px -8px rgb(0 0 0 / 0.25);
-  }
-  .card {
-    background: color-mix(in oklab, var(--color-paper-hi) 70%, transparent);
-    border: 1px solid var(--color-rule-strong);
-    border-radius: 4px;
-  }
-  .hairline {
-    border-color: var(--color-rule);
-  }
-  .field {
-    width: 100%;
-    font-family: var(--font-mono);
-    font-size: 12px;
-    color: var(--color-ink);
-    background: var(--color-paper-hi);
-    border: 1px solid var(--color-rule-strong);
-    border-radius: 4px;
-    padding: 0.4rem 0.55rem;
-    box-shadow: inset 0 1px 2px rgb(0 0 0 / 0.08);
-  }
-  .field:focus {
-    outline: none;
-    border-color: var(--color-ribbon);
-  }
-
-  /* ----- Persona chips ----- */
-  .chip {
-    font-family: var(--font-mono);
-    font-size: 10.5px;
-    letter-spacing: 0.04em;
-    padding: 0.16rem 0.55rem 0.2rem;
-    border-radius: 999px;
-    border: 1px solid var(--color-rule-strong);
-    color: var(--color-ink-soft);
+  .btn-plain {
     background: transparent;
+    color: var(--color-accent);
+    padding: 0 0.25rem;
+  }
+  .btn-plain:hover:not(:disabled) {
+    background: transparent;
+    text-decoration: underline;
+  }
+  .icon-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 26px;
+    height: 26px;
+    color: var(--color-text-2);
+    background: transparent;
+    border: 0;
+    border-radius: 6px;
     cursor: pointer;
     transition:
       background 120ms,
-      color 120ms,
-      border-color 120ms;
+      color 120ms;
   }
-  .chip:hover {
-    color: var(--color-ink);
-    border-color: var(--color-ink-soft);
+  .icon-btn:hover:not(:disabled),
+  .icon-btn[aria-pressed="true"] {
+    color: var(--color-text);
+    background: var(--color-fill);
   }
-  .chip[aria-pressed="true"] {
-    color: var(--color-paper);
-    background: var(--color-ink);
-    border-color: var(--color-ink);
+  .icon-btn:disabled {
+    opacity: 0.4;
+    cursor: default;
+  }
+
+  /* ----- Segmented control ----- */
+  .seg {
+    display: inline-flex;
+    padding: 2px;
+    gap: 2px;
+    background: var(--color-fill);
+    border-radius: 7px;
+  }
+  .seg > button {
+    height: 22px;
+    padding: 0 0.85rem;
+    font: inherit;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--color-text-2);
+    background: transparent;
+    border: 0;
+    border-radius: 5px;
+    cursor: pointer;
+    transition:
+      background 120ms,
+      color 120ms;
+  }
+  .seg > button:hover:not([aria-selected="true"]):not([aria-checked="true"]):not(:disabled) {
+    color: var(--color-text);
+  }
+  .seg > button[aria-selected="true"],
+  .seg > button[aria-checked="true"] {
+    color: var(--color-text);
+    background: var(--color-surface);
+    box-shadow:
+      0 1px 2px rgb(0 0 0 / 0.12),
+      0 0 0 0.5px rgb(0 0 0 / 0.06);
+  }
+  .seg > button:disabled {
+    opacity: 0.45;
+    cursor: default;
+  }
+
+  /* ----- Grouped inset list (System Settings) ----- */
+  .inset {
+    background: var(--color-surface);
+    border-radius: 10px;
+    box-shadow: 0 0 0 0.5px var(--color-sep-strong);
+    overflow: hidden;
+  }
+  .row {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    min-height: 40px;
+    padding: 0.45rem 0.85rem;
+  }
+  .row + .row {
+    box-shadow: inset 0 0.5px 0 var(--color-sep);
+  }
+  .group-title {
+    margin: 0 0 0.4rem 0.85rem;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--color-text-2);
+  }
+  .footnote {
+    margin: 0.45rem 0.85rem 0;
+    font-size: 11.5px;
+    line-height: 1.4;
+    color: var(--color-text-3);
+  }
+
+  /* ----- Fields ----- */
+  .field {
+    width: 100%;
+    font: inherit;
+    font-size: 13px;
+    color: var(--color-text);
+    background: var(--color-surface);
+    border: 0;
+    border-radius: 6px;
+    padding: 0.35rem 0.55rem;
+    box-shadow: 0 0 0 0.5px var(--color-sep-strong);
+  }
+  .field::placeholder {
+    color: var(--color-text-3);
+  }
+  .field:focus {
+    outline: none;
+    box-shadow: 0 0 0 3px var(--color-accent-soft), 0 0 0 1px var(--color-accent);
+  }
+  .select {
+    appearance: none;
+    -webkit-appearance: none;
+    font: inherit;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--color-text);
+    height: 24px;
+    padding: 0 1.4rem 0 0.6rem;
+    border: 0;
+    border-radius: 6px;
+    background-color: var(--color-fill);
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='10' viewBox='0 0 8 10' fill='none' stroke='%238e8e93' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M1.5 3.5 4 1l2.5 2.5M1.5 6.5 4 9l2.5-2.5'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 0.45rem center;
+    cursor: pointer;
+  }
+  .select:hover:not(:disabled) {
+    background-color: var(--color-fill-strong);
+  }
+  .select:disabled {
+    opacity: 0.45;
+    cursor: default;
+  }
+
+  /* ----- Switch ----- */
+  .switch {
+    position: relative;
+    flex: none;
+    width: 32px;
+    height: 19px;
+    border: 0;
+    border-radius: 999px;
+    background: var(--color-fill-strong);
+    cursor: pointer;
+    transition: background 160ms;
+  }
+  .switch::after {
+    content: "";
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 15px;
+    height: 15px;
+    border-radius: 999px;
+    background: #fff;
+    box-shadow: 0 1px 2px rgb(0 0 0 / 0.25);
+    transition: transform 180ms cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+  .switch[aria-checked="true"] {
+    background: var(--color-accent);
+  }
+  .switch[aria-checked="true"]::after {
+    transform: translateX(13px);
+  }
+  .switch:disabled {
+    opacity: 0.4;
+    cursor: default;
+  }
+
+  .kbd {
+    display: inline-flex;
+    align-items: center;
+    gap: 1px;
+    font-family: var(--font-sans);
+    font-size: 12px;
+    font-weight: 500;
+    letter-spacing: 0.04em;
+    color: var(--color-text);
+  }
+  .tnum {
+    font-variant-numeric: tabular-nums;
   }
 }
 
-/* typebar strike animation for freshly-arrived content */
-@keyframes strike {
-  0% {
+@keyframes fade-in {
+  from {
     opacity: 0;
-    transform: translateY(-3px);
+    transform: translateY(-2px);
   }
-  60% {
+  to {
     opacity: 1;
-    transform: translateY(0.5px);
-  }
-  100% {
-    opacity: 1;
-    transform: translateY(0);
+    transform: none;
   }
 }
-.strike-in {
-  animation: strike 260ms cubic-bezier(0.2, 0.9, 0.3, 1.2) both;
+.fade-in {
+  animation: fade-in 180ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
 }
 
-@keyframes caret {
+@keyframes breathe {
   50% {
-    opacity: 0;
+    opacity: 0.35;
   }
 }
-.caret {
-  animation: caret 1.05s steps(1) infinite;
-}
-
-@keyframes pulse-dot {
-  0%,
-  100% {
-    box-shadow: 0 0 0 0 color-mix(in oklab, var(--color-ok) 50%, transparent);
-  }
-  50% {
-    box-shadow: 0 0 0 4px transparent;
-  }
-}
-.dot-live {
-  animation: pulse-dot 2.4s ease-in-out infinite;
+.breathe {
+  animation: breathe 1.2s ease-in-out infinite;
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -317,8 +354,5 @@ input,
     animation-duration: 0.001ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.001ms !important;
-  }
-  .keycap:active:not(:disabled) {
-    transform: none;
   }
 }
