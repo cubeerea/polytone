@@ -15,34 +15,6 @@ export interface Health {
   llm_ready?: boolean;
 }
 
-export interface Constraints {
-  avg_sentence_len: number;
-  sentence_len_p90: number;
-  top_openers: string[];
-  top_transitions: string[];
-  top_bigrams: [string, string, number][];
-  punctuation_rates: Record<string, number>;
-  structures: { signature: string; weight: number }[];
-  lexicon: string[];
-  casing: "lower" | "sentence" | "mixed";
-  contractions_rate: number;
-  sample_count: number;
-}
-
-export interface GenerateRequest {
-  intent: string;
-  persona: string | null;
-  app_context: string | null;
-}
-
-export interface GenerateResponse {
-  draft_id: string;
-  text: string;
-  persona: string;
-  latency_ms: number;
-  constraints: Constraints;
-}
-
 export interface IngestResult {
   accepted: number;
   rejected: number;
@@ -54,7 +26,8 @@ export interface IngestResult {
 export type SourceName = "manual" | "gmail" | "wispr" | "watcher" | "typed";
 
 export interface IngestSource {
-  name: SourceName | string;
+  /** One of SourceName today; typed as string so a newer backend's sources still render. */
+  name: SourceName | (string & {});
   enabled: boolean;
   status: string;
   last_run: string | null;
@@ -162,23 +135,39 @@ export function isOffline(err: unknown): boolean {
   return err instanceof ApiError && err.offline;
 }
 
+/** One human-readable line for any error: backend (ApiError), Tauri command (string/object) or JS. */
 export function errorMessage(err: unknown): string {
   if (isOffline(err)) return OFFLINE_HINT;
   if (err instanceof Error) return err.message;
-  return String(err);
+  if (typeof err === "string") return err;
+  try {
+    return JSON.stringify(err);
+  } catch {
+    return String(err);
+  }
 }
+
+const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null;
 
 // ---------- Core request ----------
 
-async function request<T>(path: string, init?: RequestInit & { timeoutMs?: number }): Promise<T> {
+interface RequestOptions {
+  method?: "GET" | "POST" | "PUT";
+  body?: unknown;
+  timeoutMs?: number;
+}
+
+async function request<T>(path: string, { method = "GET", body, timeoutMs = 10_000 }: RequestOptions = {}): Promise<T> {
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), init?.timeoutMs ?? 10_000);
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   let res: Response;
   try {
     res = await fetch(`${API_BASE}${path}`, {
-      ...init,
+      method,
       signal: ctrl.signal,
-      headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
+      // Only send Content-Type with a body: on a GET it makes the request "non-simple" and
+      // forces a CORS preflight (OPTIONS) round-trip before every poll.
+      ...(body === undefined ? {} : { body: JSON.stringify(body), headers: { "Content-Type": "application/json" } }),
     });
   } catch {
     throw new ApiError(OFFLINE_HINT, null, true);
@@ -189,10 +178,12 @@ async function request<T>(path: string, init?: RequestInit & { timeoutMs?: numbe
     let detail = `${res.status} ${res.statusText}`;
     let code: string | null = null;
     try {
-      const body = await res.json();
-      if (body && typeof body.error === "string") code = body.error;
-      if (body && typeof body.detail === "string") detail = body.detail;
-      else if (body && body.detail) detail = JSON.stringify(body.detail);
+      const err: unknown = await res.json();
+      if (isRecord(err)) {
+        if (typeof err.error === "string") code = err.error;
+        if (typeof err.detail === "string") detail = err.detail;
+        else if (err.detail != null) detail = JSON.stringify(err.detail);
+      }
     } catch {
       /* non-JSON error body */
     }
@@ -203,36 +194,26 @@ async function request<T>(path: string, init?: RequestInit & { timeoutMs?: numbe
   return (await res.json()) as T;
 }
 
-const json = (body: unknown): string => JSON.stringify(body);
-
 // ---------- Endpoints ----------
+// POST /generate and /ingest/typed are called by the Rust side only.
 
 export const api = {
   health: () => request<Health>("/health", { timeoutMs: 3000 }),
 
-  generate: (req: GenerateRequest) =>
-    request<GenerateResponse>("/generate", { method: "POST", body: json(req), timeoutMs: 15_000 }),
-
   ingestManual: (text: string, persona: string | null) =>
-    request<IngestResult>("/ingest/manual", {
-      method: "POST",
-      body: json({ text, persona }),
-      timeoutMs: 30_000,
-    }),
+    request<IngestResult>("/ingest/manual", { method: "POST", body: { text, persona }, timeoutMs: 30_000 }),
 
   ingestSources: () => request<IngestSource[]>("/ingest/sources"),
 
   runSource: (name: string) =>
-    request<IngestResult>(`/ingest/sources/${encodeURIComponent(name)}/run`, {
-      method: "POST",
-      timeoutMs: 120_000,
-    }),
+    request<IngestResult>(`/ingest/sources/${encodeURIComponent(name)}/run`, { method: "POST", timeoutMs: 120_000 }),
 
   personas: () => request<Persona[]>("/personas"),
 
   getConfig: () => request<AppConfig>("/config"),
 
-  putConfig: (cfg: AppConfig) => request<AppConfig>("/config", { method: "PUT", body: json(cfg) }),
+  /** PUT is a partial update: omitted fields stay unchanged on the backend. */
+  putConfig: (patch: Partial<AppConfig>) => request<AppConfig>("/config", { method: "PUT", body: patch }),
 
   drafts: (limit = 50) => request<Draft[]>(`/drafts?limit=${limit}`),
 
@@ -250,3 +231,5 @@ export const DEFAULT_PERSONAS: Persona[] = [
   { name: "Investor", description: "" },
   { name: "Default", description: "" },
 ];
+
+export const FALLBACK_CONFIG: AppConfig = { active_persona: "Default", hotkey: "CmdOrCtrl+Shift+P", inject_mode: "paste" };

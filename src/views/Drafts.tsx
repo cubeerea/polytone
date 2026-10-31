@@ -1,6 +1,7 @@
 import { useState } from "react";
-import { api, isOffline, type Draft, type ScoreComponents, type ScoresSummary } from "../api";
-import { relativeTime, useResource } from "../hooks";
+import { isOffline, type Draft, type ScoreComponents, type ScoresSummary } from "../api";
+import { relativeTime } from "../hooks";
+import { useDrafts, useScoresSummary } from "../queries";
 import { Bar, ErrorLine, Loading, OfflineNotice, prettyHotkey } from "../components/bits";
 import { Sparkline } from "../components/Sparkline";
 
@@ -22,9 +23,9 @@ const CONFIDENCE_HINT: Record<string, string> = {
   high: "High confidence.",
 };
 
-export function Drafts({ tick, hotkey }: { tick: number; hotkey: string }) {
-  const summary = useResource<ScoresSummary>(api.scoresSummary, [tick], 15_000);
-  const drafts = useResource<Draft[]>(() => api.drafts(50), [tick], 15_000);
+export function Drafts({ hotkey }: { hotkey: string }) {
+  const summary = useScoresSummary();
+  const drafts = useDrafts();
 
   if (summary.error && !summary.data && isOffline(summary.error)) return <OfflineNotice />;
   if (!summary.data && !drafts.data && (summary.loading || drafts.loading)) return <Loading />;

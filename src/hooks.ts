@@ -1,59 +1,6 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 
 export const ONBOARDING_KEY = "polytone.onboarding.dismissed";
-
-export interface Resource<T> {
-  data: T | null;
-  error: unknown;
-  loading: boolean;
-  reload: () => void;
-}
-
-/**
- * Fetch a resource, optionally polling. Keeps the last good data on error so
- * the UI doesn't flash empty when the backend hiccups.
- */
-export function useResource<T>(
-  fetcher: () => Promise<T>,
-  deps: unknown[] = [],
-  pollMs?: number,
-): Resource<T> {
-  const [data, setData] = useState<T | null>(null);
-  const [error, setError] = useState<unknown>(null);
-  const [loading, setLoading] = useState(true);
-  const fetcherRef = useRef(fetcher);
-  fetcherRef.current = fetcher;
-  const seq = useRef(0);
-
-  const run = useCallback(() => {
-    const id = ++seq.current;
-    setLoading(true);
-    fetcherRef
-      .current()
-      .then((d) => {
-        if (id !== seq.current) return;
-        setData(d);
-        setError(null);
-      })
-      .catch((e) => {
-        if (id !== seq.current) return;
-        setError(e);
-      })
-      .finally(() => {
-        if (id === seq.current) setLoading(false);
-      });
-  }, []);
-
-  useEffect(() => {
-    run();
-    if (!pollMs) return;
-    const t = setInterval(run, pollMs);
-    return () => clearInterval(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [run, pollMs, ...deps]);
-
-  return { data, error, loading, reload: run };
-}
 
 export function useLocalStorage(key: string, initial: string | null): [string | null, (v: string | null) => void] {
   const [value, setValue] = useState<string | null>(() => {
@@ -92,4 +39,28 @@ export function relativeTime(iso: string | null | undefined): string {
   const d = Math.round(h / 24);
   if (d < 30) return `${d}d ago`;
   return new Date(t).toLocaleDateString();
+}
+
+/**
+ * Run an async action with `busy` / `error` state. `run` resolves to the action's result,
+ * or undefined if it threw (the error is kept in `error` for <ErrorLine> / errorMessage).
+ */
+export function useAction<A extends unknown[], R>(fn: (...args: A) => Promise<R>) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<unknown>(null);
+  const fnRef = useRef(fn);
+  fnRef.current = fn;
+  const run = useCallback(async (...args: A): Promise<R | undefined> => {
+    setBusy(true);
+    setError(null);
+    try {
+      return await fnRef.current(...args);
+    } catch (e) {
+      setError(e);
+      return undefined;
+    } finally {
+      setBusy(false);
+    }
+  }, []);
+  return { run, busy, error, setError };
 }

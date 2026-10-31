@@ -1,9 +1,21 @@
-import { useEffect, useState } from "react";
-import { api, isOffline, type GraphData, type IngestResult, type IngestSource, type NodeLabel, type Persona, type Stats } from "../api";
-import { relativeTime, useResource } from "../hooks";
+import { lazy, Suspense, useEffect, useState } from "react";
+import { api, errorMessage, isOffline, type IngestResult, type IngestSource, type NodeLabel, type Persona, type Stats } from "../api";
+import { relativeTime, useAction } from "../hooks";
+import { invalidateQueries } from "../query";
+import { AFTER_INGEST, useGraph, useSources, useStats } from "../queries";
 import { ErrorLine, Loading, OfflineNotice } from "../components/bits";
 import { RefreshIcon } from "../components/Icons";
-import { GlyphMark, LABEL_NAME, StyleGraph } from "../components/StyleGraph";
+import { GlyphMark, LABEL_NAME } from "../components/graphGlyphs";
+
+// d3 (force + zoom + selection) is only needed here: keep it out of the startup bundle.
+const StyleGraph = lazy(() => import("../components/StyleGraph"));
+
+const GraphLoading = () => (
+  <div style={{ height: 280 }}>
+    <Loading />
+  </div>
+);
+const reloadAfterIngest = () => invalidateQueries(AFTER_INGEST);
 
 const SOURCE_META: Record<string, { name: string; blurb: string }> = {
   gmail: { name: "Gmail", blurb: "Sent mail only" },
@@ -16,26 +28,18 @@ export function Style({
   personas,
   activePersona,
   online,
-  tick,
 }: {
   personas: Persona[];
   activePersona: string | null;
   online: boolean;
-  tick: number;
 }) {
   const [persona, setPersona] = useState("");
-  const graph = useResource<GraphData>(() => api.graph(60, persona), [persona, tick]);
-  const stats = useResource<Stats>(api.stats, [tick]);
-  const sources = useResource<IngestSource[]>(api.ingestSources, [online]);
+  const graph = useGraph(persona);
+  const stats = useStats();
+  const sources = useSources();
 
   const offline = isOffline(graph.error) && !graph.data;
   if (offline) return <OfflineNotice />;
-
-  const reloadAll = () => {
-    graph.reload();
-    stats.reload();
-    sources.reload();
-  };
 
   return (
     <div className="space-y-7 pt-1">
@@ -61,11 +65,11 @@ export function Style({
           ) : graph.data && graph.data.nodes.length === 0 ? (
             <p className="py-16 text-center text-[13px] text-text-2">Nothing learned yet. Add some of your writing below.</p>
           ) : graph.data ? (
-            <StyleGraph data={graph.data} />
+            <Suspense fallback={<GraphLoading />}>
+              <StyleGraph data={graph.data} />
+            </Suspense>
           ) : (
-            <div style={{ height: 280 }}>
-              <Loading />
-            </div>
+            <GraphLoading />
           )}
         </div>
         {graph.data && graph.data.nodes.length > 0 && <Legend />}
@@ -75,7 +79,7 @@ export function Style({
         sources={sources.data}
         error={sources.error}
         loading={sources.loading}
-        onChanged={reloadAll}
+        onChanged={reloadAfterIngest}
         personas={personas}
         activePersona={activePersona}
         online={online}
@@ -176,9 +180,8 @@ function PasteRow({
   const [open, setOpen] = useState(false);
   const [text, setText] = useState("");
   const [persona, setPersona] = useState<string>(activePersona ?? "");
-  const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<IngestResult | null>(null);
-  const [error, setError] = useState<unknown>(null);
+  const learn = useAction(api.ingestManual);
 
   useEffect(() => {
     if (activePersona && !persona) setPersona(activePersona);
@@ -187,19 +190,12 @@ function PasteRow({
 
   const ingest = async () => {
     if (!text.trim()) return;
-    setBusy(true);
-    setError(null);
     setResult(null);
-    try {
-      const r = await api.ingestManual(text, persona || null);
-      setResult(r);
-      if (r.accepted > 0) setText("");
-      onDone();
-    } catch (e) {
-      setError(e);
-    } finally {
-      setBusy(false);
-    }
+    const r = await learn.run(text, persona || null);
+    if (!r) return;
+    setResult(r);
+    if (r.accepted > 0) setText("");
+    onDone();
   };
 
   return (
@@ -250,15 +246,15 @@ function PasteRow({
             <button
               type="button"
               className="btn btn-primary"
-              disabled={busy || !text.trim() || !online}
+              disabled={learn.busy || !text.trim() || !online}
               onClick={ingest}
               title={online ? "⌘↵" : "Engine offline"}
             >
-              {busy ? "Learning…" : "Learn"}
+              {learn.busy ? "Learning…" : "Learn"}
             </button>
           </div>
           <div aria-live="polite">
-            <ErrorLine error={error} />
+            <ErrorLine error={learn.error} />
             {result && <Receipt result={result} />}
           </div>
         </div>
@@ -289,29 +285,21 @@ function Receipt({ result }: { result: IngestResult }) {
 }
 
 function SourceRow({ source, onDone }: { source: IngestSource; onDone: () => void }) {
-  const [busy, setBusy] = useState(false);
-  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const sync = useAction(api.runSource);
+  const [done, setDone] = useState<string | null>(null);
   const meta = SOURCE_META[source.name] ?? { name: source.name, blurb: "" };
   const status = source.status ?? "";
   const failing = /error|fail/i.test(status);
   const runnable = source.enabled && source.name !== "typed";
 
   const run = async () => {
-    setBusy(true);
-    setMsg(null);
-    try {
-      const r = await api.runSource(source.name);
-      setMsg({
-        ok: true,
-        text: r.accepted > 0 ? `${r.accepted} new` : `Nothing new${r.reasons[0] ? `: ${r.reasons[0]}` : ""}`,
-      });
-      onDone();
-    } catch (e) {
-      setMsg({ ok: false, text: e instanceof Error ? e.message : String(e) });
-    } finally {
-      setBusy(false);
-    }
+    setDone(null);
+    const r = await sync.run(source.name);
+    if (!r) return;
+    setDone(r.accepted > 0 ? `${r.accepted} new` : `Nothing new${r.reasons[0] ? `: ${r.reasons[0]}` : ""}`);
+    onDone();
   };
+  const msg = sync.error != null ? { ok: false, text: errorMessage(sync.error) } : done ? { ok: true, text: done } : null;
 
   // Disabled sources carry their fix in `status` (e.g. Gmail's auth command): show it whole.
   const subtitle = !source.enabled
@@ -340,12 +328,12 @@ function SourceRow({ source, onDone }: { source: IngestSource; onDone: () => voi
         <button
           type="button"
           className="icon-btn"
-          disabled={busy}
+          disabled={sync.busy}
           onClick={run}
           aria-label={`Sync ${meta.name} now`}
           title="Sync now"
         >
-          <RefreshIcon className={busy ? "animate-spin" : ""} width={14} height={14} />
+          <RefreshIcon className={sync.busy ? "animate-spin" : ""} width={14} height={14} />
         </button>
       )}
     </div>

@@ -2,9 +2,11 @@
 // gracefully when the UI runs outside Tauri (e.g. `pnpm dev` in a browser).
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { errorMessage } from "./api";
 
-export const inTauri = (): boolean =>
-  typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+// Fixed for the page's lifetime, so evaluate once.
+const IN_TAURI = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+export const inTauri = (): boolean => IN_TAURI;
 
 export interface PermissionStatus {
   accessibility: boolean;
@@ -68,7 +70,7 @@ export const native = {
   setCapture: (enabled: boolean, apps: string[]): Promise<{ status: CaptureStatus | null; error: string | null }> =>
     call<CaptureStatus>("set_capture", { enabled, apps })
       .then((status) => ({ status, error: null }))
-      .catch((e) => ({ status: null, error: e instanceof NotInTauri ? null : nativeErrorMessage(e) })),
+      .catch((e) => ({ status: null, error: e instanceof NotInTauri ? null : errorMessage(e) })),
   getCaptureStatus: () => call<CaptureStatus>("get_capture_status").catch(() => null),
   listRunningApps: () =>
     call<RunningApp[]>("list_running_apps")
@@ -106,14 +108,4 @@ export function onNative<K extends keyof NativeEvents>(
     cancelled = true;
     if (un) safe(un);
   };
-}
-
-export function nativeErrorMessage(err: unknown): string {
-  if (err instanceof Error) return err.message;
-  if (typeof err === "string") return err;
-  try {
-    return JSON.stringify(err);
-  } catch {
-    return String(err);
-  }
 }

@@ -28,12 +28,6 @@ export const ChevronIcon = ({ open, ...p }: SVGProps<SVGSVGElement> & { open?: b
   </svg>
 );
 
-export const PlusIcon = (p: SVGProps<SVGSVGElement>) => (
-  <svg {...base(p)}>
-    <path d="M8 3v10M3 8h10" />
-  </svg>
-);
-
 export const MinusIcon = (p: SVGProps<SVGSVGElement>) => (
   <svg {...base(p)}>
     <path d="M3.5 8h9" />

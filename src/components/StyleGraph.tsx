@@ -10,25 +10,12 @@ import {
   type SimulationNodeDatum,
 } from "d3-force";
 import { select } from "d3-selection";
-import { zoom, zoomIdentity, type ZoomBehavior } from "d3-zoom";
-import type { EdgeType, GraphData, GraphNode, NodeLabel } from "../api";
+import { zoom, zoomIdentity, type D3ZoomEvent, type ZoomBehavior } from "d3-zoom";
+import type { EdgeType, GraphData, GraphEdge, GraphNode } from "../api";
+import { LABEL_NAME, NODE_STYLE, glyphPath } from "./graphGlyphs";
 
 type SimNode = GraphNode & SimulationNodeDatum & { r: number };
 type SimLink = SimulationLinkDatum<SimNode> & { type: EdgeType; weight: number; w: number };
-
-export const LABEL_NAME: Record<NodeLabel, string> = {
-  Word: "Words",
-  SentenceStructure: "Sentence shapes",
-  PunctuationMark: "Punctuation",
-  IntentContext: "Voices",
-};
-
-const NODE_STYLE: Record<NodeLabel, { fill: string; stroke: string; sw: number }> = {
-  Word: { fill: "var(--color-text-3)", stroke: "none", sw: 0 },
-  SentenceStructure: { fill: "var(--color-surface)", stroke: "var(--color-text-2)", sw: 1.2 },
-  PunctuationMark: { fill: "var(--color-accent)", stroke: "none", sw: 0 },
-  IntentContext: { fill: "var(--color-text)", stroke: "none", sw: 0 },
-};
 
 const EDGE_STYLE: Record<EdgeType, { color: string; opacity: number }> = {
   FOLLOWED_BY: { color: "var(--color-text-3)", opacity: 0.35 },
@@ -39,66 +26,75 @@ const EDGE_STYLE: Record<EdgeType, { color: string; opacity: number }> = {
 const prefersReducedMotion = () =>
   typeof window !== "undefined" && window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
 
-/** Node glyph centred on 0,0. Shape carries the type; colour stays quiet. */
-export function glyphPath(label: NodeLabel, r: number): string {
-  switch (label) {
-    case "SentenceStructure": {
-      const s = r * 0.85;
-      return `M${-s},${-s}H${s}V${s}H${-s}Z`;
-    }
-    case "PunctuationMark":
-      return `M0,${-r * 1.15}L${r * 1.15},0L0,${r * 1.15}L${-r * 1.15},0Z`;
-    default:
-      return `M${r},0A${r},${r} 0 1,1 ${-r},0A${r},${r} 0 1,1 ${r},0Z`;
+/** The graph stays legible at ~420px: only the heaviest words, and the strongest edges of each kind. */
+const MAX_WORDS = 24;
+const MAX_EDGES: Record<EdgeType, number> = { FOLLOWED_BY: 60, PART_OF_STRUCTURE: 40, USED_IN: Infinity };
+const SETTLED_ALPHA = 0.02;
+
+function prepare(data: GraphData) {
+  const words = data.nodes.filter((n) => n.label === "Word").sort((a, b) => b.weight - a.weight);
+  const keepWords = new Set(words.slice(0, MAX_WORDS).map((n) => n.id));
+  const kept = data.nodes.filter((n) => n.label !== "Word" || keepWords.has(n.id));
+
+  const maxW = Math.max(1, ...kept.map((n) => n.weight));
+  const nodes: SimNode[] = kept.map((n) => ({
+    ...n,
+    r:
+      (n.label === "Word" ? 2 : 2.5) +
+      Math.sqrt(Math.max(0, n.weight) / maxW) * (n.label === "Word" ? 5 : 6) +
+      (n.label === "IntentContext" ? 2.5 : 0),
+  }));
+
+  // Degree counts every edge the backend sent (it's what the tooltip reports), not just drawn ones.
+  const all = new Set(data.nodes.map((n) => n.id));
+  const degree = new Map<string, number>();
+  for (const e of data.edges) {
+    if (!all.has(e.source) || !all.has(e.target) || e.source === e.target) continue;
+    degree.set(e.source, (degree.get(e.source) ?? 0) + 1);
+    degree.set(e.target, (degree.get(e.target) ?? 0) + 1);
   }
+
+  const ids = new Set(kept.map((n) => n.id));
+  const perType: Record<EdgeType, number> = { FOLLOWED_BY: 0, PART_OF_STRUCTURE: 0, USED_IN: 0 };
+  const candidates = data.edges
+    .filter((e) => ids.has(e.source) && ids.has(e.target) && e.source !== e.target)
+    .sort((a, b) => b.weight - a.weight);
+  // Every node keeps its strongest edge (so trimming never strands one), then the heaviest
+  // remaining edges fill each type's budget.
+  const linked = new Set<string>();
+  const picked = new Set<GraphEdge>();
+  for (const e of candidates) {
+    if (linked.has(e.source) && linked.has(e.target)) continue;
+    picked.add(e);
+    perType[e.type]++;
+    linked.add(e.source);
+    linked.add(e.target);
+  }
+  for (const e of candidates) {
+    if (!picked.has(e) && perType[e.type] < MAX_EDGES[e.type]) {
+      picked.add(e);
+      perType[e.type]++;
+    }
+  }
+  const valid = [...picked];
+  const maxE = Math.max(1, ...valid.map((e) => e.weight));
+  const links: SimLink[] = valid.map((e) => ({
+    source: e.source,
+    target: e.target,
+    type: e.type,
+    weight: e.weight,
+    w: 0.5 + Math.sqrt(Math.max(0, e.weight) / maxE) * 2,
+  }));
+  return { nodes, links, degree };
 }
 
-export function GlyphMark({ label }: { label: NodeLabel }) {
-  const st = NODE_STYLE[label];
-  return (
-    <svg width="10" height="10" viewBox="-6 -6 12 12" aria-hidden>
-      <path d={glyphPath(label, 4)} style={{ fill: st.fill, stroke: st.stroke }} strokeWidth={st.sw} />
-    </svg>
-  );
-}
-
-export function GraphFrame({ children, height }: { children: React.ReactNode; height: number }) {
-  return (
-    <div className="relative overflow-hidden" style={{ height }}>
-      {children}
-    </div>
-  );
-}
-
-export function StyleGraph({ data, height = 280 }: { data: GraphData; height?: number }) {
+export default function StyleGraph({ data, height = 280 }: { data: GraphData; height?: number }) {
   const svgRef = useRef<SVGSVGElement | null>(null);
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const zoomRef = useRef<ZoomBehavior<SVGSVGElement, unknown> | null>(null);
   const [hover, setHover] = useState<{ node: SimNode; x: number; y: number; degree: number } | null>(null);
 
-  const { nodes, links, degree } = useMemo(() => {
-    const maxW = Math.max(1, ...data.nodes.map((n) => n.weight));
-    const ids = new Set(data.nodes.map((n) => n.id));
-    const nodes: SimNode[] = data.nodes.map((n) => ({
-      ...n,
-      r: (n.label === "Word" ? 2 : 2.5) + Math.sqrt(Math.max(0, n.weight) / maxW) * (n.label === "Word" ? 5 : 6) + (n.label === "IntentContext" ? 2.5 : 0),
-    }));
-    const valid = data.edges.filter((e) => ids.has(e.source) && ids.has(e.target) && e.source !== e.target);
-    const maxE = Math.max(1, ...valid.map((e) => e.weight));
-    const links: SimLink[] = valid.map((e) => ({
-      source: e.source,
-      target: e.target,
-      type: e.type,
-      weight: e.weight,
-      w: 0.5 + Math.sqrt(Math.max(0, e.weight) / maxE) * 2,
-    }));
-    const degree = new Map<string, number>();
-    for (const e of valid) {
-      degree.set(e.source, (degree.get(e.source) ?? 0) + 1);
-      degree.set(e.target, (degree.get(e.target) ?? 0) + 1);
-    }
-    return { nodes, links, degree };
-  }, [data]);
+  const { nodes, links, degree } = useMemo(() => prepare(data), [data]);
 
   useEffect(() => {
     const svgEl = svgRef.current;
@@ -210,33 +206,37 @@ export function StyleGraph({ data, height = 280 }: { data: GraphData; height?: n
 
     const z = zoom<SVGSVGElement, unknown>()
       .scaleExtent([0.3, 5])
-      .on("zoom", (e) => {
+      .on("zoom", (e: D3ZoomEvent<SVGSVGElement, unknown>) => {
         root.attr("transform", e.transform.toString());
-        setHover(null);
+        setHover((h) => (h ? null : h));
       });
     zoomRef.current = z;
     svg.call(z).on("dblclick.zoom", fit);
 
+    // Stop well before d3's default alphaMin (0.001, ~300 ticks): past this point nodes move
+    // sub-pixel, so the remaining ticks only burn CPU.
+    sim.alphaMin(SETTLED_ALPHA);
+    const timers: ReturnType<typeof setTimeout>[] = [];
     if (prefersReducedMotion()) {
       sim.stop();
-      sim.tick(300);
+      sim.tick(Math.ceil(Math.log(SETTLED_ALPHA) / Math.log(1 - sim.alphaDecay())));
       render();
       fit();
     } else {
       sim.on("tick", render);
       sim.on("end", fit);
-      setTimeout(fit, 450);
-      setTimeout(fit, 1600);
+      timers.push(setTimeout(fit, 450), setTimeout(fit, 1600));
     }
 
     return () => {
       sim.stop();
+      timers.forEach(clearTimeout);
       svg.on(".zoom", null);
     };
   }, [nodes, links, degree, height]);
 
   return (
-    <GraphFrame height={height}>
+    <div className="relative overflow-hidden" style={{ height }}>
       <div ref={wrapRef} className="absolute inset-0">
         <svg
           ref={svgRef}
@@ -259,7 +259,7 @@ export function StyleGraph({ data, height = 280 }: { data: GraphData; height?: n
           </div>
         )}
       </div>
-    </GraphFrame>
+    </div>
   );
 }
 

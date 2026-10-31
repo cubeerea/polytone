@@ -1,79 +1,65 @@
-import { useCallback, useEffect, useState } from "react";
-import { api, DEFAULT_PERSONAS, type AppConfig, type Health, type Persona } from "./api";
-import { ONBOARDING_KEY, useLocalStorage, useResource } from "./hooks";
-import { native, onNative, type RunResult } from "./tauri";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { FALLBACK_CONFIG, isOffline } from "./api";
+import { ONBOARDING_KEY, useLocalStorage } from "./hooks";
+import { invalidateQueries, prefetchQuery } from "./query";
+import {
+  AFTER_GENERATION,
+  KEYS,
+  patchConfigLocally,
+  updateConfig,
+  useConfig,
+  useHealth,
+  usePersonas,
+} from "./queries";
+import { inTauri, native, onNative, type RunResult } from "./tauri";
 import { Header, type ViewId } from "./components/Header";
 import { Drafts } from "./views/Drafts";
 import { Style } from "./views/Style";
 import { Settings } from "./views/Settings";
 
 const TAB_KEY = "polytone.tab";
+const VIEWS: readonly ViewId[] = ["drafts", "style", "settings"];
+// Older builds stored feed/scoreboard/graph; map them onto the merged views.
+const LEGACY: Record<string, ViewId> = { feed: "style", graph: "style", scoreboard: "drafts" };
 
-const FALLBACK_CONFIG: AppConfig = { active_persona: "Default", hotkey: "CmdOrCtrl+Shift+P", inject_mode: "paste" };
+/** Load the d3 graph chunk once the first paint is done, so the Style tab opens instantly. */
+function prefetchGraphChunk() {
+  const load = () => void import("./components/StyleGraph");
+  if (typeof window.requestIdleCallback === "function") window.requestIdleCallback(load, { timeout: 3000 });
+  else setTimeout(load, 1500);
+}
 
 export default function App() {
   const [storedTab, setStoredTab] = useLocalStorage(TAB_KEY, "drafts");
-  // Older builds stored feed/scoreboard/graph; map them onto the merged views.
-  const LEGACY: Record<string, ViewId> = { feed: "style", graph: "style", scoreboard: "drafts" };
-  const tab: ViewId = (["drafts", "style", "settings"] as const).includes(storedTab as ViewId)
-    ? (storedTab as ViewId)
-    : (LEGACY[storedTab ?? ""] ?? "drafts");
+  const tab: ViewId = VIEWS.includes(storedTab as ViewId) ? (storedTab as ViewId) : (LEGACY[storedTab ?? ""] ?? "drafts");
   const setTab = useCallback((t: ViewId) => setStoredTab(t), [setStoredTab]);
 
-  const health = useResource<Health>(api.health, [], 5000);
+  const health = useHealth();
   const online = health.data != null && !health.error;
+  const personas = usePersonas();
+  const config = useConfig();
 
-  const personasRes = useResource<Persona[]>(api.personas, [online]);
-  const personas = personasRes.data?.length ? personasRes.data : DEFAULT_PERSONAS;
-
-  const [config, setConfig] = useState<AppConfig | null>(null);
-  const [configError, setConfigError] = useState<unknown>(null);
-  const loadConfig = useCallback(() => {
-    api
-      .getConfig()
-      .then((c) => {
-        setConfig(c);
-        setConfigError(null);
-      })
-      .catch(setConfigError);
-  }, []);
+  // Engine came back after being offline: everything we hold may be out of date.
+  const wasOffline = useRef(false);
   useEffect(() => {
-    if (online) loadConfig();
-  }, [online, loadConfig]);
-
-  const updateConfig = useCallback(
-    async (patch: Partial<AppConfig>) => {
-      const next = { ...(config ?? FALLBACK_CONFIG), ...patch };
-      const prev = config;
-      setConfig(next); // optimistic
-      try {
-        const saved = await api.putConfig(next);
-        setConfig(saved);
-        setConfigError(null);
-        return saved;
-      } catch (e) {
-        setConfig(prev);
-        setConfigError(e);
-        throw e;
-      }
-    },
-    [config],
-  );
+    if (isOffline(health.error)) wasOffline.current = true;
+    else if (online && wasOffline.current) {
+      wasOffline.current = false;
+      invalidateQueries((k) => k !== KEYS.health && !k.startsWith("native:"));
+    }
+  }, [online, health.error]);
 
   // Native events: persona changes from the tray, generation lifecycle.
   const [generating, setGenerating] = useState(false);
   const [lastRun, setLastRun] = useState<RunResult | null>(null);
-  const [dataTick, setDataTick] = useState(0);
   useEffect(() => {
     const offs = [
-      onNative("persona-changed", ({ persona }) =>
-        setConfig((c) => (c ? { ...c, active_persona: persona } : { ...FALLBACK_CONFIG, active_persona: persona })),
-      ),
+      onNative("persona-changed", ({ persona }) => patchConfigLocally({ active_persona: persona })),
       onNative("generation-started", () => setGenerating(true)),
       onNative("generation-finished", (r) => {
         setGenerating(false);
         setLastRun(r);
-        setDataTick((n) => n + 1);
+        invalidateQueries(AFTER_GENERATION);
       }),
     ];
     return () => offs.forEach((off) => off());
@@ -82,16 +68,19 @@ export default function App() {
   // First launch: jump to Settings if accessibility is missing and the guide wasn't dismissed.
   const [dismissed] = useLocalStorage(ONBOARDING_KEY, null);
   useEffect(() => {
-    if (dismissed) return;
-    native
-      .checkPermissions()
+    prefetchGraphChunk();
+    if (dismissed || !inTauri()) return;
+    prefetchQuery(KEYS.perm, native.checkPermissions)
       .then((p) => {
-        if (!p.accessibility) setStoredTab("settings");
+        if (p && !p.accessibility) setStoredTab("settings");
       })
       .catch(() => {});
     // run once on mount
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  const active = config.data?.active_persona ?? null;
+  const onPersona = useCallback((p: string) => void updateConfig({ active_persona: p }).catch(() => {}), []);
 
   return (
     <div className="mx-auto flex h-full max-w-[560px] flex-col">
@@ -100,28 +89,18 @@ export default function App() {
         onView={setTab}
         health={health.data}
         healthError={health.error}
-        healthLoading={health.loading && !health.data && !health.error}
+        healthLoading={health.loading}
         personas={personas}
-        active={config?.active_persona ?? null}
-        onPersona={(p) => updateConfig({ active_persona: p }).catch(() => {})}
+        active={active}
+        onPersona={onPersona}
         personaDisabled={!online}
         generating={generating}
       />
       <main className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-4 pb-6" key={tab}>
-        {tab === "drafts" && <Drafts tick={dataTick} hotkey={config?.hotkey ?? FALLBACK_CONFIG.hotkey} />}
-        {tab === "style" && (
-          <Style personas={personas} activePersona={config?.active_persona ?? null} online={online} tick={dataTick} />
-        )}
+        {tab === "drafts" && <Drafts hotkey={config.data?.hotkey ?? FALLBACK_CONFIG.hotkey} />}
+        {tab === "style" && <Style personas={personas} activePersona={active} online={online} />}
         {tab === "settings" && (
-          <Settings
-            config={config}
-            configError={configError}
-            online={online}
-            health={health.data}
-            onUpdate={updateConfig}
-            lastRunFromEvent={lastRun}
-            generating={generating}
-          />
+          <Settings online={online} health={health.data} lastRunFromEvent={lastRun} generating={generating} />
         )}
       </main>
     </div>
