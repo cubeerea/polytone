@@ -62,7 +62,7 @@ def _call(mod: ModuleType | None, fn: str, *args: Any, default: Any = None) -> A
     try:
         return f(*args)
     except Exception as e:  # noqa: BLE001
-        log.warning("%s.%s failed: %s", mod.__name__, fn, e)
+        log.warning("%s.%s failed: %s", mod.__name__, fn, type(e).__name__)
         return default
 
 
@@ -177,5 +177,5 @@ def _strip_wispr(text: str, app: str | None) -> Any:
 
         return wispr_live.check_typed(text, app)
     except Exception as e:  # noqa: BLE001 - typing capture must work without Wispr
-        log.warning("wispr insertion check failed: %s", e)
+        log.warning("wispr insertion check failed: %s", type(e).__name__)
         return None

@@ -68,7 +68,7 @@ class Runtime:
         try:
             self.store.get_constraints(persona)
         except Exception as e:  # noqa: BLE001 - generation falls back to empty constraints anyway
-            log.warning("constraint warm-up failed: %s", e)
+            log.warning("constraint warm-up failed: %s", type(e).__name__)
 
     def audit_event(self, event: str, detail: dict[str, Any] | None = None, actor: str = "backend") -> None:
         """Append an audit event (never user text: counts, ids, lengths, bundle ids)."""

@@ -141,7 +141,7 @@ def score_draft(draft_id: str, runtime_or_db: Any, *, limit: int = 200) -> dict[
     try:
         result = score(draft["text"], baseline, persona)
     except Exception as e:  # noqa: BLE001 - scoring is best-effort
-        log.warning("scoring draft %s failed: %s", draft_id, e)
+        log.warning("scoring draft %s failed: %s", draft_id, type(e).__name__)
         return None
     db.update_draft_score(draft_id, result)
     return result

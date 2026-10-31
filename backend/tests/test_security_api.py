@@ -340,3 +340,16 @@ def test_anthropic_key_from_keychain(monkeypatch, tmp_path):
         assert get_settings().anthropic_api_key == "" and asked == []  # mock never asks the Keychain
     finally:
         get_settings.cache_clear()
+
+
+def test_logs_never_contain_user_text(client, caplog):
+    import logging
+
+    caplog.set_level(logging.DEBUG)
+    text = f"honestly i think {SECRET} is fine, no rush at all."
+    client.post("/ingest/manual", json={"text": text})
+    client.post("/ingest/manual", json={"text": text})  # duplicate → rejected
+    client.post("/generate", json={"intent": f"tell sam about {SECRET}"})
+    client.get("/graph")
+    client.get("/drafts")
+    assert SECRET not in caplog.text
