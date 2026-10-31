@@ -1,6 +1,7 @@
 // Typed client for the Polytone Python backend. Mirrors CONTRACTS.md exactly.
 
-export const API_BASE = "http://127.0.0.1:8765";
+// VITE_POLYTONE_API overrides the engine URL for development against a stub (never in the app).
+export const API_BASE: string = import.meta.env.VITE_POLYTONE_API || "http://127.0.0.1:8765";
 export const OFFLINE_HINT = "Backend offline — run `uv run polytone-api`";
 
 // ---------- Types ----------
@@ -49,7 +50,34 @@ export interface AppConfig {
   capture_enabled?: boolean;
   /** macOS bundle ids the typing capture is allowed to read from. */
   capture_apps?: string[];
+  /** Auto-lock after this many idle minutes (1-240, default 15). Optional: older engines omit it. */
+  lock_idle_minutes?: number;
+  /** Delete typed/dictated samples, drafts and draft edits older than N days; 0 = keep forever. */
+  retention_days?: number;
 }
+
+export interface AuditEntry {
+  seq: number;
+  ts: string;
+  event: string;
+  actor: string;
+  /** JSON object (the engine may send it parsed or as its JSON text). Never user text. */
+  detail: Record<string, unknown> | string | null;
+}
+
+export interface AuditPage {
+  entries: AuditEntry[];
+  head_seq: number;
+}
+
+export interface AuditVerify {
+  ok: boolean;
+  count: number;
+  first_bad_seq: number | null;
+  reason: string | null;
+}
+
+export const WIPE_PHRASE = "delete everything";
 
 /** Each component is a 0-1 DISTANCE (0 = identical to your baseline). */
 export interface ScoreComponents {
@@ -135,6 +163,27 @@ export function isOffline(err: unknown): boolean {
   return err instanceof ApiError && err.offline;
 }
 
+/** The engine said 401: the UI session is missing, revoked or expired. */
+export function isLocked(err: unknown): boolean {
+  return err instanceof ApiError && err.status === 401;
+}
+
+// ---------- UI session (memory only: never localStorage) ----------
+
+let sessionToken: string | null = null;
+const lockListeners = new Set<() => void>();
+
+/** Set by the unlock flow; "" = an engine without sessions (no header sent). */
+export function setSessionToken(token: string | null) {
+  sessionToken = token;
+}
+
+/** Called once for every 401 (the token is dropped first). */
+export function onSessionRejected(fn: () => void): () => void {
+  lockListeners.add(fn);
+  return () => lockListeners.delete(fn);
+}
+
 /** One human-readable line for any error: backend (ApiError), Tauri command (string/object) or JS. */
 export function errorMessage(err: unknown): string {
   if (isOffline(err)) return OFFLINE_HINT;
@@ -152,7 +201,7 @@ const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "obj
 // ---------- Core request ----------
 
 interface RequestOptions {
-  method?: "GET" | "POST" | "PUT";
+  method?: "GET" | "POST" | "PUT" | "DELETE";
   body?: unknown;
   timeoutMs?: number;
 }
@@ -160,19 +209,32 @@ interface RequestOptions {
 async function request<T>(path: string, { method = "GET", body, timeoutMs = 10_000 }: RequestOptions = {}): Promise<T> {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  const headers: Record<string, string> = {};
+  if (sessionToken) headers.Authorization = `Bearer ${sessionToken}`;
+  // Content-Type only with a body (no need to make a GET any less simple than auth already does).
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+  const sentWith = sessionToken;
   let res: Response;
   try {
     res = await fetch(`${API_BASE}${path}`, {
       method,
       signal: ctrl.signal,
-      // Only send Content-Type with a body: on a GET it makes the request "non-simple" and
-      // forces a CORS preflight (OPTIONS) round-trip before every poll.
-      ...(body === undefined ? {} : { body: JSON.stringify(body), headers: { "Content-Type": "application/json" } }),
+      headers,
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     });
   } catch {
     throw new ApiError(OFFLINE_HINT, null, true);
   } finally {
     clearTimeout(timer);
+  }
+  if (res.status === 401) {
+    // Only a rejection of the token we still hold locks; a stale request from before an
+    // unlock must not throw away the new session.
+    if (sentWith === sessionToken) {
+      sessionToken = null;
+      lockListeners.forEach((fn) => fn());
+    }
+    throw new ApiError("Locked", 401, false, "locked");
   }
   if (!res.ok) {
     let detail = `${res.status} ${res.statusText}`;
@@ -223,6 +285,14 @@ export const api = {
     request<GraphData>(`/graph?limit=${limit}&persona=${encodeURIComponent(persona)}`),
 
   stats: () => request<Stats>("/stats"),
+
+  audit: (limit = 50, beforeSeq?: number) =>
+    request<AuditPage>(`/audit?limit=${limit}${beforeSeq != null ? `&before_seq=${beforeSeq}` : ""}`),
+
+  auditVerify: () => request<AuditVerify>("/audit/verify", { timeoutMs: 30_000 }),
+
+  /** Deletes all samples, drafts, draft edits and the style graph. */
+  wipe: () => request<unknown>("/data/wipe", { method: "POST", body: { confirm: WIPE_PHRASE }, timeoutMs: 60_000 }),
 };
 
 export const DEFAULT_PERSONAS: Persona[] = [

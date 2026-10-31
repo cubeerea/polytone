@@ -7,6 +7,7 @@ import { PermissionsCard } from "./settings/PermissionsCard";
 import { ShortcutGroup } from "./settings/ShortcutGroup";
 import { CaptureGroup } from "./settings/CaptureGroup";
 import { AdvancedGroup } from "./settings/AdvancedGroup";
+import { PrivacyGroup } from "./settings/PrivacyGroup";
 
 interface Props {
   online: boolean;
@@ -36,6 +37,8 @@ export function Settings({ online, health, lastRunFromEvent, generating }: Props
       {configError != null && <ErrorLine error={configError} />}
 
       <CaptureGroup tauri={tauri} online={online} config={config.data} />
+
+      <PrivacyGroup online={online} config={config.data} />
 
       <Disclosure title="Advanced">
         <AdvancedGroup

@@ -126,6 +126,7 @@ pub fn clean_apps(apps: Vec<String>) -> Vec<String> {
 pub fn apply(app: &AppHandle, enabled: bool, apps: Vec<String>) -> CaptureStatus {
     let _ = APP.set(app.clone());
     let s = shared();
+    let was_running = s.running.load(Ordering::SeqCst);
     s.status.lock().unwrap().apps = clean_apps(apps);
     s.enabled.store(enabled, Ordering::SeqCst);
     if enabled {
@@ -150,7 +151,9 @@ pub fn apply(app: &AppHandle, enabled: bool, apps: Vec<String>) -> CaptureStatus
         platform::stop();
         set_error(None);
     }
-    status()
+    let st = status();
+    crate::security::audit_capture_transition(app, was_running, &st);
+    st
 }
 
 /// Called from `sync_from_backend_config` with the backend's `/config` (blocking; see [`apply`]).

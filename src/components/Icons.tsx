@@ -46,3 +46,10 @@ export const BackIcon = (p: SVGProps<SVGSVGElement>) => (
     <path d="M10 3.5 5.5 8l4.5 4.5" />
   </svg>
 );
+
+export const LockIcon = (p: SVGProps<SVGSVGElement>) => (
+  <svg {...base(p)}>
+    <rect x="3.5" y="7" width="9" height="6.5" rx="1.6" />
+    <path d="M5.5 7V5.2a2.5 2.5 0 0 1 5 0V7" />
+  </svg>
+);

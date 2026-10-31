@@ -42,6 +42,14 @@ export interface RunningApp {
   name: string;
 }
 
+/** `unlock()` result: a UI session token (memory only) and the engine's idle timeout. */
+export interface UnlockResult {
+  token: string;
+  idle_timeout_s: number;
+}
+
+export type LockReason = "ui" | "idle" | "tray" | "screen" | "sleep" | "expired";
+
 export type PermissionKind = "accessibility" | "input_monitoring";
 
 export class NotInTauri extends Error {
@@ -76,12 +84,19 @@ export const native = {
     call<RunningApp[]>("list_running_apps")
       .then((a) => (Array.isArray(a) ? a : []))
       .catch(() => [] as RunningApp[]),
+  // Security (CONTRACTS.md). unlock(): Touch ID / Mac password, then POST /session (Rust holds
+  // the app token; only the session token comes back). Rejects with a one-line message.
+  unlock: () => call<UnlockResult>("unlock"),
+  /** Revoke UI sessions and emit "locked". reason "expired" = the engine already dropped it. */
+  lock: (reason: LockReason = "ui") => call<void>("lock", { reason }).catch(() => {}),
+  getLockState: () => call<{ locked: boolean }>("get_lock_state"),
 };
 
 export interface NativeEvents {
   "persona-changed": { persona: string };
   "generation-started": RunResult;
   "generation-finished": RunResult;
+  locked: { reason: LockReason };
 }
 
 /** Subscribe to a Tauri event; returns a cleanup fn. No-op outside Tauri. */

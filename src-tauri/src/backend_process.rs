@@ -37,20 +37,27 @@ pub fn uv_candidates(home: Option<&str>) -> Vec<PathBuf> {
     v
 }
 
-/// Where the backend's output goes: the terminal under `pnpm tauri dev`, else `data/backend.log`
-/// (a Finder-launched app has no terminal, so inherited output would vanish).
-fn backend_output(root: &Path) -> (Stdio, Stdio, Option<PathBuf>) {
+/// The backend's data dir: `$POLYTONE_DATA_DIR`, else `<repo>/data` (see `security`).
+pub fn data_dir() -> Option<PathBuf> {
+    crate::security::resolve_data_dir(
+        std::env::var("POLYTONE_DATA_DIR").ok(),
+        repo_root().as_deref(),
+    )
+}
+
+/// Where the backend's output goes: the terminal under `pnpm tauri dev`, else
+/// `<data_dir>/backend.log` (0600, in a 0700 dir; a Finder-launched app has no terminal, so
+/// inherited output would vanish).
+fn backend_output(data: &Path) -> (Stdio, Stdio, Option<PathBuf>) {
     use std::io::IsTerminal;
     if std::io::stderr().is_terminal() {
         return (Stdio::inherit(), Stdio::inherit(), None);
     }
-    let path = root.join("data").join("backend.log");
-    let _ = std::fs::create_dir_all(root.join("data"));
-    match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
+    let path = data.join("backend.log");
+    if let Err(e) = crate::security::ensure_private_dir(data) {
+        log::warn!("cannot create {}: {e}", data.display());
+    }
+    match crate::security::open_private_append(&path) {
         Ok(f) => match f.try_clone() {
             Ok(f2) => (Stdio::from(f), Stdio::from(f2), Some(path)),
             Err(_) => (Stdio::from(f), Stdio::null(), Some(path)),
@@ -62,16 +69,19 @@ fn backend_output(root: &Path) -> (Stdio, Stdio, Option<PathBuf>) {
     }
 }
 
-fn spawn_backend(root: &Path) -> Option<Child> {
+fn spawn_backend(root: &Path, data: &Path, token: &str) -> Option<Child> {
     let home = std::env::var("HOME").ok();
     for uv in uv_candidates(home.as_deref()) {
-        let (out, err, log_path) = backend_output(root);
+        let (out, err, log_path) = backend_output(data);
         let mut cmd = Command::new(&uv);
         cmd.args(["run", "polytone-api"])
             .current_dir(root)
             // The backend exits when this pid disappears, so a crashed or force-quit app
             // never leaves a backend behind serving stale code.
             .env("POLYTONE_PARENT_PID", std::process::id().to_string())
+            // The app token (CONTRACTS.md "Security"); the backend also writes it to
+            // `<data_dir>/.api_token` so later launches of the app can attach.
+            .env("POLYTONE_API_TOKEN", token)
             .stdin(Stdio::null())
             .stdout(out)
             .stderr(err);
@@ -105,19 +115,32 @@ fn spawn_backend(root: &Path) -> Option<Child> {
     None
 }
 
-/// On launch: if /health fails, spawn the backend, then sync config once healthy.
+/// On launch: if /health fails, spawn the backend with a fresh app token; else attach to the
+/// running one with the token from its token file. Then sync config once healthy.
 pub fn autostart(app: &AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let client = app.state::<AppState>().client.clone();
-        if client.health().await.is_err() {
-            match repo_root() {
-                Some(root) => {
-                    if let Some(child) = spawn_backend(&root) {
+        let data = data_dir();
+        // Known in both cases: a 401 re-reads it (another process may own the running backend).
+        client.set_token_file(data.as_ref().map(|d| d.join(crate::security::TOKEN_FILE)));
+        if client.health().await.is_ok() {
+            if !client.load_token_file() {
+                log::warn!(
+                    "attached backend left no {} (engine without auth?); sending no app token",
+                    crate::security::TOKEN_FILE
+                );
+            }
+        } else {
+            let token = crate::security::generate_token();
+            client.set_token(Some(token.clone()));
+            match (repo_root(), data.as_deref()) {
+                (Some(root), Some(data)) => {
+                    if let Some(child) = spawn_backend(&root, data, &token) {
                         *app.state::<AppState>().backend_child.lock().unwrap() = Some(child);
                     }
                 }
-                None => log::warn!(
+                _ => log::warn!(
                     "backend not running and repo root unknown (set POLYTONE_REPO); skipping autostart"
                 ),
             }

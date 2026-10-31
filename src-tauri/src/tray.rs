@@ -14,6 +14,7 @@ pub const EVENT_PERSONA_CHANGED: &str = "persona-changed";
 
 const ID_OPEN: &str = "open";
 const ID_PAUSE: &str = "pause";
+const ID_LOCK: &str = "lock";
 const ID_QUIT: &str = "quit";
 const PERSONA_PREFIX: &str = "persona:";
 
@@ -54,11 +55,15 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
 
     let open = MenuItem::with_id(app, ID_OPEN, "Open Polytone", true, None::<&str>)?;
     let pause = CheckMenuItem::with_id(app, ID_PAUSE, "Pause hotkey", true, false, None::<&str>)?;
+    let lock = MenuItem::with_id(app, ID_LOCK, "Lock Polytone", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, ID_QUIT, "Quit", true, Some("CmdOrCtrl+Q"))?;
     let sep1 = PredefinedMenuItem::separator(app)?;
     let sep2 = PredefinedMenuItem::separator(app)?;
 
-    let menu = Menu::with_items(app, &[&persona_menu, &sep1, &open, &pause, &sep2, &quit])?;
+    let menu = Menu::with_items(
+        app,
+        &[&persona_menu, &sep1, &open, &pause, &lock, &sep2, &quit],
+    )?;
 
     let mut builder = TrayIconBuilder::with_id("polytone-tray")
         .menu(&menu)
@@ -82,6 +87,7 @@ fn on_menu_event(app: &AppHandle, event: MenuEvent) {
     match id {
         ID_OPEN => show_main_window(app),
         ID_QUIT => app.exit(0),
+        ID_LOCK => crate::security::lock_app(app, crate::security::LockReason::Tray),
         ID_PAUSE => {
             let paused = !app.state::<AppState>().paused.load(Ordering::SeqCst);
             set_paused(app, paused);

@@ -5,6 +5,7 @@ pub mod backend_process;
 pub mod keyboard_hooks;
 pub mod macos;
 pub mod permissions;
+pub mod security;
 pub mod tray;
 pub mod typing_capture;
 
@@ -29,6 +30,8 @@ pub struct AppState {
     pub inject_mode: Mutex<InjectMode>,
     pub backend_child: Mutex<Option<Child>>,
     pub tray: Mutex<Option<tray::TrayItems>>,
+    /// UI lock state (starts locked; see `security`).
+    pub lock: security::LockCell,
 }
 
 impl Default for AppState {
@@ -43,6 +46,7 @@ impl Default for AppState {
             inject_mode: Mutex::new(InjectMode::Paste),
             backend_child: Mutex::new(None),
             tray: Mutex::new(None),
+            lock: security::LockCell::default(),
         }
     }
 }
@@ -118,6 +122,7 @@ pub fn run() {
             // host, config sync, the capture tap) run on background threads.
             let handle = app.handle().clone();
             tray::build(&handle)?;
+            security::watch_system_lock(&handle);
             keyboard_hooks::start_worker(&handle);
             keyboard_hooks::register_initial(&handle);
             // Launching the app should visibly open it: a menu-bar-only app with no window looks
@@ -151,6 +156,9 @@ pub fn run() {
             typing_capture::set_capture,
             typing_capture::get_capture_status,
             typing_capture::list_running_apps,
+            security::unlock,
+            security::lock,
+            security::get_lock_state,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

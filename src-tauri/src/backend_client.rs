@@ -1,5 +1,7 @@
 //! HTTP client for the Polytone Python backend (see CONTRACTS.md "HTTP API").
 
+use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -86,6 +88,16 @@ pub struct IngestResult {
     pub reasons: Vec<String>,
 }
 
+/// `POST /session` response (CONTRACTS.md "Security"): a UI session token.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionInfo {
+    pub token: String,
+    #[serde(default)]
+    pub idle_timeout_s: u64,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendError {
     NotRunning,
@@ -153,10 +165,21 @@ impl From<reqwest::Error> for BackendError {
     }
 }
 
+/// The app token (CONTRACTS.md "Security"): only Rust holds it; it never reaches the webview.
+#[derive(Debug, Default)]
+struct Auth {
+    token: Option<String>,
+    /// `<data_dir>/.api_token`: re-read once on a 401 (the backend may have been restarted by
+    /// someone else and generated a new token).
+    token_file: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone)]
 pub struct BackendClient {
     base_url: String,
     http: reqwest::Client,
+    /// Shared by every clone, so a token set at startup reaches the hotkey / capture paths.
+    auth: Arc<RwLock<Auth>>,
 }
 
 impl Default for BackendClient {
@@ -178,11 +201,82 @@ impl BackendClient {
         Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             http,
+            auth: Arc::new(RwLock::new(Auth::default())),
         }
     }
 
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.base_url, path)
+    }
+
+    /// Use `token` as the app token (the one we pass to a backend we spawn).
+    pub fn set_token(&self, token: Option<String>) {
+        self.auth.write().unwrap().token = token;
+    }
+
+    pub fn has_token(&self) -> bool {
+        self.auth.read().unwrap().token.is_some()
+    }
+
+    /// Where the backend writes its token; re-read on a 401.
+    pub fn set_token_file(&self, path: Option<PathBuf>) {
+        self.auth.write().unwrap().token_file = path;
+    }
+
+    /// Load the token from the token file (attaching to an already-running backend).
+    /// Returns whether a token was found.
+    pub fn load_token_file(&self) -> bool {
+        let mut auth = self.auth.write().unwrap();
+        match auth
+            .token_file
+            .as_deref()
+            .and_then(crate::security::read_token_file)
+        {
+            Some(t) => {
+                auth.token = Some(t);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// After a 401: re-read the token file; true if it holds a different token (worth a retry).
+    fn refresh_token_after_401(&self) -> bool {
+        let mut auth = self.auth.write().unwrap();
+        let Some(fresh) = auth
+            .token_file
+            .as_deref()
+            .and_then(crate::security::read_token_file)
+        else {
+            return false;
+        };
+        if auth.token.as_deref() == Some(fresh.as_str()) {
+            return false;
+        }
+        log::info!("backend rejected the app token; using the one in the token file");
+        auth.token = Some(fresh);
+        true
+    }
+
+    /// Send a request with `Authorization: Bearer <app token>`. On 401, re-read the token file
+    /// once and retry if it changed. `build` is called once per attempt.
+    async fn send(
+        &self,
+        build: impl Fn(&reqwest::Client) -> reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, BackendError> {
+        let attempt = || {
+            let token = self.auth.read().unwrap().token.clone();
+            let mut req = build(&self.http);
+            if let Some(t) = token {
+                req = req.bearer_auth(t);
+            }
+            req.send()
+        };
+        let resp = attempt().await?;
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED && self.refresh_token_after_401() {
+            return Self::check(attempt().await?).await;
+        }
+        Self::check(resp).await
     }
 
     async fn check(resp: reqwest::Response) -> Result<reqwest::Response, BackendError> {
@@ -199,6 +293,7 @@ impl BackendClient {
     }
 
     pub async fn health(&self) -> Result<Health, BackendError> {
+        // Unauthenticated by contract; no token sent.
         let resp = self
             .http
             .get(self.url("/health"))
@@ -209,36 +304,51 @@ impl BackendClient {
     }
 
     pub async fn generate(&self, req: &GenerateRequest) -> Result<GenerateResponse, BackendError> {
-        let resp = self
-            .http
-            .post(self.url("/generate"))
-            .json(req)
-            .send()
-            .await?;
-        Ok(Self::check(resp).await?.json().await?)
+        let url = self.url("/generate");
+        Ok(self.send(|h| h.post(&url).json(req)).await?.json().await?)
     }
 
     pub async fn get_config(&self) -> Result<BackendConfig, BackendError> {
-        let resp = self.http.get(self.url("/config")).send().await?;
-        Ok(Self::check(resp).await?.json().await?)
+        let url = self.url("/config");
+        Ok(self.send(|h| h.get(&url)).await?.json().await?)
     }
 
     pub async fn put_config(&self, cfg: &BackendConfig) -> Result<BackendConfig, BackendError> {
-        let resp = self.http.put(self.url("/config")).json(cfg).send().await?;
-        Ok(Self::check(resp).await?.json().await?)
+        let url = self.url("/config");
+        Ok(self.send(|h| h.put(&url).json(cfg)).await?.json().await?)
     }
 
     pub async fn ingest_typed(
         &self,
         req: &TypedIngestRequest,
     ) -> Result<IngestResult, BackendError> {
-        let resp = self
-            .http
-            .post(self.url("/ingest/typed"))
-            .json(req)
-            .send()
-            .await?;
-        Ok(Self::check(resp).await?.json().await?)
+        let url = self.url("/ingest/typed");
+        Ok(self.send(|h| h.post(&url).json(req)).await?.json().await?)
+    }
+
+    /// `POST /session` (app token) -> a UI session token.
+    pub async fn create_session(&self) -> Result<SessionInfo, BackendError> {
+        let url = self.url("/session");
+        Ok(self.send(|h| h.post(&url)).await?.json().await?)
+    }
+
+    /// `DELETE /session` (app token): revoke every UI session.
+    pub async fn revoke_sessions(&self) -> Result<(), BackendError> {
+        let url = self.url("/session");
+        self.send(|h| h.delete(&url)).await.map(|_| ())
+    }
+
+    /// `POST /audit/event` (app token): a Rust-side audit event (never user text).
+    pub async fn audit_event(
+        &self,
+        event: &str,
+        detail: &serde_json::Value,
+    ) -> Result<(), BackendError> {
+        let url = self.url("/audit/event");
+        let body = serde_json::json!({ "event": event, "detail": detail });
+        self.send(|h| h.post(&url).json(&body).timeout(Duration::from_secs(3)))
+            .await
+            .map(|_| ())
     }
 
     /// GET /config, apply `f`, PUT it back.
@@ -359,6 +469,208 @@ mod tests {
         let rt = tokio_rt();
         let err = rt.block_on(c.health()).unwrap_err();
         assert_eq!(err, BackendError::NotRunning);
+    }
+
+    // ----- auth against a tiny mock HTTP server -----
+
+    use std::sync::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Recorded requests: ("METHOD /path", Authorization header).
+    type Seen = Arc<Mutex<Vec<(String, Option<String>)>>>;
+
+    /// Serves `respond("METHOD /path", auth header) -> (status, body)` on an ephemeral port.
+    async fn mock_server(
+        respond: impl Fn(&str, Option<&str>) -> (u16, String) + Send + Sync + 'static,
+    ) -> (String, Seen) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen: Seen = Arc::default();
+        let seen2 = seen.clone();
+        let respond = Arc::new(respond);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let seen = seen2.clone();
+                let respond = respond.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    // Headers only; the bodies these tests send are ignored.
+                    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let n = sock.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    let text = String::from_utf8_lossy(&buf).to_string();
+                    let mut lines = text.split("\r\n");
+                    let first = lines.next().unwrap_or_default();
+                    let line = first.split(' ').take(2).collect::<Vec<_>>().join(" ");
+                    let auth = lines.find_map(|l| {
+                        l.split_once(':')
+                            .filter(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+                            .map(|(_, v)| v.trim().to_string())
+                    });
+                    seen.lock().unwrap().push((line.clone(), auth.clone()));
+                    let (status, body) = respond(&line, auth.as_deref());
+                    let resp = format!(
+                        "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    const CFG: &str = r#"{"active_persona":"Boss","hotkey":"X"}"#;
+
+    fn only_token(tok: &'static str) -> impl Fn(&str, Option<&str>) -> (u16, String) {
+        move |_line, auth| {
+            if auth == Some(format!("Bearer {tok}").as_str()) {
+                (200, CFG.to_string())
+            } else {
+                (401, r#"{"detail":"locked"}"#.to_string())
+            }
+        }
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("polytone-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn sends_bearer_token() {
+        tokio_rt().block_on(async {
+            let (url, seen) = mock_server(only_token("tok-a")).await;
+            let c = BackendClient::new(url);
+            c.set_token(Some("tok-a".into()));
+            assert_eq!(c.get_config().await.unwrap().active_persona, "Boss");
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen[0].0, "GET /config");
+            assert_eq!(seen[0].1.as_deref(), Some("Bearer tok-a"));
+        });
+    }
+
+    #[test]
+    fn health_sends_no_token() {
+        tokio_rt().block_on(async {
+            let (url, seen) = mock_server(|_, _| (200, r#"{"status":"ok"}"#.into())).await;
+            let c = BackendClient::new(url);
+            c.set_token(Some("secret".into()));
+            c.health().await.unwrap();
+            assert_eq!(seen.lock().unwrap()[0].1, None);
+        });
+    }
+
+    #[test]
+    fn retries_once_with_token_file_after_401() {
+        let dir = temp_dir("retry");
+        let file = dir.join(".api_token");
+        std::fs::write(&file, "tok-new\n").unwrap();
+        tokio_rt().block_on(async {
+            let (url, seen) = mock_server(only_token("tok-new")).await;
+            let c = BackendClient::new(url);
+            c.set_token(Some("tok-old".into()));
+            c.set_token_file(Some(file.clone()));
+            assert!(c.get_config().await.is_ok());
+            let got = seen.lock().unwrap().clone();
+            assert_eq!(got.len(), 2);
+            assert_eq!(got[0].1.as_deref(), Some("Bearer tok-old"));
+            assert_eq!(got[1].1.as_deref(), Some("Bearer tok-new"));
+            // The fresh token sticks for later requests, on every clone.
+            let c2 = c.clone();
+            assert!(c2.get_config().await.is_ok());
+            assert_eq!(seen.lock().unwrap().len(), 3);
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn no_retry_when_token_file_unchanged_or_missing() {
+        let dir = temp_dir("noretry");
+        let file = dir.join(".api_token");
+        std::fs::write(&file, "tok-same").unwrap();
+        tokio_rt().block_on(async {
+            let (url, seen) = mock_server(only_token("other")).await;
+            let c = BackendClient::new(url);
+            c.set_token(Some("tok-same".into()));
+            c.set_token_file(Some(file.clone()));
+            let err = c.get_config().await.unwrap_err();
+            assert!(matches!(err, BackendError::Http { status: 401, .. }));
+            assert_eq!(seen.lock().unwrap().len(), 1);
+
+            // Missing file: one request, no retry.
+            c.set_token_file(Some(dir.join("missing")));
+            assert!(c.get_config().await.is_err());
+            assert_eq!(seen.lock().unwrap().len(), 2);
+
+            // A changed file buys exactly one retry, even if that 401s too.
+            std::fs::write(&file, "tok-third").unwrap();
+            c.set_token_file(Some(file.clone()));
+            assert!(c.get_config().await.is_err());
+            assert_eq!(seen.lock().unwrap().len(), 4);
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn attach_loads_token_file() {
+        let dir = temp_dir("attach");
+        let file = dir.join(".api_token");
+        let c = BackendClient::new("http://127.0.0.1:9");
+        c.set_token_file(Some(file.clone()));
+        assert!(!c.load_token_file());
+        assert!(!c.has_token());
+        std::fs::write(&file, "  abc  \n").unwrap();
+        assert!(c.load_token_file());
+        assert_eq!(c.auth.read().unwrap().token.as_deref(), Some("abc"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn session_and_audit_endpoints() {
+        tokio_rt().block_on(async {
+            let (url, seen) = mock_server(|line, auth| {
+                if auth != Some("Bearer app") {
+                    return (401, r#"{"detail":"locked"}"#.into());
+                }
+                match line {
+                    "POST /session" => (
+                        200,
+                        r#"{"token":"s1","idle_timeout_s":900,"expires_at":"2026-01-01T00:00:00Z"}"#
+                            .into(),
+                    ),
+                    "DELETE /session" | "POST /audit/event" => (200, "{}".into()),
+                    _ => (404, "{}".into()),
+                }
+            })
+            .await;
+            let c = BackendClient::new(url);
+            c.set_token(Some("app".into()));
+            let s = c.create_session().await.unwrap();
+            assert_eq!(s.token, "s1");
+            assert_eq!(s.idle_timeout_s, 900);
+            c.revoke_sessions().await.unwrap();
+            c.audit_event("session.lock", &serde_json::json!({"reason":"tray"}))
+                .await
+                .unwrap();
+            let lines: Vec<String> = seen.lock().unwrap().iter().map(|s| s.0.clone()).collect();
+            assert_eq!(
+                lines,
+                ["POST /session", "DELETE /session", "POST /audit/event"]
+            );
+        });
     }
 
     fn tokio_rt() -> tokio::runtime::Runtime {
