@@ -239,6 +239,16 @@ an attacker running as the same user with the Polytone window unlocked, or root.
   lock (`com.apple.screenIsLocked`), system sleep, and tray "Lock Polytone". Hotkey and typing capture
   keep working while locked (they use the app token).
 - UI: any 401 → lock screen ("Unlock with Touch ID"); idle timer on its side too, for an immediate lock.
+- Rust/UI details (additive): `lock(reason?: "ui"|"idle"|"expired")` — `expired` (the UI saw a 401)
+  only marks Rust locked, nothing to revoke or audit; others `DELETE /session` + audit `session.lock`.
+  Event `locked` payload `{"reason":"ui"|"idle"|"tray"|"screen"|"sleep"}` (`screen` also covers fast
+  user switching). The UI starts locked, keeps the session token in a module variable, and drops every
+  cached response on lock. A plain browser (not in Tauri) shows no data views at all. Rust audit
+  details: `session.unlock {idle_timeout_s}`, `session.unlock_failed {reason, code?}` (`reason` =
+  `failed|cancelled|interrupted|no_password|no_biometrics|not_enrolled|lockout|not_interactive|backend`),
+  `session.lock {reason}`, `capture.start|stop {apps:int}`. The app token is not sent to `/health`.
+  An engine without `/session` (404) unlocks with token `""` (pre-security engines only).
+  Rust's data dir = `POLYTONE_DATA_DIR` (relative → against the repo root) else `<repo>/data`.
 
 ### Audit log (`backend/security/audit.py`, `data/audit.sqlite3`)
 - Table `audit_log(seq INTEGER PRIMARY KEY, ts TEXT, event TEXT, actor TEXT, detail TEXT /*JSON*/, prev TEXT, mac TEXT)`.
