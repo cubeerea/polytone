@@ -151,6 +151,14 @@ Learns from messages the user types and **sends** in allowlisted native apps.
   "persona": "Default", "provenance": {"source":"wispr","raw_transcript":true,"kind":"spoken",
   "origin":"wispr_local_history","field":"asrText","rowid","transcript_id","timestamp","app","url"?,
   "duration"?,"archived"?}}`. Formatted/pasted text is never ingested or stored in provenance.
+- App list: a dictation is learned only when its `app` is in `capture_apps` — the same Learning list
+  typing capture uses, whether or not typing capture is on (`backend/ingestion/app_policy.py`). Matched
+  case-insensitively on the bundle id, or the display name older Wispr versions stored (`Slack`). No
+  recorded app → never learned. Enforced in the firewall for every `wispr` item (local, live, WebSocket
+  `app`/`bundleId`, MCP tools; reasons `wispr app is not in the Learning app list` /
+  `wispr dictation has no recorded app`) and counted early by the history reader (`info.skipped`, live
+  status `"<n> skipped (app not in your Learning list)"`). Not retroactive: the cursor moves past skipped
+  rows, so adding an app later learns only new dictations (same as typing).
 - Cursor: SQLite config `wispr.history_rowid` (`rowid > cursor`, insert order; `timestamp` is the
   dictation start and not monotonic). Migrated once from `wispr.history_last_ts` (kept updated) as
   `MAX(rowid) WHERE timestamp <= old`. Shared by the live watcher and `POST /ingest/sources/wispr/run`

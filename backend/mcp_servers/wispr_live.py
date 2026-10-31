@@ -37,6 +37,7 @@ from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
+from backend.ingestion import app_policy
 from backend.ingestion.text import token_spans, tokenize
 from backend.mcp_servers import wispr
 from backend.mcp_servers._common import truthy_env
@@ -71,7 +72,13 @@ class StripResult:
 
 
 def _same_app(a: str | None, b: str | None) -> bool:
-    return not a or not b or a.strip().lower() == b.strip().lower()
+    """Unknown on either side matches; a bundle id also matches the display name older Wispr
+    versions recorded for it (``Slack`` ↔ ``com.tinyspeck.slackmacgap``)."""
+    if not a or not b:
+        return True
+    a, b = a.strip(), b.strip()
+    return a.casefold() == b.casefold() or app_policy.skip_reason(a, [b]) is None \
+        or app_policy.skip_reason(b, [a]) is None
 
 
 class InsertionIndex:
@@ -313,7 +320,7 @@ class WisprLiveWatcher(threading.Thread):
         self.stats: dict[str, Any] = {
             "started_at": _iso(time.time()), "reads": 0, "rows_read": 0, "accepted": 0, "rejected": 0,
             "last_pickup_at": None, "last_dictation_at": None, "last_app": None, "last_error": None,
-            "last_read_ms": None, "cursor": None,
+            "last_read_ms": None, "cursor": None, "skipped_app": 0,
         }
 
     def stop(self, timeout: float = 5.0) -> None:
@@ -362,6 +369,8 @@ class WisprLiveWatcher(threading.Thread):
         self.stats["reads"] += 1
         self.stats["rows_read"] += len(rows)
         self.stats["cursor"] = info.get("cursor")
+        sk = info.get("skipped") or {}
+        self.stats["skipped_app"] += sk.get(app_policy.NOT_LISTED, 0) + sk.get(app_policy.NO_APP, 0)
         if items:
             res = run_ingest_batch(items, "wispr", wispr.SPOKEN_PERSONA, runtime=self.runtime)
             self.stats["accepted"] += res["accepted"]
@@ -430,6 +439,8 @@ def status_text() -> str | None:
     else:
         parts.append("no new dictation yet")
     parts.append(f"{s['accepted']} ingested live")
+    if s.get("skipped_app"):
+        parts.append(f"{s['skipped_app']} skipped (app not in your Learning list)")
     if s["last_error"]:
         parts.append(f"last error: {s['last_error']}")
     return "; ".join(parts)

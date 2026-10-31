@@ -155,8 +155,8 @@ def test_formatted_text_is_never_ingested(fake, runtime):
 def test_pending_row_filled_in_later_is_picked_up(fake, runtime):
     rid = fake.add(None, None, status=None, app=None, pasted=None)  # inserted first, filled in later
     assert wispr.collect_local(runtime.settings, db=runtime.db)[0] == []
-    fake.conn.execute("UPDATE History SET asrText=?, status='formatted' WHERE rowid=?",
-                      ("the text arrived after the row was inserted", rid))
+    fake.conn.execute("UPDATE History SET asrText=?, status='formatted', app=? WHERE rowid=?",
+                      ("the text arrived after the row was inserted", SLACK, rid))
     fake.conn.commit()
     items, _ = wispr.collect_local(runtime.settings, db=runtime.db)
     assert [i["text"] for i in items] == ["the text arrived after the row was inserted"]

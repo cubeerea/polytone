@@ -121,7 +121,7 @@ def test_firewall_provenance_per_source(db):
     assert check(t, "watcher", {"kind": "txt", "file": "notes.txt"}, db) == (True, None)
     assert "raw transcript" in check(t, "wispr", {}, db)[1]
     assert "formatted" in check(t, "wispr", {"raw_transcript": True, "formatted": True}, db)[1]
-    assert check(t, "wispr", {"raw_transcript": True}, db) == (True, None)
+    assert check(t, "wispr", {"raw_transcript": True, "app": "com.tinyspeck.slackmacgap"}, db) == (True, None)
     assert check(t, "manual", {}, db) == (True, None)
 
 
@@ -302,7 +302,7 @@ def test_generated_drafts_never_reach_graph_via_any_path(client, runtime, monkey
     valid_prov = {
         "manual": {"source": "manual", "generated": False, "direction": "outbound"},
         "gmail": {"label": "SENT", "from_me": True, "direction": "outbound"},
-        "wispr": {"raw_transcript": True},
+        "wispr": {"raw_transcript": True, "app": "com.tinyspeck.slackmacgap"},
         "watcher": {"kind": "mbox", "from_me": True, "file": "sent.mbox"},
     }
     for v in variants:  # HTTP manual path

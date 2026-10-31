@@ -43,6 +43,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from backend.ingestion import app_policy
 from backend.ingestion.text import tokenize
 from backend.mcp_servers._common import (
     SourceItem,
@@ -99,7 +100,8 @@ def _is_polished(name: str) -> bool:
 
 # =========================================================================== WebSocket
 def parse_message(raw: str | bytes | dict[str, Any]) -> dict[str, Any] | None:
-    """Return ``{"text", "id"?, "timestamp"?}`` for a final RAW transcript message, else None."""
+    """Return ``{"text", "id"?, "timestamp"?, "app"?}`` for a final RAW transcript message, else None.
+    ``app`` (the app the dictation went into) gates learning: no app → not learned (firewall)."""
     if isinstance(raw, (bytes, bytearray)):
         raw = raw.decode("utf-8", errors="replace")
     if isinstance(raw, str):
@@ -122,6 +124,7 @@ def parse_message(raw: str | bytes | dict[str, Any]) -> dict[str, Any] | None:
                     "text": v.strip(),
                     "id": msg.get("id") or msg.get("transcript_id") or msg.get("transcriptEntityId"),
                     "timestamp": msg.get("timestamp") or msg.get("created_at") or msg.get("createdAt"),
+                    "app": _ws_app(msg) or _ws_app(raw),
                 }
         nested = next((msg[k] for k in NESTED_KEYS if isinstance(msg.get(k), dict)), None)
         if nested is None:
@@ -130,12 +133,20 @@ def parse_message(raw: str | bytes | dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def _ws_app(msg: dict[str, Any]) -> str | None:
+    for k in ("app", "bundle_id", "bundleId", "app_bundle_id", "appBundleId"):
+        v = msg.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
+
+
 def _ws_item(parsed: dict[str, Any]) -> SourceItem:
     return {
         "text": parsed["text"],
         "provenance": outbound(
             "wispr", raw_transcript=True, origin="wispr_ws", transcript_id=parsed.get("id"),
-            timestamp=parsed.get("timestamp"),
+            timestamp=parsed.get("timestamp"), app=parsed.get("app"),
         ),
     }
 
@@ -496,18 +507,22 @@ def is_filler_only(text: str) -> bool:
     return bool(toks) and all(t in FILLERS for t in toks)
 
 
-def skip_reason(row: HistoryRow) -> str | None:
+def skip_reason(row: HistoryRow, apps: list[str] | None = None) -> str | None:
     """Why a row is not learned from (None → learn its raw transcript as-is).
 
     Archived rows ARE learned: archiving only hides a dictation in Wispr's UI, it is still the
     user's speech. Filler-only transcripts ("um", "uh um ok") are dropped — real transcripts are
-    never "polished"; the firewall's own length rules apply to the rest."""
+    never "polished"; the firewall's own length rules apply to the rest. With ``apps`` (the
+    Learning app list), a dictation into any other app — or with no recorded app — is skipped too;
+    the firewall enforces the same rule for every Wispr path, this just counts it early."""
     if not row.text:
         return "no raw transcript"
     if (row.status or "").strip().lower() in SKIP_STATUSES:
         return f"status {row.status}"
     if is_filler_only(row.text):
         return "filler only"
+    if apps is not None:
+        return app_policy.skip_reason(row.app, apps)
     return None
 
 
@@ -617,8 +632,9 @@ def _read_increment(db_path: Path, db: Any, cap: int, conn: sqlite3.Connection):
             _pending[(key, r.rowid)] = now_m
     seen = rows + [r for r in rechecked if not r.is_pending]
     items, skipped = [], {}
+    apps = app_policy.allowed_apps(db)
     for r in seen:
-        why = skip_reason(r)
+        why = skip_reason(r, apps)
         if why is None:
             items.append(row_item(r, schema["text_col"]))
         elif not r.is_pending:
