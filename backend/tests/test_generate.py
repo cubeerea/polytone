@@ -43,7 +43,7 @@ def test_generation_roundtrip(runtime):
         assert run_ingest(t, "manual", "Friend", {}, runtime=runtime)["accepted"] == 1
     words_before = dict(runtime.store.words)
     out = run_generation("- tell sam meeting moved to 3\n- ask for slides", "Friend", "Slack", runtime=runtime)
-    assert set(out) == {"draft_id", "text", "persona", "latency_ms", "constraints"}
+    assert set(out) == {"draft_id", "text", "persona", "latency_ms", "constraints", "model"}
     assert out["persona"] == "Friend" and out["constraints"]["sample_count"] == 3
     assert "sam" in out["text"].lower() and "slides" in out["text"]
     assert out["text"] == out["text"].lower()  # mock honoured the lowercase casing rule

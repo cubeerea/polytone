@@ -26,6 +26,7 @@ from langgraph.graph import END, START, StateGraph
 from backend.graph.constraints import empty_constraints
 from backend.langgraph.examples import select_examples
 from backend.langgraph.prompts import build_system_parts, build_user_prompt
+from backend.llm.client import FAST_MODEL
 from backend.runtime import Runtime, get_runtime
 
 log = logging.getLogger(__name__)
@@ -66,6 +67,7 @@ class GenState(TypedDict, total=False):
     raw_intent: str
     intent: str
     persona: str
+    model: str | None  # per-draft model override (draft_speed "fast"); None = the configured model
     app_context: str | None
     t0: float
     constraints: dict[str, Any]
@@ -126,8 +128,10 @@ def build_generate_graph(rt: Runtime):
         intent = normalize_intent(state.get("raw_intent", ""))
         if not intent:
             raise ValueError("intent is empty")
-        persona = (state.get("persona") or "").strip() or rt.db.get_config().get("active_persona") or "Default"
-        return {"intent": intent, "persona": persona}
+        cfg = rt.db.get_config()
+        persona = (state.get("persona") or "").strip() or cfg.get("active_persona") or "Default"
+        model = FAST_MODEL if cfg.get("draft_speed") == "fast" else None
+        return {"intent": intent, "persona": persona, "model": model}
 
     def retrieve_constraints(state: GenState) -> GenState:
         try:
@@ -158,7 +162,9 @@ def build_generate_graph(rt: Runtime):
             raise LLMFailedError("no LLM configured: POLYTONE_LLM=anthropic but ANTHROPIC_API_KEY is empty")
         try:
             system = state["system_parts"] if getattr(rt.llm, "cache_system", False) else state["system"]
-            return {"raw_output": rt.llm.complete(system, state["user"])}
+            model = state.get("model")  # only passed when set: plain complete(system, user) LLMs keep working
+            out = rt.llm.complete(system, state["user"], model=model) if model else rt.llm.complete(system, state["user"])
+            return {"raw_output": out}
         except Exception as e:
             log.warning("LLM call failed: %s", _detail(e))
             if _is_timeout(e):
@@ -242,9 +248,19 @@ def _graph_for(rt: Runtime):
 
 
 def warm(rt: Runtime) -> None:
-    """Compile the graph and prime the active persona's constraints (startup / after ingest)."""
+    """Startup / after ingest: compile the graph, prime the active persona's constraints and its
+    few-shot excerpt cache (~40ms the first draft would otherwise pay), and open the API connection."""
     _graph_for(rt)
     rt.prime_constraints()
+    try:
+        persona = rt.db.get_config().get("active_persona") or "Default"
+        c = rt.store.get_constraints(persona)
+        select_examples(rt.db, persona, "warm up the example cache", dict(c))
+    except Exception as e:  # noqa: BLE001 - only a warm-up
+        log.debug("example cache warm-up failed: %s", type(e).__name__)
+    warm_llm = getattr(rt.llm, "warm", None)
+    if warm_llm is not None:
+        warm_llm()
 
 
 def run_generation(
@@ -264,4 +280,5 @@ def run_generation(
         "persona": out["persona"],
         "latency_ms": out["latency_ms"],
         "constraints": out["constraints"],
+        "model": out.get("model") or getattr(rt.llm, "model", None) or rt.llm.name,  # audit only
     }

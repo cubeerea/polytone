@@ -155,7 +155,8 @@ def test_personas(client):
 def test_config(client):
     from backend.storage.db import DEFAULT_CAPTURE_APPS
 
-    cap = {"capture_enabled": False, "capture_apps": DEFAULT_CAPTURE_APPS, "lock_idle_minutes": 15, "retention_days": 0}
+    cap = {"capture_enabled": False, "capture_apps": DEFAULT_CAPTURE_APPS, "lock_idle_minutes": 15, "retention_days": 0,
+           "draft_speed": "quality"}
     assert client.get("/config").json() == {
         "active_persona": "Default", "hotkey": "CmdOrCtrl+Shift+P", "inject_mode": "paste", **cap}
     r = client.put("/config", json={"active_persona": "Boss", "hotkey": "Alt+P", "inject_mode": "type"})

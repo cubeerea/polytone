@@ -54,7 +54,11 @@ export interface AppConfig {
   lock_idle_minutes?: number;
   /** Delete typed/dictated samples, drafts and draft edits older than N days; 0 = keep forever. */
   retention_days?: number;
+  /** "quality" (Claude Sonnet) or "fast" (Claude Haiku: ~40% quicker, a little less literal). Optional: older engines omit it. */
+  draft_speed?: DraftSpeed;
 }
+
+export type DraftSpeed = "quality" | "fast";
 
 export interface AuditEntry {
   seq: number;

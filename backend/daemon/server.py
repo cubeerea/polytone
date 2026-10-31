@@ -75,6 +75,7 @@ class ConfigBody(BaseModel):
     inject_mode: Literal["paste", "type"] | None = None
     capture_enabled: bool | None = None
     capture_apps: list[str] | None = None
+    draft_speed: Literal["quality", "fast"] | None = None
     lock_idle_minutes: int | None = Field(default=None, ge=MIN_IDLE_MINUTES, le=MAX_IDLE_MINUTES)
     retention_days: int | None = Field(default=None, ge=0, le=retention.MAX_RETENTION_DAYS)
 
@@ -117,6 +118,7 @@ def _config_out(db: Any) -> dict[str, Any]:
         "active_persona": cfg.get("active_persona", "Default"),
         "hotkey": cfg.get("hotkey", "CmdOrCtrl+Shift+P"),
         "inject_mode": cfg.get("inject_mode", "paste"),
+        "draft_speed": "fast" if cfg.get("draft_speed") == "fast" else "quality",
         "capture_enabled": enabled,
         "capture_apps": apps,
         "lock_idle_minutes": _int_cfg(cfg, "lock_idle_minutes", 15, MIN_IDLE_MINUTES, MAX_IDLE_MINUTES),
@@ -317,6 +319,7 @@ def create_app(runtime: Runtime | None = None, *, api_token: str | None = None) 
         r = rt()
         try:
             out = run_generation(req.intent, req.persona, req.app_context, runtime=r)
+            model = out.pop("model", None)  # the model this draft used: audit log only, not in the response
         except GenerationError as e:  # never inject placeholder text: tell the client it failed
             r.audit_event_soon("generate", {"ok": False, "error": e.code, "chars_in": len(req.intent)}, actor(request))
             return JSONResponse(status_code=e.status_code, content={"error": e.code, "detail": str(e)})
@@ -325,11 +328,19 @@ def create_app(runtime: Runtime | None = None, *, api_token: str | None = None) 
         r.audit_event_soon(
             "generate",
             {"ok": True, "draft_id": out.get("draft_id"), "persona": out.get("persona"), "chars_in": len(req.intent),
-             "chars_out": len(out.get("text") or ""), "model": getattr(r.llm, "model", r.llm.name),
+             "chars_out": len(out.get("text") or ""), "model": model,
              "latency_ms": out.get("latency_ms"), "app": (req.app_context or "")[:100] or None},
             actor(request),
         )
         return out
+
+    @app.post("/warm")
+    def warm_llm() -> dict[str, Any]:
+        """The hotkey went down: open the API connection while Rust captures the selection.
+        Returns immediately; the warm-up runs on its own thread and never raises."""
+        llm = rt().llm
+        started = bool(getattr(llm, "warm", None) and llm.warm())
+        return {"ok": True, "started": started}
 
     @app.post("/ingest/manual")
     def ingest_manual(req: IngestManualRequest) -> dict[str, Any]:

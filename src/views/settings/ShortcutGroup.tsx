@@ -1,5 +1,5 @@
 import { useState, type KeyboardEvent } from "react";
-import { errorMessage, FALLBACK_CONFIG, type AppConfig, type InjectMode } from "../../api";
+import { errorMessage, FALLBACK_CONFIG, type AppConfig, type DraftSpeed, type InjectMode } from "../../api";
 import { invalidateQueries, setQueryState } from "../../query";
 import { KEYS, updateConfig, useHotkeyStatus } from "../../queries";
 import { native, type HotkeyStatus } from "../../tauri";
@@ -32,6 +32,11 @@ function accelFromEvent(e: KeyboardEvent): string | null {
 const MODES: { id: InjectMode; label: string; desc: string }[] = [
   { id: "paste", label: "Paste", desc: "Pastes the rewrite, then restores your clipboard." },
   { id: "type", label: "Type", desc: "Types it out key by key, for apps that block paste." },
+];
+
+const SPEEDS: { id: DraftSpeed; label: string; desc: string }[] = [
+  { id: "quality", label: "Best", desc: "Your configured model (Claude Sonnet by default). Sticks closest to what you wrote." },
+  { id: "fast", label: "Fast", desc: "Claude Haiku. About 40% quicker, but may add a few words of its own." },
 ];
 
 const setHotkeyStatus = (s: HotkeyStatus) => setQueryState(KEYS.hotkey, { data: s, error: null });
@@ -86,6 +91,7 @@ export function ShortcutGroup({ tauri, online, config }: { tauri: boolean; onlin
   };
 
   const mode = config?.inject_mode ?? FALLBACK_CONFIG.inject_mode;
+  const speed = config?.draft_speed;
 
   return (
     <section>
@@ -141,6 +147,24 @@ export function ShortcutGroup({ tauri, online, config }: { tauri: boolean; onlin
             ))}
           </div>
         </Row>
+        {speed && (
+          <Row title="Draft quality" subtitle={SPEEDS.find((s) => s.id === speed)?.desc}>
+            <div className="seg" role="radiogroup" aria-label="Draft quality">
+              {SPEEDS.map((s) => (
+                <button
+                  key={s.id}
+                  type="button"
+                  role="radio"
+                  aria-checked={speed === s.id}
+                  disabled={!online || !config}
+                  onClick={() => speed !== s.id && updateConfig({ draft_speed: s.id }).catch(() => {})}
+                >
+                  {s.label}
+                </button>
+              ))}
+            </div>
+          </Row>
+        )}
       </div>
       {msg && <p className={`footnote fade-in ${msg.ok ? "" : "!text-bad"}`}>{msg.text}</p>}
     </section>
