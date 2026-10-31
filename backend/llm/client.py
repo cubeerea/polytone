@@ -12,7 +12,8 @@ AnthropicLLM latency notes:
 - ``output_config.effort`` defaults to ``low`` (``POLYTONE_EFFORT``): at ``medium`` and above the
   model thinks before almost every reply, which adds seconds before the first token — too slow
   for a hotkey rewrite under an 8s budget;
-- a single 6.5s attempt, no retries (Rust gives up at 8s).
+- a single 6.5s attempt, no retries (Rust gives up at 8s);
+- the SDK's httpx client uses a TLS 1.3-only ``ssl.SSLContext`` (``security/tls.py``).
 """
 from __future__ import annotations
 
@@ -66,7 +67,13 @@ class AnthropicLLM:
         if client is None:
             import anthropic
 
-            client = anthropic.Anthropic(api_key=api_key, timeout=timeout, max_retries=max_retries)
+            from backend.security.tls import httpx_client
+
+            # TLS 1.3 minimum (CONTRACTS.md → Network); the SDK's timeout / retries still apply
+            client = anthropic.Anthropic(
+                api_key=api_key, timeout=timeout, max_retries=max_retries,
+                http_client=httpx_client(timeout=timeout),
+            )
         self._client = client
         self.model = model
         self.max_tokens = max_tokens

@@ -71,4 +71,9 @@ def get_settings() -> Settings:
     export_env_file()
     s = Settings()
     s.polytone_data_dir.mkdir(parents=True, exist_ok=True)
+    if not s.anthropic_api_key and s.polytone_llm != "mock":
+        # the key may live in the Keychain instead of .env (env / .env win when both exist)
+        from backend.security.keys import ANTHROPIC_ACCOUNT, keychain_secret
+
+        s.anthropic_api_key = keychain_secret(ANTHROPIC_ACCOUNT) or ""
     return s
