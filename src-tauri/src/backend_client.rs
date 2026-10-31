@@ -370,6 +370,16 @@ impl BackendClient {
         Ok(self.send(|h| h.post(&url).json(req)).await?.json().await?)
     }
 
+    /// `POST /warm`: the hotkey went down, so have the engine open its connection to the model
+    /// API while the selection is still being captured. Returns as soon as the engine has
+    /// scheduled it (the engine does the network work on its own thread).
+    pub async fn warm(&self) -> Result<(), BackendError> {
+        let url = self.url("/warm");
+        self.send(|h| h.post(&url).timeout(Duration::from_secs(2)))
+            .await
+            .map(|_| ())
+    }
+
     pub async fn get_config(&self) -> Result<BackendConfig, BackendError> {
         let url = self.url("/config");
         Ok(self.send(|h| h.get(&url)).await?.json().await?)
@@ -612,6 +622,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn warm_posts_with_the_token_and_reports_errors() {
+        tokio_rt().block_on(async {
+            let (url, seen) = mock_server(|line, auth| match (line, auth) {
+                ("POST /warm", Some("Bearer tok-w")) => (200, r#"{"ok":true,"started":true}"#.into()),
+                _ => (401, r#"{"detail":"locked"}"#.into()),
+            })
+            .await;
+            let c = BackendClient::new(url);
+            c.set_token(Some("tok-w".into()));
+            c.warm().await.unwrap();
+            c.set_token(Some("wrong".into()));
+            assert!(c.warm().await.is_err());
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen[0].0, "POST /warm");
+            assert_eq!(seen[0].1.as_deref(), Some("Bearer tok-w"));
+        });
     }
 
     #[test]

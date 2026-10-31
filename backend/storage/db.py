@@ -69,6 +69,8 @@ DEFAULT_CONFIG: dict[str, str] = {
     "capture_enabled": "false",
     "capture_apps": json.dumps(DEFAULT_CAPTURE_APPS),
     "lock_idle_minutes": "15",
+    # "quality" (POLYTONE_MODEL) | "fast" (llm.client.FAST_MODEL — lower latency, less literal)
+    "draft_speed": "quality",
     "retention_days": "0",
 }
 

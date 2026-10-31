@@ -35,11 +35,17 @@ def tls13_context(cafile: str | None = None) -> ssl.SSLContext:
     return ctx
 
 
-def httpx_client(*, timeout: Any = None, cafile: str | None = None, anthropic_defaults: bool = True) -> Any:
+def httpx_client(
+    *, timeout: Any = None, cafile: str | None = None, anthropic_defaults: bool = True,
+    keepalive_expiry: float | None = None,
+) -> Any:
+    """``keepalive_expiry``: seconds an idle pooled connection is kept (httpx default: 5)."""
     ctx = tls13_context(cafile)
     kwargs: dict[str, Any] = {"verify": ctx}
     if timeout is not None:
         kwargs["timeout"] = timeout
+    if keepalive_expiry is not None:
+        kwargs["limits"] = _limits(keepalive_expiry)
     if anthropic_defaults:
         try:
             import anthropic
@@ -50,6 +56,22 @@ def httpx_client(*, timeout: Any = None, cafile: str | None = None, anthropic_de
     import httpx
 
     return httpx.Client(**kwargs)
+
+
+def _limits(keepalive_expiry: float) -> Any:
+    """The Anthropic SDK's default pool limits with a longer idle keep-alive."""
+    try:
+        from anthropic._constants import DEFAULT_CONNECTION_LIMITS as d
+    except ImportError:  # pragma: no cover
+        d = None
+    try:
+        import httpx2 as hx
+    except ImportError:  # pragma: no cover - older SDKs use httpx
+        import httpx as hx
+    if d is None:
+        return hx.Limits(max_connections=1000, max_keepalive_connections=100, keepalive_expiry=keepalive_expiry)
+    return hx.Limits(max_connections=d.max_connections, max_keepalive_connections=d.max_keepalive_connections,
+                     keepalive_expiry=keepalive_expiry)
 
 
 def _tls_adapter_cls() -> Any:

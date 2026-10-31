@@ -13,12 +13,22 @@ AnthropicLLM latency notes:
   model thinks before almost every reply, which adds seconds before the first token — too slow
   for a hotkey rewrite under an 8s budget;
 - a single 6.5s attempt, no retries (Rust gives up at 8s);
-- the SDK's httpx client uses a TLS 1.3-only ``ssl.SSLContext`` (``security/tls.py``).
+- the SDK's httpx client uses a TLS 1.3-only ``ssl.SSLContext`` (``security/tls.py``);
+- idle connections are kept for ``KEEPALIVE_S`` (the SDK default is 5s, so a hotkey press minutes
+  after the last one always paid a fresh TCP + TLS handshake, ~70ms measured), and ``warm()`` —
+  called when the hotkey goes down, while Rust is still capturing the selection — re-opens the
+  connection with a free ``GET /v1/models/{id}`` if it may have gone idle;
+- ``complete(..., model=)`` picks the model per draft: the "fast" draft speed uses
+  ``FAST_MODEL`` (Claude Haiku 5.5, ~40% lower latency measured on 80-token drafts; less literal).
+- thinking stays adaptive: at ``low`` effort the model did not think on any measured draft, and
+  ``thinking: between_tools`` measured no faster.
 """
 from __future__ import annotations
 
 import logging
 import re
+import threading
+import time
 from collections.abc import Sequence
 from typing import Any, Protocol, runtime_checkable
 
@@ -30,6 +40,14 @@ DEFAULT_TIMEOUT_S = 6.5
 DEFAULT_MAX_RETRIES = 0
 DEFAULT_EFFORT = "low"
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
+FAST_MODEL = "claude-haiku-5-5"
+# Keep idle connections to the API this long (SDK default: 5s). Measured: a pooled connection
+# is still usable after 70s idle. A connection the peer dropped (sleep, network change) is
+# covered by the wall-clock check in warm() and one reconnect in complete().
+KEEPALIVE_S = 90.0
+# warm() skips the network when the client talked to the API this recently (connection is live).
+WARM_FRESH_S = 20.0
+WARM_TIMEOUT_S = 3.0
 
 System = str | Sequence[str]
 
@@ -38,11 +56,20 @@ System = str | Sequence[str]
 class LLM(Protocol):
     name: str  # "anthropic" | "mock"
 
-    def complete(self, system: str, user: str) -> str: ...
+    def complete(self, system: str, user: str, model: str | None = None) -> str: ...
 
 
 def join_system(system: System) -> str:
     return system if isinstance(system, str) else "\n\n".join(p for p in system if p)
+
+
+def _is_stale_connection(e: BaseException) -> bool:
+    """A connection error that isn't a timeout (``APITimeoutError`` subclasses it)."""
+    try:
+        import anthropic
+    except ImportError:  # pragma: no cover
+        return False
+    return isinstance(e, anthropic.APIConnectionError) and not isinstance(e, anthropic.APITimeoutError)
 
 
 class LLMRefusal(RuntimeError):
@@ -72,12 +99,48 @@ class AnthropicLLM:
             # TLS 1.3 minimum (CONTRACTS.md → Network); the SDK's timeout / retries still apply
             client = anthropic.Anthropic(
                 api_key=api_key, timeout=timeout, max_retries=max_retries,
-                http_client=httpx_client(timeout=timeout),
+                http_client=httpx_client(timeout=timeout, keepalive_expiry=KEEPALIVE_S),
             )
         self._client = client
         self.model = model
         self.max_tokens = max_tokens
         self.effort = effort if effort in EFFORTS else None
+        self._io_lock = threading.Lock()
+        # WALL-clock time the API last answered: unlike time.monotonic on macOS, it keeps counting
+        # while the Mac sleeps, so a press after waking always re-opens the connection
+        self._last_io = float("-inf")
+        self._warming = False
+
+    def _note_io(self) -> None:
+        with self._io_lock:
+            self._last_io = time.time()
+
+    def warm(self, *, block: bool = False) -> bool:
+        """Make sure a pooled connection to the API is open before the next ``complete``.
+
+        Returns at once (the request runs on a daemon thread) unless ``block``. No-op — returns
+        False — while one is in flight or the client talked to the API in the last
+        ``WARM_FRESH_S``. Free: ``GET /v1/models/{id}`` is not billed. Never raises."""
+        with self._io_lock:
+            if self._warming or 0 <= time.time() - self._last_io < WARM_FRESH_S:
+                return False
+            self._warming = True
+
+        def run() -> None:
+            try:
+                self._client.with_options(timeout=WARM_TIMEOUT_S).models.retrieve(self.model)
+                self._note_io()
+            except Exception as e:  # noqa: BLE001 - best effort; the real request reconnects
+                log.debug("llm warm-up failed: %s", type(e).__name__)
+            finally:
+                with self._io_lock:
+                    self._warming = False
+
+        if block:
+            run()
+        else:
+            threading.Thread(target=run, name="polytone-llm-warm", daemon=True).start()
+        return True
 
     @staticmethod
     def _system_param(system: System) -> Any:
@@ -88,17 +151,27 @@ class AnthropicLLM:
         blocks += [{"type": "text", "text": p} for p in rest]
         return blocks
 
-    def complete(self, system: System, user: str) -> str:
+    def complete(self, system: System, user: str, model: str | None = None) -> str:
         kwargs: dict[str, Any] = {}
         if self.effort:
             kwargs["output_config"] = {"effort": self.effort}
-        resp = self._client.messages.create(
-            model=self.model,
+        req = dict(
+            model=model or self.model,
             max_tokens=self.max_tokens,
             system=self._system_param(system),
             messages=[{"role": "user", "content": user}],
             **kwargs,
         )
+        try:
+            resp = self._client.messages.create(**req)
+        except Exception as e:
+            # A pooled connection the server or network dropped while idle fails fast here
+            # (reset / closed): reconnect once. Timeouts are not retried (the 8s budget).
+            if not _is_stale_connection(e):
+                raise
+            log.info("llm connection was dropped (%s); reconnecting once", type(e).__name__)
+            resp = self._client.messages.create(**req)
+        self._note_io()
         if getattr(resp, "stop_reason", None) == "refusal":
             details = getattr(resp, "stop_details", None)
             raise LLMRefusal(f"the model declined (category: {getattr(details, 'category', None) or 'unknown'})")
@@ -140,6 +213,7 @@ class MockLLM:
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, str]] = []
+        self.models: list[str | None] = []  # the per-call model override (None = default)
 
     @staticmethod
     def _intent_lines(user: str) -> list[str]:
@@ -175,9 +249,13 @@ class MockLLM:
             return s[0].upper() + s[1:]
         return s[0].upper() + s[1:] + "."
 
-    def complete(self, system: System, user: str) -> str:
+    def warm(self, *, block: bool = False) -> bool:
+        return False
+
+    def complete(self, system: System, user: str, model: str | None = None) -> str:
         system = join_system(system)
         self.calls.append((system, user))
+        self.models.append(model)
         sents = [self._sentence(ln) for ln in self._intent_lines(user)]
         text = " ".join(sents)
         sys_low = system.lower()

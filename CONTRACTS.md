@@ -17,7 +17,9 @@ Every component builds against this file. Change it only with the orchestrator's
 - Config: `backend/config.py` → `get_settings()` reads `.env` (see `.env.example`). Never hardcode secrets.
 - LLM: `POLYTONE_LLM=mock` OR no `ANTHROPIC_API_KEY` → deterministic mock LLM. Real model `claude-sonnet-5-5`,
   `output_config.effort` = `POLYTONE_EFFORT` (default `low`: little/no thinking → fast drafts), stable system-prompt
-  part sent with `cache_control` (prompt caching), one 6.5s attempt, no retries.
+  part sent with `cache_control` (prompt caching), one 6.5s attempt, no retries. Draft speed `"fast"`
+  (`PUT /config`) sends the draft to `claude-haiku-5-5` instead (`llm.client.FAST_MODEL`; ~40% lower
+  latency measured, a little less literal). Idle API connections are pooled for 300 s (SDK default 5 s).
 - Embeddings: `POLYTONE_EMBEDDINGS=none` → feature-only scoring. Tests always use `none`.
 - Python 3.11, managed with `uv` (`pyproject.toml` at repo root, package `backend`).
 
@@ -53,7 +55,8 @@ with `403 {"detail":"app token required"}`. See Security → Local API auth.
 | GET | `/ingest/sources` | – | `[{"name":"manual"\|"gmail"\|"wispr"\|"watcher"\|"typed","enabled":bool,"status":str,"last_run":iso\|null,"items_ingested":int}]` (`typed`: `enabled` = `capture_enabled`, `status` `"listening"`\|`"disabled"`; `wispr` while live: `"live (watching flow.sqlite; last dictation picked up <iso> (<app>); <n> ingested live)"`, else `"ready (local history: flow.sqlite)"` / `"needs credentials: …"`) |
 | POST | `/ingest/sources/{name}/run` | – | `IngestResult`; `typed` → `400 {"detail":"typed is push-only"}`; unknown → 404 |
 | GET | `/personas` | – | `[{"name":str,"description":str}]` (defaults: Boss, Friend, Investor, Default) |
-| GET/PUT | `/config` | `{"active_persona":str,"hotkey":str,"inject_mode":"paste"\|"type","capture_enabled":bool,"capture_apps":[str],"lock_idle_minutes":int /*1–240, default 15*/,"retention_days":int /*0–3650, 0 = keep forever (default)*/}` (PUT: every field optional, omitted = unchanged; out of range → 422; setting a non-zero `retention_days` purges at once) | same (full config) |
+| POST | `/warm` | – | `{"ok":true,"started":bool}` — Rust calls it when the hotkey goes down so the engine re-opens its model-API connection (free `GET /v1/models/{id}`, own thread) while the selection is captured. `started` false = connection already fresh (< 20 s since the API last answered), one in flight, or the mock LLM. Never fails because of the network. |
+| GET/PUT | `/config` | `{"active_persona":str,"hotkey":str,"inject_mode":"paste"\|"type","draft_speed":"quality"\|"fast" /*default quality*/,"capture_enabled":bool,"capture_apps":[str],"lock_idle_minutes":int /*1–240, default 15*/,"retention_days":int /*0–3650, 0 = keep forever (default)*/}` (PUT: every field optional, omitted = unchanged; out of range → 422; setting a non-zero `retention_days` purges at once) | same (full config) |
 | GET | `/drafts?limit=50` | – | `[{"draft_id","created_at","persona","intent","text","latency_ms","score":ScoreBreakdown\|null}]` |
 | GET | `/scores/summary` | – | `{"mean":float\|null,"count":int,"trend":[{"t":iso,"score":float}]}` |
 | GET | `/graph?limit=60&persona=` | – | `{"nodes":[{"id":str,"label":"Word"\|"SentenceStructure"\|"PunctuationMark"\|"IntentContext","name":str,"weight":float}],"edges":[{"source":str,"target":str,"type":"FOLLOWED_BY"\|"PART_OF_STRUCTURE"\|"USED_IN","weight":float}]}` |

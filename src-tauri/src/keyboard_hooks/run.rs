@@ -234,6 +234,9 @@ fn run_inner(
             crate::permissions::missing_accessibility_message(),
         ));
     }
+    // While the user releases the keys and we capture the selection (tens to hundreds of ms),
+    // let the engine re-open its API connection so /generate doesn't pay the handshake.
+    warm_engine(app);
     // inject_mode is only needed after /generate; refresh it concurrently (the UI may have
     // changed it with a PUT /config that Rust never sees).
     refresh_inject_mode(app);
@@ -296,6 +299,17 @@ fn run_inner(
     finish_inject(clip, mode, &cap.saved, timing).map_err(LoopError::RestoreFailed)?;
     phases.mark("restore");
     Ok(visible)
+}
+
+/// Background `POST /warm`: the engine re-opens its model-API connection during capture.
+fn warm_engine(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let client = app.state::<AppState>().client.clone();
+        if let Err(e) = client.warm().await {
+            log::debug!("engine warm-up request failed (generation still works): {e}");
+        }
+    });
 }
 
 /// Background `GET /config` → `AppState::inject_mode` (falls back to the cached value).
