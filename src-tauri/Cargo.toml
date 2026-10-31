@@ -34,6 +34,9 @@ tokio = { version = "1", features = ["time"] }
 # App token (CONTRACTS.md "Security"): 32 random bytes, base64url.
 getrandom = "0.3"
 base64 = "0.23"
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

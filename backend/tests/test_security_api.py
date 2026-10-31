@@ -41,6 +41,18 @@ def test_health_open_everything_else_locked(anon):
     assert anon.get("/drafts", headers=_bearer(TEST_APP_TOKEN)).status_code == 200
 
 
+def test_health_proves_token_knowledge(anon):
+    import hashlib
+    import hmac
+
+    assert "proof" not in anon.get("/health").json()
+    challenge = "c" * 43
+    proof = anon.get("/health", params={"challenge": challenge}).json()["proof"]
+    want = hmac.new(TEST_APP_TOKEN.encode(), b"polytone-health-v1:" + challenge.encode(), hashlib.sha256)
+    assert proof == want.hexdigest()  # Rust's security::health_proof_matches computes the same
+    assert anon.get("/health", params={"challenge": "short"}).status_code == 422
+
+
 def test_host_header_checked(client):
     assert client.get("/health", headers={"host": "evil.example:8765"}).status_code == 403
     assert client.get("/drafts", headers={"host": "127.0.0.1:9999"}).status_code == 403

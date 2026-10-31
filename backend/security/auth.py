@@ -92,6 +92,12 @@ class AuthManager:
         self._denied_since = 0.0
 
     # ------------------------------------------------------------------ helpers
+
+    def health_proof(self, challenge: str) -> str:
+        """Answer to ``/health?challenge=``: proves to Rust that this process holds the app token
+        (a program that grabbed the port first can't). HMAC-SHA256, hex."""
+        msg = b"polytone-health-v1:" + challenge.encode()
+        return hmac.new(self.app_token.encode(), msg, hashlib.sha256).hexdigest()
     def audit(self, event: str, detail: dict[str, Any], actor: str = "backend") -> None:
         if self._audit is not None:
             self._audit(event, detail, actor)

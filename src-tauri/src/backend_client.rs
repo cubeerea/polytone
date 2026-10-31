@@ -14,6 +14,8 @@ pub const TYPED_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MSG_EMPTY: &str = "Type or select your rough intent first";
 pub const MSG_NOT_RUNNING: &str = "Polytone backend not running";
 pub const MSG_TIMEOUT: &str = "Polytone timed out";
+pub const MSG_UNTRUSTED: &str =
+    "Another program is using Polytone's port, so nothing was sent. Quit it and restart Polytone";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct GenerateRequest {
@@ -104,8 +106,13 @@ pub struct SessionInfo {
 pub enum BackendError {
     NotRunning,
     Timeout,
-    Http { status: u16, body: String },
+    Http {
+        status: u16,
+        body: String,
+    },
     Decode(String),
+    /// Whatever answers on the port couldn't prove it knows the app token: not our backend.
+    Untrusted,
     Other(String),
 }
 
@@ -140,6 +147,7 @@ impl BackendError {
                 }
             }
             BackendError::Decode(e) => format!("Polytone got a bad response: {e}"),
+            BackendError::Untrusted => MSG_UNTRUSTED.to_string(),
             BackendError::Other(e) => format!("Polytone error: {e}"),
         }
     }
@@ -174,6 +182,8 @@ struct Auth {
     /// `<data_dir>/.api_token`: re-read once on a 401 (the backend may have been restarted by
     /// someone else and generated a new token).
     token_file: Option<PathBuf>,
+    /// The process on the port proved it holds `token` (`/health?challenge=`).
+    verified: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -182,13 +192,18 @@ pub struct BackendClient {
     http: reqwest::Client,
     /// Shared by every clone, so a token set at startup reaches the hotkey / capture paths.
     auth: Arc<RwLock<Auth>>,
+    /// Refuse to send anything until the backend proves it knows the app token. On in the app;
+    /// off for `new()` so request-shape tests needn't speak the challenge.
+    require_proof: bool,
 }
 
 impl Default for BackendClient {
     fn default() -> Self {
-        Self::new(
+        let mut c = Self::new(
             std::env::var("POLYTONE_API_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string()),
-        )
+        );
+        c.require_proof = true;
+        c
     }
 }
 
@@ -204,7 +219,46 @@ impl BackendClient {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             http,
             auth: Arc::new(RwLock::new(Auth::default())),
+            require_proof: false,
         }
+    }
+
+    /// Prove the process on the port is our backend before it sees any data: it must answer
+    /// `GET /health?challenge=<c>` with `proof` = hex HMAC-SHA256(app token, "polytone-health-v1:" + c).
+    /// Another local program that grabbed 127.0.0.1:8765 can't read the 0600 token file.
+    pub async fn verify(&self) -> Result<(), BackendError> {
+        let Some(token) = self.auth.read().unwrap().token.clone() else {
+            return Err(BackendError::Untrusted);
+        };
+        let challenge = crate::security::generate_token();
+        let resp = self
+            .http
+            // base64url: safe in a query string as is
+            .get(self.url(&format!("/health?challenge={challenge}")))
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await?;
+        let body: serde_json::Value = Self::check(resp).await?.json().await?;
+        let proof = body.get("proof").and_then(|p| p.as_str()).unwrap_or("");
+        if crate::security::health_proof_matches(&token, &challenge, proof) {
+            let mut auth = self.auth.write().unwrap();
+            if auth.token.as_deref() == Some(token.as_str()) {
+                auth.verified = true;
+            }
+            Ok(())
+        } else {
+            log::warn!(
+                "the process on the backend port failed the token proof; not sending it data"
+            );
+            Err(BackendError::Untrusted)
+        }
+    }
+
+    async fn ensure_verified(&self) -> Result<(), BackendError> {
+        if !self.require_proof || self.auth.read().unwrap().verified {
+            return Ok(());
+        }
+        self.verify().await
     }
 
     fn url(&self, path: &str) -> String {
@@ -213,7 +267,9 @@ impl BackendClient {
 
     /// Use `token` as the app token (the one we pass to a backend we spawn).
     pub fn set_token(&self, token: Option<String>) {
-        self.auth.write().unwrap().token = token;
+        let mut auth = self.auth.write().unwrap();
+        auth.token = token;
+        auth.verified = false;
     }
 
     pub fn has_token(&self) -> bool {
@@ -236,6 +292,7 @@ impl BackendClient {
         {
             Some(t) => {
                 auth.token = Some(t);
+                auth.verified = false;
                 true
             }
             None => false,
@@ -257,6 +314,7 @@ impl BackendClient {
         }
         log::info!("backend rejected the app token; using the one in the token file");
         auth.token = Some(fresh);
+        auth.verified = false;
         true
     }
 
@@ -274,8 +332,10 @@ impl BackendClient {
             }
             req.send()
         };
+        self.ensure_verified().await?;
         let resp = attempt().await?;
         if resp.status() == reqwest::StatusCode::UNAUTHORIZED && self.refresh_token_after_401() {
+            self.ensure_verified().await?;
             return Self::check(attempt().await?).await;
         }
         Self::check(resp).await
@@ -677,6 +737,82 @@ mod tests {
                 ["POST /session", "DELETE /session", "POST /audit/event"]
             );
         });
+    }
+
+    fn proof_for(token: &str, line: &str) -> String {
+        use hmac::{Hmac, Mac};
+        let challenge = line.split("challenge=").nth(1).unwrap_or("");
+        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(token.as_bytes()).unwrap();
+        mac.update(b"polytone-health-v1:");
+        mac.update(challenge.as_bytes());
+        hex::encode(mac.finalize().into_bytes())
+    }
+
+    #[test]
+    fn app_client_sends_nothing_to_an_impostor() {
+        tokio_rt().block_on(async {
+            // Answers /health like a backend but doesn't know the token.
+            let (url, seen) = mock_server(|line, _| {
+                if line.starts_with("GET /health") {
+                    (200, r#"{"status":"ok","proof":"00"}"#.into())
+                } else {
+                    (200, CFG.into())
+                }
+            })
+            .await;
+            let mut c = BackendClient::new(url);
+            c.require_proof = true;
+            c.set_token(Some("app".into()));
+            assert!(matches!(c.get_config().await, Err(BackendError::Untrusted)));
+            let lines: Vec<String> = seen.lock().unwrap().iter().map(|s| s.0.clone()).collect();
+            assert_eq!(lines.len(), 1);
+            assert!(lines[0].starts_with("GET /health?challenge="));
+            assert_eq!(
+                seen.lock().unwrap()[0].1,
+                None,
+                "token must not go to the challenge"
+            );
+        });
+    }
+
+    #[test]
+    fn app_client_verifies_once_then_sends() {
+        tokio_rt().block_on(async {
+            let (url, seen) = mock_server(|line, auth| {
+                if line.starts_with("GET /health") {
+                    (
+                        200,
+                        format!(r#"{{"status":"ok","proof":"{}"}}"#, proof_for("app", line)),
+                    )
+                } else if auth == Some("Bearer app") {
+                    (200, CFG.into())
+                } else {
+                    (401, r#"{"detail":"locked"}"#.into())
+                }
+            })
+            .await;
+            let mut c = BackendClient::new(url);
+            c.require_proof = true;
+            c.set_token(Some("app".into()));
+            c.get_config().await.unwrap();
+            c.get_config().await.unwrap();
+            let n_health = seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|s| s.0.starts_with("GET /health"))
+                .count();
+            assert_eq!(n_health, 1);
+        });
+    }
+
+    #[test]
+    fn proof_check_rejects_garbage() {
+        assert!(!crate::security::health_proof_matches("t", "c", "zz"));
+        assert!(!crate::security::health_proof_matches("t", "c", ""));
+        let ok = proof_for("t", "x?challenge=c");
+        assert!(crate::security::health_proof_matches("t", "c", &ok));
+        assert!(!crate::security::health_proof_matches("u", "c", &ok));
     }
 
     fn tokio_rt() -> tokio::runtime::Runtime {

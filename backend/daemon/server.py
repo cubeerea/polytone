@@ -183,7 +183,9 @@ def _warm_up(r: Runtime, watcher: dict[str, Any], stopping: threading.Event) -> 
 
 def _wispr_live() -> bool:
     mod = sys.modules.get("backend.mcp_servers.wispr_live")  # never imported → not running
-    return bool(mod and mod.active() is not None)
+    # the warmup thread may be mid-import (module in sys.modules, `active` not defined yet)
+    active = getattr(mod, "active", None)
+    return bool(active and active() is not None)
 
 
 def create_app(runtime: Runtime | None = None, *, api_token: str | None = None) -> FastAPI:
@@ -247,7 +249,7 @@ def create_app(runtime: Runtime | None = None, *, api_token: str | None = None) 
     )
 
     @app.get("/health")
-    def health() -> dict[str, Any]:
+    def health(challenge: str | None = Query(None, min_length=16, max_length=128)) -> dict[str, Any]:
         r = rt()
         neo4j_ok = r.store.kind == "neo4j" and r.store.healthy()
         configured = "anthropic" if r.settings.llm_backend == "anthropic" else "mock"
@@ -261,6 +263,8 @@ def create_app(runtime: Runtime | None = None, *, api_token: str | None = None) 
             "embeddings": "none" if r.settings.polytone_embeddings == "none" else "qwen",
             "graph_store": r.store.kind,
             "wispr_live": _wispr_live(),  # additive: the live Wispr Flow watcher is running
+            # identity proof for Rust (CONTRACTS.md → Security); only with ?challenge=
+            **({"proof": auth.health_proof(challenge)} if challenge else {}),
         }
 
     # ------------------------------------------------------------------ sessions / audit

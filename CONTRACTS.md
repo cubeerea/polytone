@@ -332,6 +332,15 @@ an attacker running as the same user with the Polytone window unlocked, or root.
   `{"ok":bool,"count":int,"first_bad_seq":int|null,"reason":str|null}`; `POST /audit/event`
   (app token only) `{event, detail}` for Rust-side events (actor `app`).
 
+### Backend identity and CSP
+- `GET /health?challenge=<16–128 chars>` adds `"proof"` = hex HMAC-SHA256(app token,
+  `"polytone-health-v1:" + challenge`). Rust (`BackendClient::verify`) checks it before sending
+  anything else, and again whenever the token changes; a process that took the port without the
+  token gets health checks only (`BackendError::Untrusted`, notification).
+- Production webview CSP (`tauri.conf.json` → `app.security.csp`): `default-src 'self'`, scripts from
+  the app only, `connect-src` = IPC + `http://127.0.0.1:8765`, no objects/frames/forms. Dev
+  (`devCsp`) keeps none: Vite's dev server injects inline scripts and an HMR websocket.
+
 ### Network
 - Outbound HTTPS (Anthropic, Google APIs): TLS 1.3 minimum, certificate verification on (certifi CA
   bundle). `security/tls.py`: Anthropic SDK → `anthropic.DefaultHttpxClient(verify=<TLS 1.3 SSLContext>)`

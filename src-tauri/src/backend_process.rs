@@ -171,6 +171,12 @@ pub fn autostart(app: &AppHandle) {
                 return;
             }
         }
+        // Before any data goes to it: is the process on the port really our backend?
+        if let Err(e) = client.verify().await {
+            log::warn!("backend identity check failed: {e:?}");
+            crate::notify(&app, &e.user_message());
+            return;
+        }
         log::info!("backend healthy");
         crate::sync_from_backend_config(&app).await;
     });

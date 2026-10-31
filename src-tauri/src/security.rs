@@ -37,6 +37,19 @@ pub fn generate_token() -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
+/// Constant-time check of the backend's `/health?challenge=` answer (see
+/// `BackendClient::verify`).
+pub fn health_proof_matches(token: &str, challenge: &str, proof_hex: &str) -> bool {
+    use hmac::{Hmac, Mac};
+    let Ok(proof) = hex::decode(proof_hex) else {
+        return false;
+    };
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(token.as_bytes()).expect("any key length");
+    mac.update(b"polytone-health-v1:");
+    mac.update(challenge.as_bytes());
+    mac.verify_slice(&proof).is_ok()
+}
+
 /// The token in `path`, trimmed; `None` if missing, unreadable or blank.
 pub fn read_token_file(path: &Path) -> Option<String> {
     let s = std::fs::read_to_string(path).ok()?;
