@@ -54,7 +54,9 @@ for port in 1420 "$API_PORT"; do
     fi
   done
 done
-pkill -f "$REPO/src-tauri/target/.*/polytone" 2>/dev/null && say "stopped a running Polytone instance" || true
+# Any running Polytone (dev binary or bundled app) holds the single-instance lock and would
+# swallow this launch, so stop it.
+pkill -x polytone 2>/dev/null && say "stopped a running Polytone instance" || true
 sleep 0.5
 
 # 4. Launch. The app starts the backend itself and stops it on quit.

@@ -88,6 +88,26 @@ pub fn classify_key(keycode: i64, flags: u64, bundle_id: &str) -> KeyAction {
     }
 }
 
+/// Browsers whose single-line fields are mostly the address bar and search boxes.
+pub const BROWSERS: &[&str] = &[
+    "com.google.Chrome",
+    "com.apple.Safari",
+    "company.thebrowser.Browser",
+    "org.mozilla.firefox",
+    "com.microsoft.edgemac",
+    "com.brave.Browser",
+];
+
+/// Which focused element roles hold text worth learning from. In browsers only multi-line
+/// message boxes (textarea / contenteditable → AXTextArea) count: Return in the address bar
+/// or a search field would otherwise look like a sent message.
+pub fn text_role_allowed(role: &str, bundle_id: &str) -> bool {
+    if BROWSERS.contains(&bundle_id) {
+        return role == "AXTextArea";
+    }
+    matches!(role, "AXTextArea" | "AXTextField" | "AXComboBox")
+}
+
 pub fn word_count(text: &str) -> usize {
     text.split_whitespace()
         .filter(|w| w.chars().any(char::is_alphanumeric))
@@ -804,7 +824,7 @@ mod platform {
             return None;
         }
         let role = ax_string(el.0, "AXRole").unwrap_or_default();
-        if !matches!(role.as_str(), "AXTextArea" | "AXTextField" | "AXComboBox") {
+        if !text_role_allowed(&role, &front.bundle_id) {
             return None;
         }
         let value = ax_string(el.0, "AXValue");
@@ -1034,6 +1054,19 @@ mod platform {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn browsers_only_read_message_boxes() {
+        assert!(text_role_allowed("AXTextArea", "com.google.Chrome"));
+        assert!(!text_role_allowed("AXTextField", "com.google.Chrome"));
+        assert!(!text_role_allowed("AXComboBox", "com.apple.Safari"));
+        assert!(text_role_allowed(
+            "AXTextField",
+            "com.tinyspeck.slackmacgap"
+        ));
+        assert!(!text_role_allowed("AXButton", "com.tinyspeck.slackmacgap"));
+    }
+
     use super::*;
 
     const SLACK: &str = "com.tinyspeck.slackmacgap";
