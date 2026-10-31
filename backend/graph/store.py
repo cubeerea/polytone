@@ -8,7 +8,9 @@ the all-persona one — and blends them (``graph/constraints.py`` documents the 
 with few samples leans on the user's overall style; with none it is pure global, so a fresh
 "Boss" persona still sounds like the user). ``sample_count`` is the persona's own sample count
 (the global count when it has none). Constraints are cached per (persona, k) and the cache is
-invalidated on every write.
+invalidated on every write (a generation counter keeps a computation that raced with a write
+out of the cache). The all-persona aggregate is cached separately, so after an ingest each
+persona's first request only re-reads its own aggregate.
 """
 from __future__ import annotations
 
@@ -61,6 +63,8 @@ class _BaseStore:
 
     def __init__(self) -> None:
         self._cache: dict[tuple[str | None, int], Constraints] = {}
+        self._global: dict[int, StyleAggregate] = {}  # all-persona aggregate, shared by every persona
+        self._gen = 0  # bumped by every write; results computed under an older gen are not cached
         self._cache_lock = threading.Lock()
 
     # -- to implement ---------------------------------------------------------------
@@ -78,19 +82,26 @@ class _BaseStore:
     # -- cache ---------------------------------------------------------------------
     def invalidate(self) -> None:
         with self._cache_lock:
+            self._gen += 1
             self._cache.clear()
+            self._global.clear()
 
     def get_constraints(self, persona: str | None, k: int = 20) -> Constraints:
         key = (persona or None, k)
         with self._cache_lock:
             hit = self._cache.get(key)
+            g = self._global.get(k)
+            gen = self._gen
         if hit is not None:
             return _copy(hit)
-        g = self._aggregate(None, k)
+        if g is None:
+            g = self._aggregate(None, k)
         p = self._aggregate(persona, k) if persona and g.sample_count else g
         c = compute_constraints(p, k, global_agg=g) if g.sample_count else empty_constraints()
         with self._cache_lock:
-            self._cache[key] = c
+            if gen == self._gen:  # no write raced with this computation
+                self._cache[key] = c
+                self._global[k] = g
         return _copy(c)
 
     # -- graph view ----------------------------------------------------------------
@@ -377,25 +388,33 @@ class Neo4jGraphStore(_BaseStore):
         return {"words_merged": len(ex.words), "sentences": ex.sentence_count}
 
     def _aggregate(self, persona: str | None, k: int) -> StyleAggregate:
-        agg = StyleAggregate()
-        for row in self._read(Q.READ_CONTEXTS, persona=persona):
-            agg.merge_context(row["c"])
-        if agg.sample_count == 0:
+        """All reads for one aggregate in ONE read transaction (one session, one BEGIN/COMMIT,
+        a consistent view) instead of five auto-commit queries."""
+
+        def rows(tx: Any, query: str, **params: Any) -> list[dict[str, Any]]:
+            return [r.data() for r in tx.run(query, persona=persona, **params)]
+
+        def work(tx: Any) -> StyleAggregate:
+            agg = StyleAggregate()
+            for row in rows(tx, Q.READ_CONTEXTS):
+                agg.merge_context(row["c"])
+            if agg.sample_count == 0:
+                return agg
+            words = rows(tx, Q.READ_TOP_WORDS, limit=_WORD_FETCH)
+            agg.words = {r["text"]: int(r["n"] or 0) for r in words}
+            agg.word_totals = {r["text"]: int(r["total"] or 0) for r in words}
+            seed = [r["text"] for r in words[:_BIGRAM_SEED]]
+            agg.bigrams = {
+                (r["a"], r["b"]): int(r["n"] or 0) for r in rows(tx, Q.READ_TOP_BIGRAMS, seed=seed, limit=k)
+            }
+            agg.structures = {
+                r["sig"]: int(r["n"] or 0) for r in rows(tx, Q.READ_STRUCTURES, limit=max(k, _STRUCT_FETCH))
+            }
+            agg.punctuation = {r["sym"]: int(r["n"] or 0) for r in rows(tx, Q.READ_PUNCTUATION)}
             return agg
-        rows = self._read(Q.READ_TOP_WORDS, persona=persona, limit=_WORD_FETCH)
-        agg.words = {r["text"]: int(r["n"] or 0) for r in rows}
-        agg.word_totals = {r["text"]: int(r["total"] or 0) for r in rows}
-        seed = [r["text"] for r in rows[:_BIGRAM_SEED]]
-        agg.bigrams = {
-            (r["a"], r["b"]): int(r["n"] or 0)
-            for r in self._read(Q.READ_TOP_BIGRAMS, persona=persona, seed=seed, limit=k)
-        }
-        agg.structures = {
-            r["sig"]: int(r["n"] or 0)
-            for r in self._read(Q.READ_STRUCTURES, persona=persona, limit=max(k, _STRUCT_FETCH))
-        }
-        agg.punctuation = {r["sym"]: int(r["n"] or 0) for r in self._read(Q.READ_PUNCTUATION, persona=persona)}
-        return agg
+
+        with self._driver.session(default_access_mode="READ") as s:
+            return s.execute_read(work)
 
     def _top_nodes(self, persona: str | None, n_words: int, n_structs: int) -> dict[str, list]:
         ctxs = [

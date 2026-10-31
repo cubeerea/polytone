@@ -7,6 +7,9 @@
 * Any failure (deps missing, download blocked, OOM) logs once and returns ``None``; the
   scorer then renormalizes over the stylometric components. Never raises.
 * ``POLYTONE_EMBEDDINGS=none`` disables everything without importing torch.
+* Loads from the local HuggingFace cache first (``local_files_only``: no network round trips —
+  they cost ~1.5s of HEAD/GET requests per start); only an uncached model is downloaded
+  (never when ``HF_HUB_OFFLINE`` is set).
 """
 from __future__ import annotations
 
@@ -74,7 +77,13 @@ def get_model() -> Any | None:
             from sentence_transformers import SentenceTransformer
 
             dev = _device()
-            _model = SentenceTransformer(MODEL_NAME, device=dev)
+            try:
+                _model = SentenceTransformer(MODEL_NAME, device=dev, local_files_only=True)
+            except Exception as e:
+                if os.environ.get("HF_HUB_OFFLINE", "").strip().lower() in ("1", "true", "yes", "on"):
+                    raise
+                log.info("embedding model not in the local cache (%s); downloading %s", e, MODEL_NAME)
+                _model = SentenceTransformer(MODEL_NAME, device=dev)
             _load_seconds = time.perf_counter() - t0
             log.info("loaded %s on %s in %.1fs", MODEL_NAME, dev, _load_seconds)
         except Exception as e:  # noqa: BLE001 - optional component
@@ -86,6 +95,11 @@ def get_model() -> Any | None:
 
 def load_seconds() -> float | None:
     return _load_seconds
+
+
+def warm_up() -> bool:
+    """Load the model and run one tiny encode (the first MPS encode costs ~1s). True if ready."""
+    return embed(["warm up"]) is not None
 
 
 def embed(texts: Sequence[str]) -> Any | None:

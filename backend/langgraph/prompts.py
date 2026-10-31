@@ -88,7 +88,22 @@ def build_system_prompt(
     app_context: str | None = None,
     examples: list[str] | None = None,
 ) -> str:
-    """System prompt: HARD style constraints from the graph + few-shot real sentences.
+    """The full system prompt as one string (``build_system_parts`` joined)."""
+    return "\n\n".join(p for p in build_system_parts(constraints, persona, app_context, examples) if p)
+
+
+def build_system_parts(
+    constraints: dict[str, Any],
+    persona: str,
+    app_context: str | None = None,
+    examples: list[str] | None = None,
+) -> tuple[str, str]:
+    """System prompt as ``(stable, volatile)``.
+
+    ``stable`` — HARD style constraints from the graph, persona and content rules — depends only
+    on (constraints, persona), which are cached per persona until the next ingest, so it is the
+    prompt-cache prefix. ``volatile`` — the few-shot examples (chosen per intent) and the
+    destination-app hint — changes per request and goes after the cache breakpoint.
 
     ``examples`` must be excerpts of the user's own human samples (never drafts)."""
     c = constraints
@@ -158,20 +173,9 @@ def build_system_prompt(
             rules.append(f"Word pairs the user often uses: {pairs}.")
         lines.append(f"HARD STYLE RULES (learned from {n} of the user's own writing samples — follow them):")
         lines += [f"{i}. {r}" for i, r in enumerate(rules, 1)]
-    if examples:
-        lines += [
-            "",
-            "REAL EXAMPLES of the user's own writing (copy the rhythm, punctuation and casing — NOT the content):",
-        ]
-        lines += [f"<example>{ex}</example>" for ex in examples]
     lines += [
         "",
         f"PERSONA: {persona}. {persona_guidance(persona)}",
-    ]
-    hint = app_context_hint(app_context)
-    if hint:
-        lines.append(f"CONTEXT: {hint}")
-    lines += [
         "",
         "CONTENT RULES:",
         ("- Convey exactly what the intent says. Never invent facts, names, dates, numbers, links or "
@@ -181,7 +185,18 @@ def build_system_prompt(
         ("- Output ONLY the final message text. No preamble (no \"Here's...\"), no quotes around it, "
          "no explanations, no alternatives, no markdown headings."),
     ]
-    return "\n".join(lines)
+    volatile: list[str] = []
+    if examples:
+        volatile.append(
+            "REAL EXAMPLES of the user's own writing (copy the rhythm, punctuation and casing — NOT the content):"
+        )
+        volatile += [f"<example>{ex}</example>" for ex in examples]
+    hint = app_context_hint(app_context)
+    if hint:
+        if volatile:
+            volatile.append("")
+        volatile.append(f"CONTEXT: {hint}")
+    return "\n".join(lines), "\n".join(volatile)
 
 
 def build_user_prompt(intent: str) -> str:

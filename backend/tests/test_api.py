@@ -179,24 +179,31 @@ def test_scores_summary(client, runtime):
     assert client.get("/drafts").json()[0]["score"]["score"] == 80.0
 
 
-def test_embedding_warmup_is_background_and_optional(runtime, monkeypatch):
+def test_warmup_is_background_and_optional(runtime, monkeypatch):
+    from fastapi.testclient import TestClient
+
     from backend.daemon import server
     from backend.evaluation import embeddings
 
-    assert server._warm_embeddings(runtime) is None  # POLYTONE_EMBEDDINGS=none → no thread
-    runtime.settings.polytone_embeddings = "qwen"
     started = []
 
-    def slow_load():
+    def slow_warm():
         started.append(1)
-        time.sleep(0.2)
+        time.sleep(0.5)
+        return True
 
-    monkeypatch.setattr(embeddings, "get_model", slow_load)
+    monkeypatch.setattr(embeddings, "warm_up", slow_warm)
+    server._warm_embeddings(runtime)  # POLYTONE_EMBEDDINGS=none → nothing loaded
+    assert started == []
+    runtime.settings.polytone_embeddings = "qwen"
     t0 = time.perf_counter()
-    t = server._warm_embeddings(runtime)
-    assert t is not None and t.daemon and time.perf_counter() - t0 < 0.1  # never blocks
-    t.join(2)
-    assert started == [1]
+    with TestClient(server.create_app(runtime)) as c:
+        assert c.get("/health").status_code == 200
+        assert time.perf_counter() - t0 < 0.4  # /health never waits for the embedding model
+        warm = c.app.state.warmup
+        assert warm.daemon
+        warm.join(3)
+    assert started == [1] and "generate" in runtime._graphs  # graph compiled during warm-up
 
 
 def test_env_file_switches_reach_os_environ(tmp_path, monkeypatch):

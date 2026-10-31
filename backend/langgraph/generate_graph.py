@@ -25,7 +25,7 @@ from langgraph.graph import END, START, StateGraph
 
 from backend.graph.constraints import empty_constraints
 from backend.langgraph.examples import select_examples
-from backend.langgraph.prompts import build_system_prompt, build_user_prompt
+from backend.langgraph.prompts import build_system_parts, build_user_prompt
 from backend.runtime import Runtime, get_runtime
 
 log = logging.getLogger(__name__)
@@ -72,9 +72,9 @@ class GenState(TypedDict, total=False):
     constraints_source: str  # "graph" | "fallback"
     examples: list[str]
     system: str
+    system_parts: tuple[str, str]  # (stable, volatile) — the stable part is the prompt-cache prefix
     user: str
     raw_output: str
-    llm_fallback: bool
     text: str
     draft_id: str
     latency_ms: int
@@ -144,10 +144,12 @@ def build_generate_graph(rt: Runtime):
         return out
 
     def build_prompt(state: GenState) -> GenState:
+        parts = build_system_parts(
+            state["constraints"], state["persona"], state.get("app_context"), state.get("examples") or []
+        )
         return {
-            "system": build_system_prompt(
-                state["constraints"], state["persona"], state.get("app_context"), state.get("examples") or []
-            ),
+            "system": "\n\n".join(p for p in parts if p),
+            "system_parts": parts,
             "user": build_user_prompt(state["intent"]),
         }
 
@@ -155,7 +157,8 @@ def build_generate_graph(rt: Runtime):
         if getattr(rt.llm, "name", "") == "mock" and rt.settings.llm_backend != "mock":
             raise LLMFailedError("no LLM configured: POLYTONE_LLM=anthropic but ANTHROPIC_API_KEY is empty")
         try:
-            return {"raw_output": rt.llm.complete(state["system"], state["user"]), "llm_fallback": False}
+            system = state["system_parts"] if getattr(rt.llm, "cache_system", False) else state["system"]
+            return {"raw_output": rt.llm.complete(system, state["user"])}
         except Exception as e:
             log.warning("LLM call failed: %s", _detail(e))
             if _is_timeout(e):
@@ -216,9 +219,9 @@ def score_draft(rt: Runtime, draft_id: str, text: str, persona: str) -> dict | N
     if scorer is None:
         return None
     try:
-        baseline = [s["text"] for s in rt.db.list_samples(persona=persona, limit=200)]
-        if not baseline:
-            baseline = [s["text"] for s in rt.db.list_samples(limit=200)]
+        from backend.evaluation.style_distance import baseline_texts
+
+        baseline = baseline_texts(rt.db, persona)
         if not baseline:
             return None
         result = scorer(text, baseline, persona)
@@ -236,6 +239,12 @@ def _graph_for(rt: Runtime):
     if g is None:
         g = rt._graphs["generate"] = build_generate_graph(rt)
     return g
+
+
+def warm(rt: Runtime) -> None:
+    """Compile the graph and prime the active persona's constraints (startup / after ingest)."""
+    _graph_for(rt)
+    rt.prime_constraints()
 
 
 def run_generation(

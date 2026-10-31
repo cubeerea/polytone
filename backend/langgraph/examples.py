@@ -12,6 +12,11 @@ Selection (deterministic):
                             − 0.5 · share of the excerpt's sentences whose structure signature
                                     is among the persona's top-5 structures
 3. Greedy pick by score: at most one excerpt per sample, no two with the same opener.
+
+Memo: the result is cached per (database, persona, target length, avg, top structures, k,
+samples watermark). Drafts are append-only and only ever *remove* candidates, so a cached
+pick stays exactly right as long as each chosen excerpt still passes against the drafts
+added since — that is all a cache hit re-checks (a new sample, or a deleted draft, recomputes).
 """
 from __future__ import annotations
 
@@ -20,7 +25,7 @@ from collections import OrderedDict
 from typing import Any
 
 from backend.ingestion.extract import signature
-from backend.ingestion.firewall import draft_match_reason
+from backend.ingestion.firewall import draft_match_reason, draft_snapshot
 from backend.ingestion.text import clean_message, segment, token_spans, tokenize
 
 MAX_EXAMPLES = 3
@@ -36,6 +41,10 @@ Excerpt = tuple[str, int, tuple[str, ...], str]
 _cache: OrderedDict[tuple[str, int, str], list[Excerpt]] = OrderedDict()
 _cache_lock = threading.Lock()
 _CACHE_SIZE = 4000
+
+# memo key -> (chosen excerpts, drafts snapshot rows object, drafts checked)
+_picks: OrderedDict[tuple, tuple[list[str], Any, int]] = OrderedDict()
+_PICKS_SIZE = 256
 
 
 def _excerpts_for(db_key: str, sample: dict[str, Any]) -> list[Excerpt]:
@@ -77,15 +86,37 @@ def select_examples(
     db: Any, persona: str | None, intent: str, constraints: dict[str, Any], k: int = MAX_EXAMPLES
 ) -> list[str]:
     db_key = str(getattr(db, "path", id(db)))
+    target = min(max(len(tokenize(intent)), 6), 30)
+    avg = float(constraints.get("avg_sentence_len") or 0) or None
+    top5 = tuple(s["signature"] for s in (constraints.get("structures") or [])[:5])
+    key = (db_key, persona or None, target, avg, top5, k, db.samples_watermark())
+    drafts = draft_snapshot(db)  # one sync for every draft check below
+    with _cache_lock:
+        hit = _picks.get(key)
+        if hit is not None:
+            _picks.move_to_end(key)
+    if hit is not None and hit[1] is drafts.rows and hit[2] <= drafts.n:
+        chosen, _, checked = hit
+        if all(draft_match_reason(t, db, snapshot=drafts, start=checked) is None for t in chosen):
+            with _cache_lock:
+                _picks[key] = (chosen, drafts.rows, drafts.n)
+            return list(chosen)
+    chosen = _select(db, db_key, persona, target, avg, set(top5), k, drafts)
+    with _cache_lock:
+        _picks[key] = (chosen, drafts.rows, drafts.n)
+        while len(_picks) > _PICKS_SIZE:
+            _picks.popitem(last=False)
+    return list(chosen)
+
+
+def _select(
+    db: Any, db_key: str, persona: str | None, target: int, avg: float | None, top_sigs: set[str], k: int, drafts: Any
+) -> list[str]:
     samples = [s for s in db.list_samples(persona=persona, limit=SAMPLE_LIMIT) if _usable(s)] if persona else []
     pools = [samples]
     if sum(len(_excerpts_for(db_key, s)) for s in samples) < MIN_EXAMPLES:
         seen = {s["id"] for s in samples}
         pools.append([s for s in db.list_samples(limit=SAMPLE_LIMIT) if _usable(s) and s["id"] not in seen])
-
-    target = min(max(len(tokenize(intent)), 6), 30)
-    avg = float(constraints.get("avg_sentence_len") or 0) or None
-    top_sigs = {s["signature"] for s in (constraints.get("structures") or [])[:5]}
 
     chosen: list[str] = []
     for pool in pools:
@@ -107,7 +138,7 @@ def select_examples(
                 break
             if neg_id in used_samples or ex[3] in used_openers or text in chosen:
                 continue
-            if draft_match_reason(text, db) is not None:
+            if draft_match_reason(text, db, snapshot=drafts) is not None:
                 continue  # never show anything that looks like a generated draft
             chosen.append(text)
             used_samples.add(neg_id)

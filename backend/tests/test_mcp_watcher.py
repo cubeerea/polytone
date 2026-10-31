@@ -138,6 +138,7 @@ def test_daemon_starts_and_stops_watcher(runtime, inbox, monkeypatch):
 
     monkeypatch.setenv("POLYTONE_WATCHER", "1")
     with TestClient(create_app(runtime)) as c:
+        c.app.state.warmup.join(5)  # the watcher starts in the background warm-up thread
         th = fw._active_thread
         assert th is not None and th.is_alive()
         assert "watching" in {s["name"]: s for s in c.get("/ingest/sources").json()}["watcher"]["status"]
@@ -150,5 +151,6 @@ def test_daemon_watcher_disabled(runtime, inbox, monkeypatch):
     from backend.daemon.server import create_app
 
     monkeypatch.setenv("POLYTONE_WATCHER", "0")
-    with TestClient(create_app(runtime)):
+    with TestClient(create_app(runtime)) as c:
+        c.app.state.warmup.join(5)
         assert fw._active_thread is None

@@ -4,7 +4,8 @@
 enforces provenance, minimum length, sample de-duplication and the never-a-draft rules.
 
 ``run_ingest(text, source, persona, provenance) -> IngestResult`` ingests ONE human sample.
-``run_ingest_batch(items, source, persona)`` ingests many and logs an ``ingest_runs`` row.
+``run_ingest_batch(items, source, persona)`` ingests many and logs an ``ingest_runs`` row; in the
+server (``rt.score_async``) it then re-primes the active persona's constraint cache in the background.
 
 IngestResult = {"accepted", "rejected", "reasons", "sentences", "words_merged"}.
 Only text that passes the firewall reaches the graph; drafts never do.
@@ -164,4 +165,6 @@ def run_ingest_batch(
             source=source, started_at=started, finished_at=utcnow_iso(),
             accepted=total["accepted"], rejected=total["rejected"], status=status,
         )
+    if total["accepted"] and rt.score_async:
+        rt.submit(rt.prime_constraints)  # the write invalidated the cache; refill it off the hot path
     return total

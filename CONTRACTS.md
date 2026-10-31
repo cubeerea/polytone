@@ -15,7 +15,9 @@ Every component builds against this file. Change it only with the orchestrator's
 
 - Backend entrypoint: `uv run polytone-api` (= `backend.daemon.server:main`), port `POLYTONE_API_PORT` (default 8765).
 - Config: `backend/config.py` → `get_settings()` reads `.env` (see `.env.example`). Never hardcode secrets.
-- LLM: `POLYTONE_LLM=mock` OR no `ANTHROPIC_API_KEY` → deterministic mock LLM. Real model `claude-sonnet-5-5`.
+- LLM: `POLYTONE_LLM=mock` OR no `ANTHROPIC_API_KEY` → deterministic mock LLM. Real model `claude-sonnet-5-5`,
+  `output_config.effort` = `POLYTONE_EFFORT` (default `low`: little/no thinking → fast drafts), stable system-prompt
+  part sent with `cache_control` (prompt caching), one 6.5s attempt, no retries.
 - Embeddings: `POLYTONE_EMBEDDINGS=none` → feature-only scoring. Tests always use `none`.
 - Python 3.11, managed with `uv` (`pyproject.toml` at repo root, package `backend`).
 
@@ -39,7 +41,7 @@ Every component builds against this file. Change it only with the orchestrator's
 
 | Method | Path | Request | Response |
 |---|---|---|---|
-| GET | `/health` | – | `{"status":"ok","neo4j":bool,"llm":"anthropic"\|"mock","embeddings":"qwen"\|"none","graph_store":"neo4j"\|"memory","llm_ready":bool}` (`llm` = configured backend; `llm_ready` false → `/generate` will 502) |
+| GET | `/health` | – | `{"status":"ok","neo4j":bool,"llm":"anthropic"\|"mock","embeddings":"qwen"\|"none","graph_store":"neo4j"\|"memory","llm_ready":bool}` (`llm` = configured backend; `llm_ready` false → `/generate` will 502). Answers as soon as uvicorn is up; graph compile, constraint priming, the drop-folder watcher and the embedding model warm in a background thread afterwards. |
 | POST | `/generate` | `{"intent":str,"persona":str\|null,"app_context":str\|null}` | `{"draft_id":str,"text":str,"persona":str,"latency_ms":int,"constraints":Constraints}`; errors `502/504 {"error":"llm_failed"\|"llm_timeout","detail":str}` |
 | POST | `/ingest/manual` | `{"text":str,"persona":str\|null}` | `IngestResult` |
 | POST | `/ingest/typed` | `{"text":str,"app":str /*bundle id*/,"app_name":str\|null,"after_inject":bool}` | `IngestResult` (see "Typing capture") |
@@ -102,14 +104,16 @@ Learns from messages the user types and **sends** in allowlisted native apps.
 ## Python module boundaries (backend/)
 
 - `config.py` — `Settings`, `get_settings()`.
-- `storage/db.py` — SQLite (`data/polytone.sqlite3`): tables `config`, `drafts`, `samples` (ingested human text + provenance + sha256), `ingest_runs`, `draft_edits` (post-inject sends; never learned). Functions documented in that file.
+- `storage/db.py` — SQLite (`data/polytone.sqlite3`): tables `config`, `drafts`, `samples` (ingested human text + provenance + sha256), `ingest_runs`, `draft_edits` (post-inject sends; never learned). `Database(path)` methods documented in that file (the old module-level wrappers are gone; use `Runtime.db`). One persistent connection per thread, WAL + `synchronous=NORMAL`; `draft_watermark()`/`drafts_since(rowid)`/`samples_watermark()` let in-process caches stay exact across processes.
 - `graph/store.py` — `GraphStore` protocol + `Neo4jGraphStore` + `InMemoryGraphStore` (tests). Cypher templates live in `graph/queries.py`.
 - `ingestion/extract.py` — `extract(text) -> Extraction` (pure python, deterministic, no network). Triplets: Word FOLLOWED_BY Word (weight), Word PART_OF_STRUCTURE SentenceStructure, SentenceStructure USED_IN IntentContext, PunctuationMark nodes.
 - `ingestion/firewall.py` — `HumanText` provenance gate; every rejection returns a reason string. Rejects: empty,
   `generated=True`/`origin="polytone"`, inbound mail, per-source provenance failures, < 3 words / < 10 chars,
   duplicate samples (sha256), and anything draft-like: sha256 match, a draft (≥4 tokens) contained in the text or the
   text contained in a draft, shingle Jaccard ≥ 0.8, or ≥ 80% of a draft's shingles inside the text.
-  **Generated drafts never reach the graph.** Required source provenance:
+  **Generated drafts never reach the graph.** Draft checks use an in-memory index per DB file (inverted shingle
+  index, synced incrementally from `drafts` on every check — so drafts written by any process count); verdicts are
+  identical to comparing against every draft. Required source provenance:
   gmail → `from_me=True` or `label`/`labels` containing `SENT` (`from_me=False` always rejects);
   watcher → `.mbox` items (`kind`/`format`="mbox" or `file`/`path` *.mbox) need `from_me=True`;
   wispr → `raw_transcript=True` (or `text_kind="raw"`); `formatted`/`edited`/`ai_edited`/`polished` = reject;
@@ -117,9 +121,14 @@ Learns from messages the user types and **sends** in allowlisted native apps.
 - `langgraph/ingest_graph.py` — LangGraph: `validate → firewall → extract → write_graph → record`. `validate` strips
   quoted reply chains and signatures (`ingestion/text.clean_message`); the cleaned text is what is checked, learned, stored.
 - `langgraph/generate_graph.py` — LangGraph: `capture → retrieve_constraints → build_prompt → generate → postprocess → record → score`.
-  `retrieve_constraints` also selects 2–3 few-shot excerpts from SQLite `samples` (`langgraph/examples.py`; never drafts).
+  `retrieve_constraints` also selects 2–3 few-shot excerpts from SQLite `samples` (`langgraph/examples.py`; never drafts;
+  memoized per persona/intent-length/constraints/samples-watermark, re-checked against drafts added since).
+  The system prompt is built as `(stable, volatile)` parts (`prompts.build_system_parts`): stable = style rules +
+  persona + content rules (the prompt-cache prefix), volatile = few-shot examples + destination-app hint.
   LLM failure raises `LLMFailedError`/`LLMTimeoutError` (→ 502/504), never a mock fallback.
-- `llm/client.py` — `LLM.complete(system, user) -> str`; `AnthropicLLM`, `MockLLM`.
+- `llm/client.py` — `LLM.complete(system, user) -> str`; `AnthropicLLM`, `MockLLM`. Clients with
+  `cache_system = True` (AnthropicLLM) receive `system` as the `(stable, volatile)` parts; others get one string.
+  `stop_reason == "refusal"` raises `LLMRefusal` (→ 502 `llm_failed`).
 - `evaluation/style_distance.py` — `score(text, baseline_texts, persona=None) -> ScoreBreakdown`; `score_draft(draft_id, runtime_or_db)` re-scores + persists. Features in `evaluation/features.py`, optional Qwen3 embedding in `evaluation/embeddings.py`, `python -m backend.evaluation.calibrate` prints sanity numbers.
 - `mcp_servers/` — FastMCP stdio servers: `graph_server.py` (tool `execute_read`, `get_constraints`), `gmail_outbound.py` (only `in:sent from:me`; inbound blocked), `wispr.py` (WebSocket client; falls back to local Wispr history), `file_watcher.py` (.txt, .mbox [only messages From: the user], SQLite dumps).
 - `daemon/server.py` — FastAPI app wiring everything (`create_app(runtime)`).
@@ -146,5 +155,8 @@ Implementation notes (backend core, additive — see `graph/queries.py`):
   expansions, opener_keys/opener_counts, transition_keys/transition_counts`).
 - Neo4j properties cannot be maps, so `persona_weights` is a list parallel to `personas`
   (`r.personas[i]` ↔ `r.persona_weights[i]`); `Word` likewise has `weight, personas, persona_counts`.
-- `get_constraints(persona)` blends the persona with all-persona data (see Constraints semantics above).
+- `get_constraints(persona)` blends the persona with all-persona data (see Constraints semantics above). Results are
+  cached per (persona, k) and the all-persona aggregate once for every persona; any write invalidates (a generation
+  counter keeps a computation that raced a write out of the cache). After an accepted ingest the server re-primes
+  the active persona's constraints in the background. Each Neo4j aggregate is read in one read transaction.
 - `IntentContext` also stores `opener_phrase_keys/opener_phrase_counts` (2–3 word openers).

@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
     polytone_model: str = "claude-sonnet-5-5"
     polytone_llm: str = ""  # "", "anthropic", "mock"
+    # output_config.effort for the real model: low | medium | high | xhigh | max ("" = API default)
+    polytone_effort: str = "low"
 
     neo4j_uri: str = "bolt://localhost:7687"
     neo4j_user: str = "neo4j"

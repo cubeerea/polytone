@@ -1,16 +1,36 @@
-"""LLM clients: ``LLM`` protocol, ``AnthropicLLM`` (real), ``MockLLM`` (deterministic, offline)."""
+"""LLM clients: ``LLM`` protocol, ``AnthropicLLM`` (real), ``MockLLM`` (deterministic, offline).
+
+``complete(system, user)`` takes the system prompt as one string, or — for clients that set
+``cache_system = True`` — as ``(stable, volatile)`` parts (``prompts.build_system_parts``).
+
+AnthropicLLM latency notes:
+- one ``anthropic.Anthropic`` client per process (built once with the Runtime), so the HTTPS
+  connection pool is reused across requests;
+- prompt caching: the stable part carries ``cache_control`` (the style rules only change on
+  ingest); the volatile part (few-shot examples, app hint) follows the breakpoint. Prefixes
+  under the model's minimum (512 tokens on claude-sonnet-5-5) silently don't cache — harmless;
+- ``output_config.effort`` defaults to ``low`` (``POLYTONE_EFFORT``): at ``medium`` and above the
+  model thinks before almost every reply, which adds seconds before the first token — too slow
+  for a hotkey rewrite under an 8s budget;
+- a single 6.5s attempt, no retries (Rust gives up at 8s).
+"""
 from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Sequence
 from typing import Any, Protocol, runtime_checkable
 
 log = logging.getLogger(__name__)
 
-DEFAULT_MAX_TOKENS = 1024
+DEFAULT_MAX_TOKENS = 2048  # headroom for (short) adaptive thinking; drafts themselves are short
 # Rust gives up at 8s; one 6.5s attempt keeps the whole loop inside that budget.
 DEFAULT_TIMEOUT_S = 6.5
 DEFAULT_MAX_RETRIES = 0
+DEFAULT_EFFORT = "low"
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+System = str | Sequence[str]
 
 
 @runtime_checkable
@@ -20,8 +40,17 @@ class LLM(Protocol):
     def complete(self, system: str, user: str) -> str: ...
 
 
+def join_system(system: System) -> str:
+    return system if isinstance(system, str) else "\n\n".join(p for p in system if p)
+
+
+class LLMRefusal(RuntimeError):
+    """The model declined (``stop_reason == "refusal"``)."""
+
+
 class AnthropicLLM:
     name = "anthropic"
+    cache_system = True  # accepts (stable, volatile) system parts
 
     def __init__(
         self,
@@ -31,6 +60,7 @@ class AnthropicLLM:
         max_tokens: int = DEFAULT_MAX_TOKENS,
         timeout: float = DEFAULT_TIMEOUT_S,
         max_retries: int = DEFAULT_MAX_RETRIES,
+        effort: str | None = DEFAULT_EFFORT,
         client: Any = None,
     ):
         if client is None:
@@ -40,14 +70,38 @@ class AnthropicLLM:
         self._client = client
         self.model = model
         self.max_tokens = max_tokens
+        self.effort = effort if effort in EFFORTS else None
 
-    def complete(self, system: str, user: str) -> str:
+    @staticmethod
+    def _system_param(system: System) -> Any:
+        if isinstance(system, str):
+            return system
+        stable, *rest = [p for p in system if p] or [""]
+        blocks: list[dict[str, Any]] = [{"type": "text", "text": stable, "cache_control": {"type": "ephemeral"}}]
+        blocks += [{"type": "text", "text": p} for p in rest]
+        return blocks
+
+    def complete(self, system: System, user: str) -> str:
+        kwargs: dict[str, Any] = {}
+        if self.effort:
+            kwargs["output_config"] = {"effort": self.effort}
         resp = self._client.messages.create(
             model=self.model,
             max_tokens=self.max_tokens,
-            system=system,
+            system=self._system_param(system),
             messages=[{"role": "user", "content": user}],
+            **kwargs,
         )
+        if getattr(resp, "stop_reason", None) == "refusal":
+            details = getattr(resp, "stop_details", None)
+            raise LLMRefusal(f"the model declined (category: {getattr(details, 'category', None) or 'unknown'})")
+        usage = getattr(resp, "usage", None)
+        if usage is not None:
+            log.debug(
+                "llm usage: input=%s cache_read=%s cache_write=%s output=%s",
+                getattr(usage, "input_tokens", None), getattr(usage, "cache_read_input_tokens", None),
+                getattr(usage, "cache_creation_input_tokens", None), getattr(usage, "output_tokens", None),
+            )
         return "".join(
             getattr(block, "text", "") for block in resp.content if getattr(block, "type", None) == "text"
         ).strip()
@@ -114,7 +168,8 @@ class MockLLM:
             return s[0].upper() + s[1:]
         return s[0].upper() + s[1:] + "."
 
-    def complete(self, system: str, user: str) -> str:
+    def complete(self, system: System, user: str) -> str:
+        system = join_system(system)
         self.calls.append((system, user))
         sents = [self._sentence(ln) for ln in self._intent_lines(user)]
         text = " ".join(sents)
@@ -137,7 +192,10 @@ class MockLLM:
 
 def get_llm(settings: Any) -> LLM:
     if settings.llm_backend == "anthropic" and settings.anthropic_api_key:
-        return AnthropicLLM(settings.anthropic_api_key, settings.polytone_model)
+        return AnthropicLLM(
+            settings.anthropic_api_key, settings.polytone_model,
+            effort=(getattr(settings, "polytone_effort", DEFAULT_EFFORT) or "").strip().lower() or None,
+        )
     if settings.llm_backend == "anthropic":
         log.warning("POLYTONE_LLM=anthropic but ANTHROPIC_API_KEY is empty; using MockLLM")
     return MockLLM()

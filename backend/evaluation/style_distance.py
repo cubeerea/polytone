@@ -118,21 +118,24 @@ def score(
     return _breakdown(combine(comps), comps, _confidence(base, tf.n_words))
 
 
+def baseline_texts(db: Any, persona: str | None, limit: int = 200) -> list[str]:
+    """The persona's most recent human samples, falling back to all samples when it has none."""
+    baseline = [s["text"] for s in db.list_samples(persona=persona, limit=limit)] if persona else []
+    return baseline or [s["text"] for s in db.list_samples(limit=limit)]
+
+
 def score_draft(draft_id: str, runtime_or_db: Any, *, limit: int = 200) -> dict[str, Any] | None:
     """(Re)score a stored draft against its persona's samples and persist the breakdown.
 
-    Accepts a ``Runtime`` (uses ``.db``) or a ``Database``. Mirrors the baseline selection of
-    ``generate_graph.score_draft`` (persona samples, falling back to all samples). Useful for
-    backfills; the live generate graph calls ``score(text, baseline)`` directly.
+    Accepts a ``Runtime`` (uses ``.db``) or a ``Database``. Same baseline as the live generate
+    graph (``baseline_texts``). Useful for backfills.
     """
     db = getattr(runtime_or_db, "db", runtime_or_db)
     draft = db.get_draft(draft_id)
     if not draft:
         return None
     persona = draft.get("persona") or None
-    baseline = [s["text"] for s in db.list_samples(persona=persona, limit=limit)]
-    if not baseline:
-        baseline = [s["text"] for s in db.list_samples(limit=limit)]
+    baseline = baseline_texts(db, persona, limit)
     if not baseline:
         return None
     try:

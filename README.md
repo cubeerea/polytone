@@ -137,12 +137,13 @@ vector. Each component is a 0–1 distance. The overall score is `100 × (1 − 
 `confidence` (low/medium/high) that reflects how many samples back it and how long the draft is.
 
 Scoring runs in a background thread, so it never delays a draft. The embedding model is warmed in the
-background when the backend starts. Run `uv run python -m backend.evaluation.calibrate` for sanity numbers.
+background when the backend starts (from the local Hugging Face cache, with no network round trips once it
+has been downloaded). Run `uv run python -m backend.evaluation.calibrate` for sanity numbers.
 
 ## Configuration
 
 `.env` (see `.env.example`): `ANTHROPIC_API_KEY`, `POLYTONE_MODEL` (default `claude-sonnet-5-5`),
-`POLYTONE_LLM` (`anthropic`/`mock`), `NEO4J_*`, `POLYTONE_API_PORT` (8765), `POLYTONE_DATA_DIR`,
+`POLYTONE_LLM` (`anthropic`/`mock`), `POLYTONE_EFFORT` (`low` default; higher = more thinking, slower drafts), `NEO4J_*`, `POLYTONE_API_PORT` (8765), `POLYTONE_DATA_DIR`,
 `POLYTONE_WATCH_DIR`, `POLYTONE_USER_EMAILS`, `POLYTONE_WISPR_LOCAL`, `POLYTONE_WATCHER`,
 `POLYTONE_EMBEDDINGS` (`qwen`/`none`), `GMAIL_*`, `WISPR_*`. App-side variables: `POLYTONE_REPO` (backend
 location for a bundled app) and `POLYTONE_START_HIDDEN=1` (start in the menu bar only; the window still opens when permissions are missing).
@@ -157,7 +158,17 @@ cd src-tauri && cargo test && cargo clippy --all-targets
 cargo test -- --ignored real_pasteboard   # optional: round-trips an image through the real macOS clipboard
 ```
 
-The Neo4j tests use unique `__pytest_*` personas and delete what they create.
+The Neo4j integration tests never touch your real graph: they skip unless you point them at a scratch container:
+`docker run -d --rm --name polytone-test -p 7688:7687 -e NEO4J_AUTH=neo4j/test-pass neo4j:5-community`, then
+`POLYTONE_TEST_NEO4J_URI=bolt://localhost:7688 uv run pytest -q`.
+
+Benchmarks (mock LLM, scratch SQLite, never touch `data/`):
+
+```bash
+uv run python scripts/bench_generate.py --http                 # per-node p50/p95 of POST /generate
+uv run python scripts/bench_generate.py --neo4j bolt://localhost:7688 --ingest-every 5   # scratch Neo4j (wiped!)
+uv run python scripts/bench_startup.py --embeddings qwen       # launch → /health, → embeddings warm (port 8775)
+```
 
 ## Troubleshooting
 

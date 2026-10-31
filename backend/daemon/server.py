@@ -2,6 +2,11 @@
 
 ``create_app(runtime=None)`` builds the app (tests pass an explicit Runtime);
 ``main()`` runs uvicorn on 127.0.0.1:settings.polytone_api_port.
+
+Startup: ``/health`` answers as soon as uvicorn is up. LangGraph (~0.3s of imports) is imported
+lazily by the routes that need it; one background thread (``_warm_up``) then compiles the
+generate graph, primes the active persona's constraints, starts the drop-folder watcher and
+finally loads the embedding model, so the first hotkey press pays for none of it.
 """
 from __future__ import annotations
 
@@ -17,9 +22,13 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
 from backend.config import get_settings
-from backend.ingestion.sources import PUSH_ONLY, SOURCES, ingest_typed, list_sources, run_source
-from backend.langgraph.generate_graph import GenerationError, run_generation
-from backend.langgraph.ingest_graph import run_ingest_batch
+from backend.ingestion.sources import (
+    PUSH_ONLY,
+    SOURCES,
+    ingest_typed,
+    list_sources,
+    run_source,
+)
 from backend.langgraph.prompts import PERSONAS
 from backend.runtime import Runtime, build_runtime, get_runtime, set_runtime
 
@@ -95,26 +104,31 @@ def _start_watcher(r: Runtime) -> Any:
         return None
 
 
-def _warm_embeddings(r: Runtime) -> threading.Thread | None:
-    """Load the Qwen embedding model in a daemon thread so the first draft's score isn't delayed.
-
-    Only when POLYTONE_EMBEDDINGS=qwen; never blocks startup and never raises.
-    """
+def _warm_embeddings(r: Runtime) -> None:
+    """Load the Qwen embedding model (+ one tiny encode) when POLYTONE_EMBEDDINGS=qwen. Never raises."""
     if (r.settings.polytone_embeddings or "").strip().lower() != "qwen":
-        return None
+        return
+    try:
+        from backend.evaluation import embeddings
 
-    def _load() -> None:
-        try:
-            from backend.evaluation import embeddings
+        if embeddings.warm_up():
+            log.info("embedding model warm (load %.1fs)", embeddings.load_seconds() or 0.0)
+    except Exception as e:  # noqa: BLE001 - optional component
+        log.warning("embedding warm-up failed: %s", e)
 
-            if embeddings.get_model() is not None:
-                log.info("embedding model warm (%.1fs)", embeddings.load_seconds() or 0.0)
-        except Exception as e:  # noqa: BLE001 - optional component
-            log.warning("embedding warm-up failed: %s", e)
 
-    t = threading.Thread(target=_load, name="polytone-embed-warmup", daemon=True)
-    t.start()
-    return t
+def _warm_up(r: Runtime, watcher: dict[str, Any], stopping: threading.Event) -> None:
+    """Background start-up work, cheapest-and-most-needed first (see module docstring)."""
+    try:
+        from backend.langgraph.generate_graph import warm
+
+        warm(r)
+    except Exception as e:  # noqa: BLE001
+        log.warning("generation warm-up failed: %s", e)
+    if not stopping.is_set():
+        watcher["t"] = _start_watcher(r)
+    if not stopping.is_set():
+        _warm_embeddings(r)
 
 
 def create_app(runtime: Runtime | None = None) -> FastAPI:
@@ -131,13 +145,18 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         log.info("graph store: %s, llm: %s", r.store.kind, r.llm.name)
         if r.store.kind != "neo4j":
             log.warning("Neo4j not in use — style graph is in-memory and will not persist")
-        watcher = _start_watcher(r)
-        _warm_embeddings(r)
+        watcher: dict[str, Any] = {}
+        stopping = threading.Event()
+        warm = threading.Thread(target=_warm_up, args=(r, watcher, stopping), name="polytone-warmup", daemon=True)
+        warm.start()
+        app.state.warmup = warm  # tests join it
         yield
-        if watcher is not None:
+        stopping.set()
+        warm.join(timeout=5)  # the watcher may still be starting; never wait on the embedding load
+        if watcher.get("t") is not None:
             from backend.mcp_servers.file_watcher import stop_watcher
 
-            stop_watcher(watcher)
+            stop_watcher(watcher["t"])
         if runtime is None:
             r.close()
 
@@ -168,6 +187,8 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
 
     @app.post("/generate", response_model=None)
     def generate(req: GenerateRequest) -> dict[str, Any] | JSONResponse:
+        from backend.langgraph.generate_graph import GenerationError, run_generation
+
         if not req.intent or not req.intent.strip():
             raise HTTPException(status_code=422, detail="intent is empty")
         try:
@@ -179,6 +200,8 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
 
     @app.post("/ingest/manual")
     def ingest_manual(req: IngestManualRequest) -> dict[str, Any]:
+        from backend.langgraph.ingest_graph import run_ingest_batch
+
         item = {"text": req.text, "provenance": {"source": "manual", "generated": False, "direction": "outbound"}}
         return run_ingest_batch([item], "manual", req.persona, runtime=rt())
 

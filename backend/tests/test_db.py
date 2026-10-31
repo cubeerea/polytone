@@ -1,6 +1,5 @@
 import threading
 
-from backend.storage import db as dbmod
 from backend.storage.db import DEFAULT_CONFIG, Database, sha256_text
 
 
@@ -47,24 +46,32 @@ def test_ingest_runs(db: Database):
     assert db.list_ingest_runs("wispr") == []
 
 
-def test_module_functions_and_threads(tmp_path):
-    dbmod.configure(tmp_path / "mod.sqlite3")
-    try:
-        assert dbmod.get_config()["active_persona"] == "Default"
-        dbmod.set_config(active_persona="Boss")
+def test_threads_share_one_database(tmp_path):
+    db = Database(tmp_path / "mod.sqlite3")
+    assert db.get_config()["active_persona"] == "Default"
+    db.set_config(active_persona="Boss")
 
-        def worker(i):
-            dbmod.insert_draft(persona="Boss", intent=str(i), text=f"draft {i}")
+    def worker(i):
+        db.insert_draft(persona="Boss", intent=str(i), text=f"draft {i}")
 
-        ts = [threading.Thread(target=worker, args=(i,)) for i in range(20)]
-        [t.start() for t in ts]
-        [t.join() for t in ts]
-        assert len(dbmod.list_drafts(100)) == 20
-        assert dbmod.get_config()["active_persona"] == "Boss"
-        assert dbmod.insert_sample(text="hi there", source="manual", persona="Boss")
-        assert dbmod.sample_exists(sha256_text("hi there"))
-        assert dbmod.list_samples(persona="Boss")[0]["text"] == "hi there"
-        dbmod.record_ingest_run(source="manual", started_at="t")
-        assert dbmod.list_ingest_runs()[0]["source"] == "manual"
-    finally:
-        dbmod._default = None
+    ts = [threading.Thread(target=worker, args=(i,)) for i in range(20)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert len(db.list_drafts(100)) == 20
+    # a second Database on the same file (another process, e.g. an MCP server) sees every write
+    other = Database(tmp_path / "mod.sqlite3")
+    assert other.draft_watermark()[0] == 20 and other.get_config()["active_persona"] == "Boss"
+    assert db.insert_sample(text="hi there", source="manual", persona="Boss")
+    assert other.sample_exists(sha256_text("hi there"))
+    assert other.list_samples(persona="Boss")[0]["text"] == "hi there"
+
+
+def test_draft_watermark_and_since(db: Database):
+    assert db.draft_watermark() == (0, 0) and db.drafts_since(0) == []
+    a = db.insert_draft(persona="P", intent="i", text="one two three")
+    db.insert_draft(persona="P", intent="i", text="four five six")
+    n, top = db.draft_watermark()
+    assert n == 2 and top >= 2
+    rows = db.drafts_since(0)
+    assert [r[2] for r in rows] == ["one two three", "four five six"] and rows[0][1] == a["sha256"]
+    assert [r[2] for r in db.drafts_since(rows[0][0])] == ["four five six"]

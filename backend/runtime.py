@@ -44,7 +44,8 @@ class Runtime:
     llm: LLM
     # None → look up backend.evaluation.style_distance.score at call time; False → disabled
     scorer: Scorer | None | bool = None
-    # run the score node in a background thread so it never delays /generate
+    # background work allowed (the server): the score node and constraint-cache priming run on a
+    # worker thread so they never delay /generate; tests keep everything synchronous
     score_async: bool = False
     _graphs: dict[str, Any] = field(default_factory=dict, repr=False)
     _executor: ThreadPoolExecutor | None = field(default=None, repr=False)
@@ -55,6 +56,14 @@ class Runtime:
         if callable(self.scorer):
             return self.scorer
         return load_scorer()
+
+    def prime_constraints(self) -> None:
+        """Compute (and cache) the active persona's constraints so the next /generate hits the cache."""
+        persona = self.db.get_config().get("active_persona") or "Default"
+        try:
+            self.store.get_constraints(persona)
+        except Exception as e:  # noqa: BLE001 - generation falls back to empty constraints anyway
+            log.warning("constraint warm-up failed: %s", e)
 
     def submit(self, fn: Callable[..., Any], *args: Any) -> None:
         if self._executor is None:

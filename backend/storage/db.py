@@ -11,18 +11,14 @@ Tables
 - ``draft_edits`` text the user sent right after a Polytone inject (typing capture with
                   ``after_inject=True``). NEVER learned from; kept for future edit learning.
 
-Usage
------
-Two equivalent styles are supported:
+Usage: ``Database(path)``; the process-wide instance lives on ``backend.runtime.Runtime.db``.
 
-* ``Database(path)`` instance methods (preferred for injection / tests), and
-* module-level plain functions (``get_config()``, ``insert_draft(...)`` ...) which
-  delegate to a process-wide default ``Database``. Call ``configure(path)`` to point
-  the default at a different file (tests do this with a temp path); otherwise it
-  uses ``get_settings().sqlite_path``.
-
-Thread-safety: every call opens its own short-lived connection (WAL mode), so the
-functions can be used from any thread (FastAPI threadpool, background scorers).
+Thread-safety: each thread keeps one persistent connection (``threading.local``), so methods
+can be called from any thread (FastAPI threadpool, background scorers) without paying a
+connect per call. WAL mode + ``synchronous=NORMAL``: readers never block the writer and a
+commit does not fsync (durable across app crashes; only an OS crash / power loss can drop
+the last few commits). SELECTs run in autocommit, so every read sees the latest commit,
+including writes from other processes (MCP servers).
 """
 from __future__ import annotations
 
@@ -87,7 +83,9 @@ CREATE TABLE IF NOT EXISTS samples (
     sha256 TEXT NOT NULL UNIQUE,
     provenance_json TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_samples_persona ON samples(persona);
+DROP INDEX IF EXISTS idx_samples_persona;
+CREATE INDEX IF NOT EXISTS idx_samples_persona_created ON samples(persona, created_at, id);
+CREATE INDEX IF NOT EXISTS idx_samples_created ON samples(created_at, id);
 CREATE INDEX IF NOT EXISTS idx_samples_source ON samples(source);
 CREATE TABLE IF NOT EXISTS ingest_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -98,7 +96,8 @@ CREATE TABLE IF NOT EXISTS ingest_runs (
     rejected INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'ok'
 );
-CREATE INDEX IF NOT EXISTS idx_runs_source ON ingest_runs(source);
+DROP INDEX IF EXISTS idx_runs_source;
+CREATE INDEX IF NOT EXISTS idx_runs_source_started ON ingest_runs(source, started_at);
 CREATE TABLE IF NOT EXISTS draft_edits (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at TEXT NOT NULL,
@@ -140,18 +139,32 @@ class Database:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._init_lock = threading.Lock()
+        self._local = threading.local()
         self._initialized = False
         self.init()
 
     # ------------------------------------------------------------------ plumbing
+    def _conn(self) -> sqlite3.Connection:
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(self.path, timeout=10)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA synchronous=NORMAL")
+            self._local.conn = conn
+        return conn
+
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
-        conn = sqlite3.connect(self.path, timeout=10)
-        conn.row_factory = sqlite3.Row
-        try:
-            with conn:  # commit / rollback
-                yield conn
-        finally:
+        """This thread's connection, inside a transaction (commit on success, rollback on error)."""
+        conn = self._conn()
+        with conn:
+            yield conn
+
+    def close(self) -> None:
+        """Close the calling thread's connection (others close when their thread / self is gc'd)."""
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            self._local.conn = None
             conn.close()
 
     def init(self) -> None:
@@ -300,7 +313,21 @@ class Database:
 
     def all_draft_texts(self) -> list[str]:
         with self.connect() as c:
-            return [r[0] for r in c.execute("SELECT text FROM drafts").fetchall()]
+            return [r[0] for r in c.execute("SELECT text FROM drafts ORDER BY rowid").fetchall()]
+
+    def draft_watermark(self) -> tuple[int, int]:
+        """``(row count, max rowid)`` of ``drafts`` — changes whenever a draft is added/removed."""
+        with self.connect() as c:
+            n, top = c.execute("SELECT COUNT(*), COALESCE(MAX(rowid), 0) FROM drafts").fetchone()
+        return int(n), int(top)
+
+    def drafts_since(self, rowid: int = 0) -> list[tuple[int, str, str]]:
+        """``(rowid, sha256, text)`` of drafts with ``rowid > rowid``, oldest first."""
+        with self.connect() as c:
+            rows = c.execute(
+                "SELECT rowid, sha256, text FROM drafts WHERE rowid > ? ORDER BY rowid", (int(rowid),)
+            ).fetchall()
+        return [(int(r[0]), r[1], r[2]) for r in rows]
 
     def draft_hashes(self) -> set[str]:
         with self.connect() as c:
@@ -378,6 +405,12 @@ class Database:
             for r in rows
         ]
 
+    def samples_watermark(self) -> tuple[int, int]:
+        """``(row count, max id)`` of ``samples`` — changes whenever a sample is added/removed."""
+        with self.connect() as c:
+            n, top = c.execute("SELECT COUNT(*), COALESCE(MAX(id), 0) FROM samples").fetchone()
+        return int(n), int(top)
+
     def sample_exists(self, sha: str) -> bool:
         with self.connect() as c:
             return c.execute("SELECT 1 FROM samples WHERE sha256 = ?", (sha,)).fetchone() is not None
@@ -421,78 +454,3 @@ class Database:
         args.append(int(limit))
         with self.connect() as c:
             return [dict(r) for r in c.execute(q, args).fetchall()]
-
-
-# ---------------------------------------------------------------------- module API
-_default: Database | None = None
-_default_lock = threading.Lock()
-
-
-def configure(path: str | Path | None = None) -> Database:
-    """(Re)point the module-level default database. ``None`` → settings.sqlite_path."""
-    global _default
-    if path is None:
-        from backend.config import get_settings
-
-        path = get_settings().sqlite_path
-    with _default_lock:
-        _default = Database(path)
-    return _default
-
-
-def get_db() -> Database:
-    if _default is None:
-        return configure()
-    return _default
-
-
-def get_config() -> dict[str, str]:
-    return get_db().get_config()
-
-
-def set_config(values: dict[str, Any] | None = None, **kwargs: Any) -> dict[str, str]:
-    return get_db().set_config(values, **kwargs)
-
-
-def insert_draft(**kwargs: Any) -> dict[str, Any]:
-    return get_db().insert_draft(**kwargs)
-
-
-def get_draft(draft_id: str) -> dict[str, Any] | None:
-    return get_db().get_draft(draft_id)
-
-
-def list_drafts(limit: int = 50, persona: str | None = None) -> list[dict[str, Any]]:
-    return get_db().list_drafts(limit, persona)
-
-
-def update_draft_score(draft_id: str, score: dict | None) -> None:
-    get_db().update_draft_score(draft_id, score)
-
-
-def all_draft_texts() -> list[str]:
-    return get_db().all_draft_texts()
-
-
-def draft_hashes() -> set[str]:
-    return get_db().draft_hashes()
-
-
-def insert_sample(**kwargs: Any) -> int | None:
-    return get_db().insert_sample(**kwargs)
-
-
-def list_samples(persona: str | None = None, limit: int | None = 200, source: str | None = None):
-    return get_db().list_samples(persona, limit, source)
-
-
-def sample_exists(sha: str) -> bool:
-    return get_db().sample_exists(sha)
-
-
-def record_ingest_run(**kwargs: Any) -> int:
-    return get_db().record_ingest_run(**kwargs)
-
-
-def list_ingest_runs(source: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
-    return get_db().list_ingest_runs(source, limit)

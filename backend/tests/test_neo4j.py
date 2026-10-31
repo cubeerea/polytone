@@ -1,8 +1,13 @@
-"""Integration tests against the live Neo4j container (docker compose up neo4j).
+"""Integration tests against a SCRATCH Neo4j — never the user's style graph.
+
+Opt-in: set POLYTONE_TEST_NEO4J_URI (and POLYTONE_TEST_NEO4J_PASSWORD), e.g. a throwaway
+`docker run -d --rm --name polytone-test -p 7688:7687 -e NEO4J_AUTH=neo4j/test-pass neo4j:5-community`.
+Without it these tests skip, even when the real graph on NEO4J_URI is up.
 
 Every test uses a unique persona and words prefixed with a unique token, and removes
 everything it created afterwards.
 """
+import os
 import time
 import uuid
 
@@ -18,7 +23,13 @@ pytestmark = pytest.mark.neo4j
 
 @pytest.fixture
 def neo():
-    s = Settings()
+    uri = os.environ.get("POLYTONE_TEST_NEO4J_URI")
+    if not uri:
+        pytest.skip("set POLYTONE_TEST_NEO4J_URI to a scratch Neo4j to run these")
+    s = Settings(
+        neo4j_uri=uri,
+        neo4j_password=os.environ.get("POLYTONE_TEST_NEO4J_PASSWORD", "test-pass"),
+    )
     store = Neo4jGraphStore.from_settings(s)
     if not store.healthy():
         store.close()

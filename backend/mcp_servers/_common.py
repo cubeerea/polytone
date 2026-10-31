@@ -14,8 +14,10 @@ from __future__ import annotations
 import html
 import os
 import re
+import threading
 from email.utils import getaddresses, parseaddr
 from html.parser import HTMLParser
+from pathlib import Path
 from typing import Any, TypedDict
 
 from backend.storage.db import Database
@@ -42,14 +44,24 @@ def make_server(name: str, instructions: str | None = None) -> Any:
 
 
 # --------------------------------------------------------------------------- state / config
+_dbs: dict[str, Database] = {}
+_dbs_lock = threading.Lock()
+
+
 def state_db(settings: Any) -> Database:
-    """The runtime's Database when ``settings`` belongs to the active runtime, else open the file."""
+    """The runtime's Database when ``settings`` belongs to the active runtime, else one cached
+    ``Database`` per file (opening one runs the schema script and holds per-thread connections)."""
     from backend import runtime as runtime_mod
 
     rt = runtime_mod._runtime
     if rt is not None and rt.settings is settings:
         return rt.db
-    return Database(settings.sqlite_path)
+    key = str(Path(settings.sqlite_path).resolve())
+    with _dbs_lock:
+        db = _dbs.get(key)
+        if db is None:
+            db = _dbs[key] = Database(settings.sqlite_path)
+        return db
 
 
 def get_state(db: Database, key: str, default: str | None = None) -> str | None:

@@ -25,8 +25,17 @@ string whenever ``ok`` is False, else None. Checks run in this order:
    - ≥ ``NEAR_DUP_THRESHOLD`` of a draft's shingles occur in the text (lightly edited draft
      pasted inside a longer message)
 
-``db`` is a ``backend.storage.db.Database`` (needs ``draft_hashes()``, ``all_draft_texts()``,
-``sample_exists(sha)``). Draft shingles are cached per draft-set.
+``db`` is a ``backend.storage.db.Database`` (needs ``draft_watermark()``, ``drafts_since(rowid)``,
+``sample_exists(sha)``).
+
+Draft index: per database file the normalized drafts, their shingles and an inverted index
+shingle → drafts are kept in memory and synced incrementally (one ``COUNT/MAX(rowid)`` query per
+check; only new rows are fetched; any deletion triggers a full rebuild), so the check never
+misses a draft written by another process. Only drafts sharing at least one shingle with the
+text are compared: every rule above implies a shared shingle (substring either way of ≥ 3
+tokens shares all its 3-grams; Jaccard / containment ≥ 0.8 need a non-empty intersection;
+texts under 3 tokens are a single shingle compared exactly), so the verdict is identical to a
+full scan — candidates are visited in insertion order, so the reason string is too.
 """
 from __future__ import annotations
 
@@ -96,27 +105,78 @@ def _norm(text: str) -> str:
     return " " + " ".join(tokenize(text)) + " "
 
 
+class DraftSnapshot:
+    """View of the first ``n`` indexed drafts. The index only ever appends to the structures a
+    snapshot references (a rebuild swaps in new ones), so it is safe to read without a lock."""
+
+    __slots__ = ("hash_pos", "n", "postings", "rows")
+
+    def __init__(self, rows: list, postings: dict, hash_pos: dict, n: int) -> None:
+        self.rows = rows  # (normalized text, token count, shingles, sha256), insertion order
+        self.postings = postings  # shingle -> [row positions], ascending
+        self.hash_pos = hash_pos  # sha256 -> first row position
+        self.n = n
+
+    def has_hash(self, sha: str, start: int = 0) -> bool:
+        if start:  # only drafts at positions >= start (few: those added since a cached check)
+            return any(self.rows[p][3] == sha for p in range(start, self.n))
+        pos = self.hash_pos.get(sha)
+        return pos is not None and pos < self.n
+
+    def candidates(self, sh: set, start: int = 0) -> list[int]:
+        found: set[int] = set()
+        for g in sh:
+            found.update(self.postings.get(g, ()))
+        return sorted(p for p in found if start <= p < self.n)
+
+
 class _DraftIndex:
-    """Normalized drafts + shingles, rebuilt only when the set of draft hashes changes."""
+    """One per database file; see the module docstring."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._key: tuple[int, frozenset[str]] | None = None
-        self._rows: list[tuple[str, int, set]] = []
+        self._reset()
 
-    def rows(self, db: Any, hashes: set[str]) -> list[tuple[str, int, set]]:
-        key = (id(db), frozenset(hashes))
+    def _reset(self) -> None:
+        self._mark: tuple[int, int] = (0, 0)  # (rows indexed, max rowid indexed)
+        self._rows: list[tuple[str, int, frozenset, str]] = []
+        self._postings: dict[tuple, list[int]] = {}
+        self._hash_pos: dict[str, int] = {}
+
+    def _add(self, sha: str, text: str) -> None:
+        norm = _norm(text)
+        sh = frozenset(shingles(text))
+        pos = len(self._rows)
+        self._rows.append((norm, norm.count(" ") - 1, sh, sha))
+        self._hash_pos.setdefault(sha, pos)
+        for g in sh:
+            self._postings.setdefault(g, []).append(pos)
+
+    def snapshot(self, db: Any) -> DraftSnapshot:
+        count, top = db.draft_watermark()
         with self._lock:
-            if key != self._key:
-                rows = []
-                for d in db.all_draft_texts():
-                    norm = _norm(d)
-                    rows.append((norm, norm.count(" ") - 1, shingles(d)))
-                self._rows, self._key = rows, key
-            return self._rows
+            if (count, top) != self._mark:
+                if count < self._mark[0] or top < self._mark[1]:  # drafts were deleted: rebuild
+                    self._reset()
+                new = db.drafts_since(self._mark[1])
+                for _, sha, text in new:
+                    self._add(sha, text)
+                self._mark = (len(self._rows), new[-1][0] if new else self._mark[1])
+            return DraftSnapshot(self._rows, self._postings, self._hash_pos, len(self._rows))
 
 
-_INDEX = _DraftIndex()
+_INDEXES: dict[str, _DraftIndex] = {}
+_INDEXES_LOCK = threading.Lock()
+
+
+def draft_snapshot(db: Any) -> DraftSnapshot:
+    """Current drafts of ``db`` (synced incrementally). Reuse one snapshot for many checks."""
+    key = str(getattr(db, "path", id(db)))
+    with _INDEXES_LOCK:
+        idx = _INDEXES.get(key)
+        if idx is None:
+            idx = _INDEXES[key] = _DraftIndex()
+    return idx.snapshot(db)
 
 
 def check(text: str, source: str, provenance: dict[str, Any] | None, db: Any) -> tuple[bool, str | None]:
@@ -142,18 +202,23 @@ def check(text: str, source: str, provenance: dict[str, Any] | None, db: Any) ->
     return True, None
 
 
-def draft_match_reason(text: str, db: Any, *, sha: str | None = None) -> str | None:
+def draft_match_reason(
+    text: str, db: Any, *, sha: str | None = None, snapshot: DraftSnapshot | None = None, start: int = 0
+) -> str | None:
     """Why ``text`` looks like a stored Polytone draft (exact, substring either way, near-dup,
-    or near-copy contained), or None. Used by ``check`` and by few-shot example selection."""
-    hashes = db.draft_hashes()
-    if not hashes:
+    or near-copy contained), or None. Used by ``check`` and by few-shot example selection
+    (which passes one ``snapshot`` for all its candidates, and ``start`` to re-check a cached
+    pick against only the drafts indexed at positions >= ``start``)."""
+    snap = snapshot if snapshot is not None else draft_snapshot(db)
+    if snap.n <= start:
         return None
-    if (sha or sha256_text(text)) in hashes:
+    if snap.has_hash(sha or sha256_text(text), start):
         return "matches a Polytone-generated draft"
     norm = _norm(text)
     n_toks = norm.count(" ") - 1
     sh = shingles(text)
-    for d_norm, d_len, d_sh in _INDEX.rows(db, hashes):
+    for pos in snap.candidates(sh, start):
+        d_norm, d_len, d_sh, _ = snap.rows[pos]
         if d_len >= SUBSTRING_MIN_TOKENS and d_norm in norm:
             return "contains a Polytone-generated draft"
         if n_toks >= SUBSTRING_MIN_TOKENS and norm in d_norm:
