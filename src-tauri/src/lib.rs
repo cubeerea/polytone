@@ -5,6 +5,7 @@ pub mod backend_process;
 pub mod keyboard_hooks;
 pub mod permissions;
 pub mod tray;
+pub mod typing_capture;
 
 use std::process::Child;
 use std::sync::Mutex;
@@ -65,6 +66,7 @@ pub async fn sync_from_backend_config(app: &AppHandle) {
         Ok(cfg) => {
             *app.state::<AppState>().inject_mode.lock().unwrap() = cfg.inject_mode.clone();
             tray::mark_persona(app, &cfg.active_persona);
+            typing_capture::apply_backend_config(app, &cfg);
             if !cfg.hotkey.trim().is_empty() {
                 let handle = app.clone();
                 let accel = cfg.hotkey.clone();
@@ -140,6 +142,9 @@ pub fn run() {
             keyboard_hooks::trigger_now,
             permissions::check_permissions,
             permissions::open_permission_settings,
+            typing_capture::set_capture,
+            typing_capture::get_capture_status,
+            typing_capture::list_running_apps,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

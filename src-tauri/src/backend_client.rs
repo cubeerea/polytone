@@ -57,6 +57,33 @@ pub struct BackendConfig {
     pub hotkey: String,
     #[serde(default)]
     pub inject_mode: InjectMode,
+    /// Typing capture opt-in (source "typed"). `None` = backend didn't say; never sent back
+    /// as null, so a PUT from this struct can't clobber it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_enabled: Option<bool>,
+    /// Bundle ids typing capture listens to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_apps: Option<Vec<String>>,
+}
+
+/// `POST /ingest/typed` body (CONTRACTS.md "Typing capture").
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct TypedIngestRequest {
+    pub text: String,
+    pub app: String,
+    pub app_name: Option<String>,
+    pub after_inject: bool,
+}
+
+/// `IngestResult` (only the counts are used on the Rust side).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct IngestResult {
+    #[serde(default)]
+    pub accepted: u32,
+    #[serde(default)]
+    pub rejected: u32,
+    #[serde(default)]
+    pub reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,6 +228,19 @@ impl BackendClient {
         Ok(Self::check(resp).await?.json().await?)
     }
 
+    pub async fn ingest_typed(
+        &self,
+        req: &TypedIngestRequest,
+    ) -> Result<IngestResult, BackendError> {
+        let resp = self
+            .http
+            .post(self.url("/ingest/typed"))
+            .json(req)
+            .send()
+            .await?;
+        Ok(Self::check(resp).await?.json().await?)
+    }
+
     /// GET /config, apply `f`, PUT it back.
     pub async fn update_config(
         &self,
@@ -228,6 +268,38 @@ mod tests {
         assert_eq!(cfg.inject_mode, InjectMode::Type);
         let s = serde_json::to_string(&cfg).unwrap();
         assert!(s.contains(r#""inject_mode":"type""#));
+    }
+
+    #[test]
+    fn config_capture_fields_are_optional_and_not_clobbered() {
+        let cfg: BackendConfig =
+            serde_json::from_str(r#"{"active_persona":"Boss","hotkey":"X"}"#).unwrap();
+        assert_eq!(cfg.capture_enabled, None);
+        let v = serde_json::to_value(&cfg).unwrap();
+        assert!(v.get("capture_enabled").is_none() && v.get("capture_apps").is_none());
+        let cfg: BackendConfig = serde_json::from_str(
+            r#"{"active_persona":"Boss","hotkey":"X","capture_enabled":true,"capture_apps":["com.apple.mail"]}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.capture_enabled, Some(true));
+        assert_eq!(
+            cfg.capture_apps.as_deref(),
+            Some(&["com.apple.mail".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn typed_request_shape() {
+        let r = TypedIngestRequest {
+            text: "hi there you".into(),
+            app: "com.apple.mail".into(),
+            app_name: None,
+            after_inject: true,
+        };
+        assert_eq!(
+            serde_json::to_value(&r).unwrap(),
+            serde_json::json!({"text":"hi there you","app":"com.apple.mail","app_name":null,"after_inject":true})
+        );
     }
 
     #[test]

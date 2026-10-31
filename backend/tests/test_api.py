@@ -111,7 +111,7 @@ def test_firewall_rejects_resubmitted_draft(client, runtime):
 
 def test_sources_list_and_run(client, monkeypatch):
     srcs = client.get("/ingest/sources").json()
-    assert [s["name"] for s in srcs] == ["manual", "gmail", "wispr", "watcher"]
+    assert [s["name"] for s in srcs] == ["manual", "gmail", "wispr", "watcher", "typed"]
     for s in srcs:
         assert set(s) == {"name", "enabled", "status", "last_run", "items_ingested"}
     assert srcs[0]["enabled"] is True
@@ -155,10 +155,13 @@ def test_personas(client):
 
 
 def test_config(client):
+    from backend.storage.db import DEFAULT_CAPTURE_APPS
+
+    cap = {"capture_enabled": False, "capture_apps": DEFAULT_CAPTURE_APPS}
     assert client.get("/config").json() == {
-        "active_persona": "Default", "hotkey": "CmdOrCtrl+Shift+P", "inject_mode": "paste"}
+        "active_persona": "Default", "hotkey": "CmdOrCtrl+Shift+P", "inject_mode": "paste", **cap}
     r = client.put("/config", json={"active_persona": "Boss", "hotkey": "Alt+P", "inject_mode": "type"})
-    assert r.json() == {"active_persona": "Boss", "hotkey": "Alt+P", "inject_mode": "type"}
+    assert r.json() == {"active_persona": "Boss", "hotkey": "Alt+P", "inject_mode": "type", **cap}
     assert client.put("/config", json={"inject_mode": "telepathy"}).status_code == 422
     assert client.put("/config", json={"inject_mode": "paste"}).json()["active_persona"] == "Boss"
     assert client.post("/generate", json={"intent": "hi"}).json()["persona"] == "Boss"
