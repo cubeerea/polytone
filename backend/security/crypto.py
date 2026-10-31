@@ -44,6 +44,10 @@ class DecryptError(ValueError):
     """Ciphertext is malformed, was made with another key, or belongs to another context."""
 
 
+class KeyMismatch(DecryptError):
+    """Stored data was encrypted with a different master key than the one in use."""
+
+
 @lru_cache(maxsize=1)
 def _aead() -> AESGCM:
     return AESGCM(subkey("enc"))

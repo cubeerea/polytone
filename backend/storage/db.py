@@ -228,10 +228,33 @@ class Database:
                 c.executescript(_SCHEMA)
                 for k, v in DEFAULT_CONFIG.items():
                     c.execute("INSERT OR IGNORE INTO config(k, v) VALUES (?, ?)", (k, v))
+            self._check_key()  # before migrating: never encrypt legacy rows with the wrong key
             self.migration = self._migrate_plaintext()
             self._initialized = True
 
     # ------------------------------------------------------------------ encryption migration
+    def _check_key(self) -> None:
+        """Refuse to open a database whose rows were encrypted with another data key (Keychain
+        item lost or replaced, wrong ``POLYTONE_DATA_KEY``). Without this the backend starts,
+        every read of old rows fails, and new rows are written under the new key — a database
+        no single key can read. Probes the newest ``enc1:`` value of each table."""
+        conn = self._conn()
+        for table, cols in ENC_COLUMNS.items():
+            col = cols[0]
+            row = conn.execute(
+                f"SELECT {col} FROM {table} WHERE substr({col}, 1, 5) = 'enc1:' ORDER BY rowid DESC LIMIT 1"
+            ).fetchone()
+            if row is None:
+                continue
+            try:
+                crypto.decrypt(row[0], f"{table}.{col}")
+            except crypto.DecryptError as e:
+                raise crypto.KeyMismatch(
+                    f"{self.path.name}: {table}.{col} does not decrypt with the current data key "
+                    "(was the Keychain item com.polytone.app/data-key-v1 replaced, or POLYTONE_DATA_KEY "
+                    "changed?). Refusing to start so no data is written under the wrong key."
+                ) from e
+
     def _migrate_plaintext(self) -> dict[str, int]:
         """Encrypt every plaintext user-text value and turn plain sha256 hashes into blind
         indexes. Idempotent: ``enc1:``/``idx1:`` values are skipped, so a run that finds nothing

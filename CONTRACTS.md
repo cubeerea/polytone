@@ -260,7 +260,8 @@ an attacker running as the same user with the Polytone window unlocked, or root.
 - Decryption is memoized in process memory (bounded LRU keyed by ciphertext, plus the graph store's
   key→word map), so the hot path does not decrypt per request. A legacy plaintext value read after the
   migration (written by an older build) is returned as is and encrypted at the next start; a corrupt or
-  wrong-key `enc1:` value raises.
+  wrong-key `enc1:` value raises. `Database.init` probes the newest `enc1:` value of each table and refuses to
+  start (`KeyMismatch`) when it does not decrypt, so a replaced key never writes rows under a second key.
 - Migration runs at every start (`Database.init`, `connect_graph_store`) and is a no-op once done:
   idempotent (already-`enc1:`/`idx1:` values skipped), one transaction per table (two legacy samples whose
   stripped text collides are deduped) then `VACUUM` + `wal_checkpoint(TRUNCATE)` so plaintext pages don't
