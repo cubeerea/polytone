@@ -36,6 +36,15 @@ case "$OLD" in *"'"*|*"\\"*) die "the current password contains a quote or backs
 NEW="$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32 || true)"
 [ "${#NEW}" -eq 32 ] || die "could not generate a random password"
 
+# Keep the new password on disk (0600) until .env holds it: if Neo4j applies the change but we
+# never hear back (exec dies after the commit, Ctrl-C, a crash before the rename), the password
+# is recoverable instead of unknown.
+PENDING="$ENV_FILE.neo4j-password-pending"
+[ ! -e "$PENDING" ] || die "$PENDING exists: an earlier rotation's outcome is unknown. If Neo4j accepts
+  the password in it, put it in $ENV_FILE as NEO4J_PASSWORD; then delete the file and run this again."
+(umask 077; printf '%s\n' "$NEW" >"$PENDING")
+chmod 600 "$PENDING"
+
 say "changing the Neo4j password in the running '$SERVICE' container"
 # Statement on stdin and the old password in the environment (-e NAME without a value copies it
 # from this process), so neither password shows up in `ps` on the host.
@@ -43,6 +52,7 @@ if ! out="$(cd "$COMPOSE_DIR" && printf "ALTER CURRENT USER SET PASSWORD FROM '%
       NEO4J_PASSWORD="$OLD" docker compose exec -T -e NEO4J_PASSWORD "$SERVICE" \
         cypher-shell -u "$DB_USER" -d system --non-interactive 2>&1)"; then
   err "Neo4j rejected the change; .env was NOT modified."
+  err "(if Neo4j did apply it anyway, the new password is in $PENDING)"
   printf '%s\n' "$out" | sed 's/^/    /' >&2
   case "$out" in
     *"is not running"*|*"No such service"*|*"no container"*) err "is the container up? try: docker compose up -d --wait" ;;
@@ -63,9 +73,10 @@ fi
 chmod 600 "$tmp"
 if ! mv -f "$tmp" "$ENV_FILE"; then
   err "Neo4j now uses a NEW password but $ENV_FILE could not be updated."
-  err "Set NEO4J_PASSWORD=$NEW in $ENV_FILE by hand."
+  err "Set NEO4J_PASSWORD to the password in $PENDING in $ENV_FILE by hand."
   exit 1
 fi
 trap - EXIT
 chmod 600 "$ENV_FILE"
+rm -f "$PENDING"
 say "Neo4j password rotated; $ENV_FILE updated (0600). Restart the backend to use it."

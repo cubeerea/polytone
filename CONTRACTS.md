@@ -344,7 +344,9 @@ an attacker running as the same user with the Polytone window unlocked, or root.
 - Neo4j password: `scripts/rotate-neo4j-password.sh` generates a random 32-char one, applies it in the
   running container (`docker compose exec -T -e NEO4J_PASSWORD neo4j cypher-shell -u neo4j -d system`,
   the `ALTER CURRENT USER SET PASSWORD FROM … TO …` statement on stdin so neither password is in argv),
-  and only after that succeeds rewrites `NEO4J_PASSWORD` in `.env` (atomic, 0600). `dev.sh` runs it when
+  and only after that succeeds rewrites `NEO4J_PASSWORD` in `.env` (atomic, 0600). Until then the new
+  password sits in `.env.neo4j-password-pending` (0600), so an unknown outcome (exec dies after the commit,
+  Ctrl-C) never loses it; the script refuses to run while that file exists. `dev.sh` runs it when
   `.env` still has the default (or no `NEO4J_PASSWORD`). `docker-compose.yml` takes the initial
   `NEO4J_AUTH` password from `.env` (`${NEO4J_PASSWORD:-polytone-local}`; Neo4j only reads it on first init).
 
