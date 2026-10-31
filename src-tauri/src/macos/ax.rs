@@ -182,6 +182,6 @@ mod tests {
     fn system_wide_element_exists() {
         // Creating the element needs no permission; queries through it may fail without one.
         assert!(Element::system_wide(0.1).is_some());
-        let _ = focused_selection(); // must not panic or hang without Accessibility
+        let _ = focused_selection(None); // must not panic or hang without Accessibility
     }
 }
