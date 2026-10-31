@@ -47,6 +47,33 @@ def test_host_header_checked(client):
     assert client.get("/drafts", headers={"host": "localhost:8765"}).status_code == 200
 
 
+def test_duplicate_host_header_rejected(client):
+    """Two Host headers are ambiguous (last one used to win): refuse, whatever their order."""
+    import asyncio
+
+    from backend.security.auth import AuthMiddleware
+
+    reached: list[str] = []
+
+    async def app(scope, receive, send):
+        reached.append(scope["path"])
+
+    mw = AuthMiddleware(app, client.app.state.auth)
+    good = b"127.0.0.1:8765"
+    for hosts in ([b"evil.example", good], [good, b"evil.example"], [good, good]):
+        sent: list[dict] = []
+
+        async def send(m, sent=sent):
+            sent.append(m)
+
+        headers = [(b"host", h) for h in hosts] + [(b"authorization", f"Bearer {TEST_APP_TOKEN}".encode())]
+        scope = {"type": "http", "method": "GET", "path": "/config", "headers": headers}
+        asyncio.run(mw(scope, None, send))
+        assert sent[0]["status"] == 403, hosts
+    assert reached == []
+    assert client.get("/config", headers={"host": "127.0.0.1:8765"}).status_code == 200
+
+
 def test_401_carries_cors_headers(anon):
     r = anon.get("/drafts", headers={"Origin": "http://localhost:1420"})
     assert r.status_code == 401 and r.headers["access-control-allow-origin"] == "http://localhost:1420"

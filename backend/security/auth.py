@@ -201,11 +201,15 @@ class AuthMiddleware:
             await self.app(scope, receive, send)
             return
         host = authz = None
+        hosts = 0
         for k, v in scope.get("headers") or ():
             if k == b"host":
                 host = v.decode("latin-1")
+                hosts += 1
             elif k == b"authorization":
                 authz = v.decode("latin-1")
+        if hosts > 1:  # ambiguous: a proxy and this server might each read a different one
+            host = None
         method, path = scope["method"], scope["path"]
         if not self.auth.host_ok(host):
             self.auth.denied(method, path, "host")
