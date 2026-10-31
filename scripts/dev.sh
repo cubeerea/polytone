@@ -23,6 +23,7 @@ done
 [ -d node_modules ] || { say "installing JS deps"; pnpm install; }
 [ -d .venv ] || { say "installing Python deps"; uv sync --extra embeddings --extra gmail; }
 [ -f .env ] || { say "creating .env from .env.example"; cp .env.example .env; }
+chmod 600 .env  # holds secrets (Neo4j password, maybe the Anthropic key)
 
 # 2. Neo4j. Without it the backend falls back to an empty in-memory graph.
 if command -v docker >/dev/null; then
@@ -34,6 +35,12 @@ if command -v docker >/dev/null; then
   if docker info >/dev/null 2>&1; then
     docker compose up -d --wait >/dev/null 2>&1 || docker compose up -d
     say "neo4j up"
+    # still on the shipped default password? replace it with a random one (updates .env, 0600)
+    if ! grep -q '^[[:space:]]*NEO4J_PASSWORD[[:space:]]*=' .env \
+       || grep -Eq '^[[:space:]]*NEO4J_PASSWORD[[:space:]]*=[[:space:]]*["'"'"']?polytone-local["'"'"']?[[:space:]]*$' .env; then
+      say "rotating the default Neo4j password"
+      bash scripts/rotate-neo4j-password.sh || warn "Neo4j password not rotated (see above); still using the default"
+    fi
   else
     warn "Docker isn't running: the style graph will be in-memory (nothing learned is kept)"
   fi

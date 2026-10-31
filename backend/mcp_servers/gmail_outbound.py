@@ -72,11 +72,37 @@ def load_credentials(settings: Any) -> Any | None:
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
 
+    from backend.security.tls import requests_session
+
     creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
     if not creds.valid and creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-        token_path.write_text(creds.to_json())
+        creds.refresh(Request(session=requests_session()))  # TLS 1.3 minimum
+        _write_token(token_path, creds.to_json())
     return creds if creds.valid else None
+
+
+def _write_token(path: Path, data: str) -> None:
+    """Write the OAuth token atomically with mode 0600 (it is a bearer credential)."""
+    import os
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(data)
+    os.replace(tmp, path)
+    path.chmod(0o600)
+
+
+def authorized_http(creds: Any, cafile: str | None = None) -> Any:
+    """googleapiclient transport: ``AuthorizedHttp`` over an ``httplib2.Http`` that refuses
+    anything below TLS 1.3 (API calls, the discovery document, and the token refreshes
+    ``AuthorizedHttp`` does itself all use that ``Http``)."""
+    import google_auth_httplib2
+
+    from backend.security.tls import httplib2_http
+
+    return google_auth_httplib2.AuthorizedHttp(creds, http=httplib2_http(cafile=cafile))
 
 
 def authorize(settings: Any, port: int = 0) -> Path:
@@ -89,11 +115,12 @@ def authorize(settings: Any, port: int = 0) -> Path:
         )
     from google_auth_oauthlib.flow import InstalledAppFlow
 
+    from backend.security.tls import mount_tls13
+
     flow = InstalledAppFlow.from_client_secrets_file(str(creds_path), SCOPES)
+    mount_tls13(flow.oauth2session)  # the code → token exchange: TLS 1.3 minimum
     creds = flow.run_local_server(port=port, open_browser=True)
-    token_path.parent.mkdir(parents=True, exist_ok=True)
-    token_path.write_text(creds.to_json())
-    token_path.chmod(0o600)
+    _write_token(token_path, creds.to_json())
     return token_path
 
 
@@ -103,7 +130,7 @@ def build_service(settings: Any) -> Any | None:
         return None
     from googleapiclient.discovery import build
 
-    return build("gmail", "v1", credentials=creds, cache_discovery=False)
+    return build("gmail", "v1", http=authorized_http(creds), cache_discovery=False)
 
 
 # --------------------------------------------------------------------------- message parsing

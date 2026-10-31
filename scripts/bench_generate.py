@@ -27,6 +27,10 @@ os.environ["POLYTONE_LLM"] = "mock"
 os.environ["POLYTONE_EMBEDDINGS"] = "none"
 os.environ["ANTHROPIC_API_KEY"] = ""
 os.environ.setdefault("POLYTONE_WATCHER", "0")
+os.environ.setdefault("POLYTONE_WISPR_LIVE", "0")
+os.environ.setdefault("WISPR_HISTORY_DIRS", "/nonexistent")
+# throwaway data key: a benchmark never reads or creates the real Keychain item
+os.environ["POLYTONE_DATA_KEY"] = __import__("base64").b64encode(os.urandom(32)).decode()
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -168,7 +172,12 @@ def main() -> None:
 
         from backend.daemon.server import create_app
 
-        with TestClient(create_app(rt)) as c:
+        app = create_app(rt)
+        with TestClient(
+            app,
+            base_url=f"http://127.0.0.1:{settings.polytone_api_port}",  # the Host check wants loopback
+            headers={"Authorization": f"Bearer {app.state.auth.app_token}"},
+        ) as c:
             for i in range(args.warmup + args.runs):
                 t0 = time.perf_counter()
                 r = c.post("/generate", json={"intent": INTENTS[i % 5], "persona": _PERSONAS[i % 4]})

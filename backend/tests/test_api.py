@@ -22,18 +22,16 @@ def test_health(client):
 
 def test_health_reports_unusable_llm(tmp_path):
     """POLYTONE_LLM=anthropic without a key: /health says so, /generate answers 502."""
-    from fastapi.testclient import TestClient
-
     from backend.config import Settings
-    from backend.daemon.server import create_app
     from backend.graph.store import InMemoryGraphStore
     from backend.llm.client import MockLLM
     from backend.runtime import build_runtime
+    from backend.tests.conftest import api_client
 
     s = Settings(polytone_data_dir=tmp_path, polytone_llm="anthropic", anthropic_api_key="",
                  polytone_embeddings="none", polytone_watch_dir=tmp_path / "inbox")
     rt = build_runtime(s, db_path=tmp_path / "x.sqlite3", store=InMemoryGraphStore(), llm=MockLLM(), scorer=False)
-    with TestClient(create_app(rt)) as c:
+    with api_client(rt) as c:
         body = c.get("/health").json()
         assert body["llm"] == "anthropic" and body["llm_ready"] is False
         r = c.post("/generate", json={"intent": "hello there friend", "persona": None, "app_context": None})
@@ -157,7 +155,7 @@ def test_personas(client):
 def test_config(client):
     from backend.storage.db import DEFAULT_CAPTURE_APPS
 
-    cap = {"capture_enabled": False, "capture_apps": DEFAULT_CAPTURE_APPS}
+    cap = {"capture_enabled": False, "capture_apps": DEFAULT_CAPTURE_APPS, "lock_idle_minutes": 15, "retention_days": 0}
     assert client.get("/config").json() == {
         "active_persona": "Default", "hotkey": "CmdOrCtrl+Shift+P", "inject_mode": "paste", **cap}
     r = client.put("/config", json={"active_persona": "Boss", "hotkey": "Alt+P", "inject_mode": "type"})
@@ -180,10 +178,9 @@ def test_scores_summary(client, runtime):
 
 
 def test_warmup_is_background_and_optional(runtime, monkeypatch):
-    from fastapi.testclient import TestClient
-
     from backend.daemon import server
     from backend.evaluation import embeddings
+    from backend.tests.conftest import api_client
 
     started = []
 
@@ -197,7 +194,7 @@ def test_warmup_is_background_and_optional(runtime, monkeypatch):
     assert started == []
     runtime.settings.polytone_embeddings = "qwen"
     t0 = time.perf_counter()
-    with TestClient(server.create_app(runtime)) as c:
+    with api_client(runtime) as c:
         assert c.get("/health").status_code == 200
         assert time.perf_counter() - t0 < 0.4  # /health never waits for the embedding model
         warm = c.app.state.warmup

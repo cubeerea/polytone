@@ -16,9 +16,9 @@ string whenever ``ok`` is False, else None. Checks run in this order:
    - typed:   text the user typed and sent in a native app (typing capture) — needs
               ``typed=True``; ``after_inject=True`` (sent right after a Polytone inject) rejects
 5. too short (< ``MIN_TOKENS`` word tokens or < ``MIN_CHARS`` characters)
-6. duplicate of an existing sample (sha256)                       → "duplicate sample"
+6. duplicate of an existing sample (blind index)                   → "duplicate sample"
 7. stored-draft checks (drafts NEVER reach the graph):
-   - sha256 equal to a draft
+   - blind index (keyed hash) equal to a draft
    - a draft (≥ ``SUBSTRING_MIN_TOKENS`` tokens) contained in the text, or the text
      contained in a draft — compared on normalized token strings
    - 3-word shingle Jaccard ≥ ``NEAR_DUP_THRESHOLD`` with a draft
@@ -43,7 +43,7 @@ import threading
 from typing import Any
 
 from backend.ingestion.text import containment, jaccard, shingles, tokenize
-from backend.storage.db import sha256_text
+from backend.storage.db import text_index
 
 NEAR_DUP_THRESHOLD = 0.8
 MIN_TOKENS = 3
@@ -193,7 +193,7 @@ def check(text: str, source: str, provenance: dict[str, Any] | None, db: Any) ->
     toks = tokenize(text)
     if len(toks) < MIN_TOKENS or len(text.strip()) < MIN_CHARS:
         return False, f"too short to learn from (need ≥ {MIN_TOKENS} words and ≥ {MIN_CHARS} characters)"
-    sha = sha256_text(text)
+    sha = text_index(text)
     if db.sample_exists(sha):
         return False, "duplicate sample"
     reason = draft_match_reason(text, db, sha=sha)
@@ -212,7 +212,7 @@ def draft_match_reason(
     snap = snapshot if snapshot is not None else draft_snapshot(db)
     if snap.n <= start:
         return None
-    if snap.has_hash(sha or sha256_text(text), start):
+    if snap.has_hash(sha or text_index(text), start):
         return "matches a Polytone-generated draft"
     norm = _norm(text)
     n_toks = norm.count(" ") - 1

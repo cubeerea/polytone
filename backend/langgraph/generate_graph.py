@@ -134,12 +134,12 @@ def build_generate_graph(rt: Runtime):
             c = rt.store.get_constraints(state["persona"])
             out: GenState = {"constraints": dict(c), "constraints_source": "graph"}
         except Exception as e:  # noqa: BLE001 - graph trouble must never break generation
-            log.warning("constraint retrieval failed (%s); using empty constraints", e)
+            log.warning("constraint retrieval failed (%s); using empty constraints", type(e).__name__)
             out = {"constraints": dict(empty_constraints()), "constraints_source": "fallback"}
         try:
             out["examples"] = select_examples(rt.db, state["persona"], state["intent"], out["constraints"])
         except Exception as e:  # noqa: BLE001 - examples are an optional boost
-            log.warning("few-shot example selection failed: %s", e)
+            log.warning("few-shot example selection failed: %s", type(e).__name__)
             out["examples"] = []
         return out
 
@@ -230,7 +230,7 @@ def score_draft(rt: Runtime, draft_id: str, text: str, persona: str) -> dict | N
         rt.db.update_draft_score(draft_id, result)
         return result
     except Exception as e:  # noqa: BLE001 - scoring is best-effort
-        log.warning("scoring draft %s failed: %s", draft_id, e)
+        log.warning("scoring draft %s failed: %s", draft_id, type(e).__name__)
         return None
 
 

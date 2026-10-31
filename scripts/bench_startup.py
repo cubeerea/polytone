@@ -5,12 +5,13 @@
     uv run python scripts/bench_startup.py --embeddings qwen --runs 3
 
 Runs the real ``backend.daemon.server:main`` on ``--port`` (default 8775, never the user's 8765)
-with a scratch data dir, the mock LLM and the file watcher off. Neo4j is only read (``/health``),
-but point ``--neo4j`` at a scratch container anyway.
+with a scratch data dir, a throwaway data key, the mock LLM and the file watcher off. Point
+``--neo4j`` only at a scratch container: startup encrypts a plaintext graph in place (:7687 is refused).
 """
 from __future__ import annotations
 
 import argparse
+import base64
 import os
 import statistics
 import subprocess
@@ -37,6 +38,11 @@ def one_run(args: argparse.Namespace) -> tuple[float | None, float | None, list[
         "NEO4J_URI": args.neo4j,
         "NEO4J_PASSWORD": args.neo4j_password,
         "PYTHONUNBUFFERED": "1",
+        # throwaway data key: never read / create the real Keychain item from a benchmark
+        "POLYTONE_DATA_KEY": base64.b64encode(os.urandom(32)).decode(),
+        "POLYTONE_API_TOKEN": base64.urlsafe_b64encode(os.urandom(32)).decode(),
+        "WISPR_HISTORY_DIRS": "/nonexistent",
+        "POLYTONE_WISPR_LIVE": "0",
     }
     env.pop("POLYTONE_PARENT_PID", None)
     t0 = time.perf_counter()
@@ -86,6 +92,8 @@ def main() -> None:
     ap.add_argument("--timeout", type=float, default=90)
     ap.add_argument("--show-log", action="store_true")
     args = ap.parse_args()
+    if args.neo4j.rstrip("/").endswith(":7687"):
+        sys.exit("refusing :7687 — the backend migrates the graph at start; that is the user's real style graph")
     if args.port == 8765:
         sys.exit("refusing to use 8765 — the user's backend may be listening there")
     hs, ws = [], []

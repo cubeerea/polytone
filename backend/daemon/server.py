@@ -7,6 +7,11 @@ Startup: ``/health`` answers as soon as uvicorn is up. LangGraph (~0.3s of impor
 lazily by the routes that need it; one background thread (``_warm_up``) then compiles the
 generate graph, primes the active persona's constraints, starts the drop-folder watcher and the
 live Wispr Flow watcher (``mcp_servers/wispr_live.py``) and finally loads the embedding model, so the first hotkey press pays for none of it.
+
+Security (CONTRACTS.md → Security): every route except ``GET /health`` needs a bearer token
+(``security/auth.py``: the app token Rust holds, or a UI session from ``POST /session``), the Host
+header must be loopback, and security-relevant actions are written to the audit log
+(``security/audit.py``). A retention task purges old typed/wispr samples and drafts daily.
 """
 from __future__ import annotations
 
@@ -17,12 +22,12 @@ import threading
 from contextlib import asynccontextmanager
 from typing import Any, Literal
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
-from backend.config import get_settings
+from backend.config import REPO_ROOT, get_settings
 from backend.ingestion.sources import (
     PUSH_ONLY,
     SOURCES,
@@ -32,6 +37,14 @@ from backend.ingestion.sources import (
 )
 from backend.langgraph.prompts import PERSONAS
 from backend.runtime import Runtime, build_runtime, get_runtime, set_runtime
+from backend.security import files as file_hygiene
+from backend.security import retention
+from backend.security.auth import (
+    MAX_IDLE_MINUTES,
+    MIN_IDLE_MINUTES,
+    AuthManager,
+    AuthMiddleware,
+)
 
 log = logging.getLogger("polytone.api")
 
@@ -62,6 +75,8 @@ class ConfigBody(BaseModel):
     inject_mode: Literal["paste", "type"] | None = None
     capture_enabled: bool | None = None
     capture_apps: list[str] | None = None
+    lock_idle_minutes: int | None = Field(default=None, ge=MIN_IDLE_MINUTES, le=MAX_IDLE_MINUTES)
+    retention_days: int | None = Field(default=None, ge=0, le=retention.MAX_RETENTION_DAYS)
 
     @field_validator("capture_apps")
     @classmethod
@@ -76,6 +91,25 @@ class ConfigBody(BaseModel):
         return out
 
 
+class AuditEventBody(BaseModel):
+    event: str = Field(pattern=r"^[a-z][a-z0-9_]*(\.[a-z0-9_]+)*$", max_length=64)
+    detail: dict[str, Any] = Field(default_factory=dict)
+
+
+class WipeBody(BaseModel):
+    confirm: str
+
+
+WIPE_PHRASE = "delete everything"
+
+
+def _int_cfg(cfg: dict[str, str], key: str, default: int, lo: int, hi: int) -> int:
+    try:
+        return max(lo, min(hi, int(cfg.get(key, default))))
+    except (TypeError, ValueError):
+        return default
+
+
 def _config_out(db: Any) -> dict[str, Any]:
     cfg = db.get_config()
     enabled, apps = db.capture_config()
@@ -85,6 +119,8 @@ def _config_out(db: Any) -> dict[str, Any]:
         "inject_mode": cfg.get("inject_mode", "paste"),
         "capture_enabled": enabled,
         "capture_apps": apps,
+        "lock_idle_minutes": _int_cfg(cfg, "lock_idle_minutes", 15, MIN_IDLE_MINUTES, MAX_IDLE_MINUTES),
+        "retention_days": _int_cfg(cfg, "retention_days", 0, 0, retention.MAX_RETENTION_DAYS),
     }
 
 
@@ -150,13 +186,25 @@ def _wispr_live() -> bool:
     return bool(mod and mod.active() is not None)
 
 
-def create_app(runtime: Runtime | None = None) -> FastAPI:
+def create_app(runtime: Runtime | None = None, *, api_token: str | None = None) -> FastAPI:
     holder: dict[str, Runtime] = {}
 
     def rt() -> Runtime:
         if "rt" not in holder:
             holder["rt"] = runtime or get_runtime()
         return holder["rt"]
+
+    r0 = rt()
+    auth = AuthManager(
+        r0.settings.polytone_data_dir,
+        r0.settings.polytone_api_port,
+        token=api_token,
+        idle_minutes=_config_out(r0.db)["lock_idle_minutes"],
+        audit=lambda event, detail, actor: rt().audit_event(event, detail, actor),
+    )
+
+    def actor(request: Request) -> str:
+        return str(getattr(request.state, "actor", "unknown"))
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -169,7 +217,10 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         warm = threading.Thread(target=_warm_up, args=(r, watcher, stopping), name="polytone-warmup", daemon=True)
         warm.start()
         app.state.warmup = warm  # tests join it
+        file_hygiene.harden(r.settings.polytone_data_dir)
+        purger = retention.RetentionTask(r).start()  # purge now, then daily
         yield
+        purger.stop()
         stopping.set()
         warm.join(timeout=5)  # the watcher may still be starting; never wait on the embedding load
         if watcher.get("t") is not None:
@@ -184,6 +235,9 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             r.close()
 
     app = FastAPI(title="Polytone", version="0.1.0", lifespan=lifespan)
+    app.state.auth = auth
+    # order matters: CORS is outermost (added last) so preflights and 401s carry CORS headers
+    app.add_middleware(AuthMiddleware, auth=auth)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=CORS_ORIGINS,
@@ -209,18 +263,69 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             "wispr_live": _wispr_live(),  # additive: the live Wispr Flow watcher is running
         }
 
+    # ------------------------------------------------------------------ sessions / audit
+    @app.post("/session")
+    def create_session() -> dict[str, Any]:
+        return auth.create_session()
+
+    @app.delete("/session")
+    def revoke_sessions() -> dict[str, Any]:
+        return {"revoked": auth.revoke_all("app")}
+
+    @app.delete("/session/current")
+    def lock_current(request: Request) -> dict[str, Any]:
+        if actor(request) != "ui":
+            raise HTTPException(status_code=400, detail="not a session token")
+        return {"revoked": int(auth.revoke(str(request.state.token)))}
+
+    @app.get("/audit")
+    def audit_entries(limit: int = Query(100, ge=1, le=1000), before_seq: int | None = Query(None, ge=1)):
+        log_ = rt().audit
+        if log_ is None:
+            return {"entries": [], "head_seq": 0}
+        return {"entries": log_.entries(limit, before_seq), "head_seq": log_.head_seq()}
+
+    @app.get("/audit/verify")
+    def audit_verify() -> dict[str, Any]:
+        log_ = rt().audit
+        if log_ is None:
+            return {"ok": True, "count": 0, "first_bad_seq": None, "reason": None}
+        return log_.verify()
+
+    @app.post("/audit/event")
+    def audit_event(body: AuditEventBody) -> dict[str, Any]:
+        log_ = rt().audit
+        seq = log_.append(body.event, body.detail, actor="app") if log_ is not None else -1
+        return {"seq": seq}
+
+    @app.post("/data/wipe")
+    def data_wipe(body: WipeBody, request: Request) -> dict[str, Any]:
+        if body.confirm != WIPE_PHRASE:
+            raise HTTPException(status_code=400, detail=f'confirm must be "{WIPE_PHRASE}"')
+        return {"deleted": retention.wipe(rt(), actor(request))}
+
     @app.post("/generate", response_model=None)
-    def generate(req: GenerateRequest) -> dict[str, Any] | JSONResponse:
+    def generate(req: GenerateRequest, request: Request) -> dict[str, Any] | JSONResponse:
         from backend.langgraph.generate_graph import GenerationError, run_generation
 
         if not req.intent or not req.intent.strip():
             raise HTTPException(status_code=422, detail="intent is empty")
+        r = rt()
         try:
-            return run_generation(req.intent, req.persona, req.app_context, runtime=rt())
+            out = run_generation(req.intent, req.persona, req.app_context, runtime=r)
         except GenerationError as e:  # never inject placeholder text: tell the client it failed
+            r.audit_event_soon("generate", {"ok": False, "error": e.code, "chars_in": len(req.intent)}, actor(request))
             return JSONResponse(status_code=e.status_code, content={"error": e.code, "detail": str(e)})
         except ValueError as e:
             raise HTTPException(status_code=422, detail=str(e)) from e
+        r.audit_event_soon(
+            "generate",
+            {"ok": True, "draft_id": out.get("draft_id"), "persona": out.get("persona"), "chars_in": len(req.intent),
+             "chars_out": len(out.get("text") or ""), "model": getattr(r.llm, "model", r.llm.name),
+             "latency_ms": out.get("latency_ms"), "app": (req.app_context or "")[:100] or None},
+            actor(request),
+        )
+        return out
 
     @app.post("/ingest/manual")
     def ingest_manual(req: IngestManualRequest) -> dict[str, Any]:
@@ -260,9 +365,23 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         return _config_out(rt().db)
 
     @app.put("/config")
-    def put_config(body: ConfigBody) -> dict[str, Any]:
-        rt().db.set_config(body.model_dump(exclude_none=True))
-        return _config_out(rt().db)
+    def put_config(body: ConfigBody, request: Request) -> dict[str, Any]:
+        r = rt()
+        before = _config_out(r.db)
+        r.db.set_config(body.model_dump(exclude_none=True))
+        after = _config_out(r.db)
+        changed = sorted(k for k in after if after[k] != before[k])
+        who = actor(request)
+        if changed:
+            r.audit_event("config.change", {"keys": changed}, who)
+        if "capture_enabled" in changed:
+            r.audit_event("capture.start" if after["capture_enabled"] else "capture.stop",
+                          {"apps": len(after["capture_apps"])}, who)
+        if "lock_idle_minutes" in changed:
+            auth.set_idle_minutes(after["lock_idle_minutes"])
+        if "retention_days" in changed and after["retention_days"]:
+            retention.purge(r)
+        return after
 
     @app.get("/drafts")
     def drafts(limit: int = Query(50, ge=1, le=1000)) -> list[dict[str, Any]]:
@@ -318,6 +437,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
 def main() -> None:
     import uvicorn
 
+    os.umask(0o077)  # every file the backend creates (SQLite -wal/-shm, tokens, logs) is 0600
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     # "constraint already exists" etc. are INFO-level server notifications — just noise here
     logging.getLogger("neo4j.notifications").setLevel(logging.WARNING)
@@ -325,6 +445,7 @@ def main() -> None:
 
     start_parent_watchdog()
     settings = get_settings()
+    file_hygiene.harden(settings.polytone_data_dir, [REPO_ROOT / ".env", settings.gmail_token_path])
     rt = build_runtime(settings, score_async=True)
     set_runtime(rt)
     uvicorn.run(create_app(rt), host="127.0.0.1", port=settings.polytone_api_port, log_level="info")

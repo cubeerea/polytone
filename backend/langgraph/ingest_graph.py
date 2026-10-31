@@ -75,7 +75,7 @@ def build_ingest_graph(rt: Runtime):
         try:
             res = rt.store.write_extraction(state["extraction"], state["persona"])
         except Exception as e:  # noqa: BLE001
-            log.warning("graph write failed: %s", e)
+            log.warning("graph write failed: %s", type(e).__name__)
             return {"ok": False, "reason": f"graph write failed: {e.__class__.__name__}"}
         return {"sentences": int(res.get("sentences", 0)), "words_merged": int(res.get("words_merged", 0))}
 
@@ -156,8 +156,8 @@ def run_ingest_batch(
             for reason in r["reasons"]:
                 if reason not in total["reasons"]:
                     total["reasons"].append(reason)
-    except Exception as e:
-        log.exception("ingest run for %s failed", source)
+    except Exception as e:  # noqa: BLE001 - recorded as status=error
+        log.error("ingest run for %s failed: %s", source, type(e).__name__)  # no traceback: it may quote text
         status = "error"
         total["reasons"].append(f"source error: {e}")
     finally:
@@ -165,6 +165,11 @@ def run_ingest_batch(
             source=source, started_at=started, finished_at=utcnow_iso(),
             accepted=total["accepted"], rejected=total["rejected"], status=status,
         )
+        if total["accepted"] or total["rejected"] or status != "ok":
+            rt.audit_event_soon(
+                "ingest", {"source": source, "accepted": total["accepted"], "rejected": total["rejected"],
+                           "status": status},
+            )
     if total["accepted"] and rt.score_async:
         rt.submit(rt.prime_constraints)  # the write invalidated the cache; refill it off the hot path
     return total

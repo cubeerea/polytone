@@ -11,6 +11,16 @@ Tables
 - ``draft_edits`` text the user sent right after a Polytone inject (typing capture with
                   ``after_inject=True``). NEVER learned from; kept for future edit learning.
 
+Encryption at rest (CONTRACTS.md → Security): every column holding the user's words —
+``drafts.intent/text/constraints_json``, ``samples.text/provenance_json``, ``draft_edits.text`` —
+is stored as ``enc1:`` AES-256-GCM ciphertext (AAD = ``"<table>.<column>"``) and decrypted
+transparently on read (memoized in ``security.crypto``). The ``sha256`` columns of ``drafts`` and
+``samples`` keep their name but hold the blind index ``idx1:...`` of the stripped text
+(``text_index``), which is what dedupe and the firewall compare. ``Database.init`` migrates any
+plaintext rows once (idempotent, one transaction per table, then VACUUM + WAL checkpoint); the
+counts are in ``Database.migration`` (the server audits them as ``migration.encrypted``).
+``secure_delete`` is on, so deleted rows (retention purge, wipe) are zeroed on disk.
+
 Usage: ``Database(path)``; the process-wide instance lives on ``backend.runtime.Runtime.db``.
 
 Thread-safety: each thread keeps one persistent connection (``threading.local``), so methods
@@ -22,8 +32,8 @@ including writes from other processes (MCP servers).
 """
 from __future__ import annotations
 
-import hashlib
 import json
+import logging
 import sqlite3
 import threading
 import uuid
@@ -32,6 +42,10 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+from backend.security import crypto
+
+log = logging.getLogger(__name__)
 
 # Typing capture (source "typed") watches only these apps by default; opt-in, default OFF.
 DEFAULT_CAPTURE_APPS: list[str] = [
@@ -54,7 +68,20 @@ DEFAULT_CONFIG: dict[str, str] = {
     "inject_mode": "paste",
     "capture_enabled": "false",
     "capture_apps": json.dumps(DEFAULT_CAPTURE_APPS),
+    "lock_idle_minutes": "15",
+    "retention_days": "0",
 }
+
+# AAD contexts of the encrypted columns, and the blind-index context shared by drafts and
+# samples (the firewall compares a sample's index with every draft's).
+ENC_COLUMNS: dict[str, tuple[str, ...]] = {
+    "drafts": ("intent", "text", "constraints_json"),
+    "samples": ("text", "provenance_json"),
+    "draft_edits": ("text",),
+}
+TEXT_INDEX_CONTEXT = "content.text"
+# sources whose samples the retention purge removes (CONTRACTS.md → Retention and files)
+RETENTION_SOURCES = ("typed", "wispr")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS config (
@@ -113,9 +140,32 @@ def utcnow_iso() -> str:
     return datetime.now(UTC).isoformat(timespec="milliseconds")
 
 
-def sha256_text(text: str) -> str:
-    """Canonical hash used for drafts AND samples (stripped UTF-8)."""
-    return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()
+def text_index(text: str) -> str:
+    """Blind index (``idx1:``) of the stripped text — the dedupe key of drafts AND samples."""
+    return crypto.blind_index(text.strip(), TEXT_INDEX_CONTEXT)
+
+
+sha256_text = text_index  # historical name (the column is still called ``sha256``)
+
+_legacy_warned: set[str] = set()
+
+
+def _dec(value: str | None, ctx: str) -> str | None:
+    """Decrypt a column value. A legacy plaintext value (written by an older build after this
+    process migrated) is returned as is — the next start's migration encrypts it; an ``enc1:``
+    value that fails to decrypt raises ``crypto.DecryptError``."""
+    if value is None:
+        return None
+    if crypto.is_encrypted(value):
+        return crypto.decrypt(value, ctx)
+    if ctx not in _legacy_warned:
+        _legacy_warned.add(ctx)
+        log.warning("plaintext value in %s (encrypted at the next start)", ctx)
+    return value
+
+
+def _loads_enc(s: str | None, ctx: str) -> Any:
+    return _loads(_dec(s, ctx))
 
 
 def _config_value(v: Any) -> str:
@@ -141,6 +191,7 @@ class Database:
         self._init_lock = threading.Lock()
         self._local = threading.local()
         self._initialized = False
+        self.migration: dict[str, int] = {}
         self.init()
 
     # ------------------------------------------------------------------ plumbing
@@ -150,6 +201,7 @@ class Database:
             conn = sqlite3.connect(self.path, timeout=10)
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA secure_delete=ON")  # deleted rows are zeroed, not left in free pages
             self._local.conn = conn
         return conn
 
@@ -176,7 +228,56 @@ class Database:
                 c.executescript(_SCHEMA)
                 for k, v in DEFAULT_CONFIG.items():
                     c.execute("INSERT OR IGNORE INTO config(k, v) VALUES (?, ?)", (k, v))
+            self.migration = self._migrate_plaintext()
             self._initialized = True
+
+    # ------------------------------------------------------------------ encryption migration
+    def _migrate_plaintext(self) -> dict[str, int]:
+        """Encrypt every plaintext user-text value and turn plain sha256 hashes into blind
+        indexes. Idempotent: ``enc1:``/``idx1:`` values are skipped, so a run that finds nothing
+        costs one scan per table. One transaction per table; VACUUM + WAL checkpoint afterwards
+        so no plaintext page lingers in the file or the WAL. Returns ``{table: rows changed}``."""
+        conn = self._conn()
+        counts: dict[str, int] = {}
+        for table, cols in ENC_COLUMNS.items():
+            key = "draft_id" if table == "drafts" else "id"
+            has_idx = table in ("drafts", "samples")
+            sel = ", ".join((key, *cols, *(("sha256",) if has_idx else ())))
+            cond = " OR ".join(
+                [f"({c} IS NOT NULL AND substr({c}, 1, 5) != 'enc1:')" for c in cols]
+                + (["substr(sha256, 1, 5) != 'idx1:'"] if has_idx else [])
+            )
+            changed = dupes = 0
+            with conn:  # one transaction per table: all of its rows or none
+                rows = conn.execute(f"SELECT {sel} FROM {table} WHERE {cond}").fetchall()
+                for r in rows:
+                    sets: dict[str, Any] = {}
+                    for c in cols:
+                        v = r[c]
+                        if v is not None and not crypto.is_encrypted(v):
+                            sets[c] = crypto.encrypt(v, f"{table}.{c}")
+                    if has_idx and not crypto.is_index(r["sha256"]):
+                        sets["sha256"] = text_index(_dec(r["text"], f"{table}.text") or "")
+                    assign = ", ".join(f"{c} = :{c}" for c in sets)
+                    try:
+                        conn.execute(
+                            f"UPDATE {table} SET {assign} WHERE {key} = :_k",
+                            {**sets, "_k": r[key]},
+                        )
+                    except sqlite3.IntegrityError:
+                        # two legacy samples with different hashes but the same stripped text:
+                        # keep the one already migrated (dedupe semantics), drop this duplicate
+                        conn.execute(f"DELETE FROM {table} WHERE {key} = ?", (r[key],))
+                        dupes += 1
+                    changed += 1
+            if changed:
+                counts[table] = changed
+            if dupes:
+                counts[f"{table}_duplicates_dropped"] = dupes
+        if counts:
+            self.checkpoint(vacuum=True)
+            log.info("encrypted plaintext rows at rest: %s", counts)
+        return counts
 
     # ------------------------------------------------------------------ config
     def get_config(self) -> dict[str, str]:
@@ -229,18 +330,27 @@ class Database:
             "intent": intent,
             "text": text,
             "latency_ms": int(latency_ms),
-            "constraints_json": json.dumps(constraints) if constraints is not None else None,
+            "constraints": constraints,
+            "score": score,
+            "sha256": text_index(text),
+        }
+        stored = {
+            **row,
+            "intent": crypto.encrypt(intent, "drafts.intent"),
+            "text": crypto.encrypt(text, "drafts.text"),
+            "constraints_json": crypto.encrypt(json.dumps(constraints), "drafts.constraints_json")
+            if constraints is not None
+            else None,
             "score_json": json.dumps(score) if score is not None else None,
-            "sha256": sha256_text(text),
         }
         with self.connect() as c:
             c.execute(
                 "INSERT INTO drafts(draft_id, created_at, persona, intent, text, latency_ms,"
                 " constraints_json, score_json, sha256) VALUES (:draft_id, :created_at, :persona,"
                 " :intent, :text, :latency_ms, :constraints_json, :score_json, :sha256)",
-                row,
+                stored,
             )
-        return self._draft_out(row)
+        return dict(row)
 
     @staticmethod
     def _draft_out(row: Any) -> dict[str, Any]:
@@ -249,10 +359,10 @@ class Database:
             "draft_id": r["draft_id"],
             "created_at": r["created_at"],
             "persona": r["persona"],
-            "intent": r["intent"],
-            "text": r["text"],
+            "intent": _dec(r["intent"], "drafts.intent"),
+            "text": _dec(r["text"], "drafts.text"),
             "latency_ms": r["latency_ms"],
-            "constraints": _loads(r.get("constraints_json")),
+            "constraints": _loads_enc(r.get("constraints_json"), "drafts.constraints_json"),
             "score": _loads(r.get("score_json")),
             "sha256": r["sha256"],
         }
@@ -300,7 +410,7 @@ class Database:
         with self.connect() as c:
             cur = c.execute(
                 "INSERT INTO draft_edits(created_at, app, text, nearest_draft_id) VALUES (?, ?, ?, ?)",
-                (created_at or utcnow_iso(), app, text, nearest_draft_id),
+                (created_at or utcnow_iso(), app, crypto.encrypt(text, "draft_edits.text"), nearest_draft_id),
             )
             return int(cur.lastrowid)
 
@@ -309,11 +419,12 @@ class Database:
             rows = c.execute(
                 "SELECT * FROM draft_edits ORDER BY created_at DESC, id DESC LIMIT ?", (int(limit),)
             ).fetchall()
-        return [dict(r) for r in rows]
+        return [{**dict(r), "text": _dec(r["text"], "draft_edits.text")} for r in rows]
 
     def all_draft_texts(self) -> list[str]:
         with self.connect() as c:
-            return [r[0] for r in c.execute("SELECT text FROM drafts ORDER BY rowid").fetchall()]
+            rows = c.execute("SELECT text FROM drafts ORDER BY rowid").fetchall()
+        return [_dec(r[0], "drafts.text") for r in rows]
 
     def draft_watermark(self) -> tuple[int, int]:
         """``(row count, max rowid)`` of ``drafts`` — changes whenever a draft is added/removed."""
@@ -327,7 +438,7 @@ class Database:
             rows = c.execute(
                 "SELECT rowid, sha256, text FROM drafts WHERE rowid > ? ORDER BY rowid", (int(rowid),)
             ).fetchall()
-        return [(int(r[0]), r[1], r[2]) for r in rows]
+        return [(int(r[0]), r[1], _dec(r[2], "drafts.text")) for r in rows]
 
     def draft_hashes(self) -> set[str]:
         with self.connect() as c:
@@ -366,9 +477,9 @@ class Database:
                     created_at or utcnow_iso(),
                     source,
                     persona,
-                    text,
-                    sha256_text(text),
-                    json.dumps(provenance or {}),
+                    crypto.encrypt(text, "samples.text"),
+                    text_index(text),
+                    crypto.encrypt(json.dumps(provenance or {}), "samples.provenance_json"),
                 ),
             )
             return cur.lastrowid if cur.rowcount else None
@@ -398,9 +509,9 @@ class Database:
                 "created_at": r["created_at"],
                 "source": r["source"],
                 "persona": r["persona"],
-                "text": r["text"],
+                "text": _dec(r["text"], "samples.text"),
                 "sha256": r["sha256"],
-                "provenance": _loads(r["provenance_json"]) or {},
+                "provenance": _loads_enc(r["provenance_json"], "samples.provenance_json") or {},
             }
             for r in rows
         ]
@@ -454,3 +565,35 @@ class Database:
         args.append(int(limit))
         with self.connect() as c:
             return [dict(r) for r in c.execute(q, args).fetchall()]
+
+    # ------------------------------------------------------------------ retention / wipe
+    def purge_older_than(self, cutoff_iso: str) -> dict[str, int]:
+        """Delete ``typed``/``wispr`` samples, ``draft_edits`` and ``drafts`` created before
+        ``cutoff_iso`` (retention). Returns the rows deleted per table."""
+        marks = ",".join("?" * len(RETENTION_SOURCES))
+        with self.connect() as c:
+            out = {
+                "samples": c.execute(
+                    f"DELETE FROM samples WHERE created_at < ? AND source IN ({marks})",
+                    (cutoff_iso, *RETENTION_SOURCES),
+                ).rowcount,
+                "draft_edits": c.execute("DELETE FROM draft_edits WHERE created_at < ?", (cutoff_iso,)).rowcount,
+                "drafts": c.execute("DELETE FROM drafts WHERE created_at < ?", (cutoff_iso,)).rowcount,
+            }
+        if any(out.values()):
+            self.checkpoint()
+        return out
+
+    def wipe_user_data(self) -> dict[str, int]:
+        """Delete every sample, draft and draft edit (``POST /data/wipe``), then VACUUM."""
+        with self.connect() as c:
+            out = {t: c.execute(f"DELETE FROM {t}").rowcount for t in ("samples", "drafts", "draft_edits")}
+        self.checkpoint(vacuum=True)
+        return out
+
+    def checkpoint(self, vacuum: bool = False) -> None:
+        """Optionally VACUUM (rebuild the file without free pages), then truncate the WAL."""
+        conn = self._conn()
+        if vacuum:
+            conn.execute("VACUUM")
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
