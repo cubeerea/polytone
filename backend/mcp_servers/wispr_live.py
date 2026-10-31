@@ -83,12 +83,15 @@ class InsertionIndex:
         self._entries: OrderedDict[int, Insertion] = OrderedDict()
         self._sig: dict[str, tuple] = {}  # db path → file signature at the index's last own read
         self._top: dict[str, int] = {}  # db path → highest rowid the index has looked at
+        # db path → {rowid: first seen (monotonic)} of rows read before Wispr filled them in
+        self._pending: dict[str, dict[int, float]] = {}
 
     def clear(self) -> None:
         with self._lock:
             self._entries.clear()
             self._sig.clear()
             self._top.clear()
+            self._pending.clear()
 
     def __len__(self) -> int:
         return len(self._entries)
@@ -145,12 +148,26 @@ class InsertionIndex:
                     self._sig[key] = sig
                     return False
                 top = wispr.max_rowid(conn, schema)
-                after = max(self._top.get(key, 0), top - COLD_ROWS)
+                seen = self._top.get(key, 0)
+                if seen > top:  # rowids renumbered / DB replaced: start over (see wispr.verify_cursor)
+                    seen = self._top[key] = 0
+                    self._pending.pop(key, None)
+                after = max(seen, top - COLD_ROWS)
                 # only rows that can still be in the window (timestamp = dictation START)
                 newest = wispr.newest_ts(conn, schema) or ""
                 since = wispr.wispr_ts(time.time() - WINDOW_S - MAX_DICTATION_S) if newest.endswith("+00:00") else None
                 rows = (wispr.fetch_rows(conn, schema, after_rowid=after, cap=COLD_ROWS * 4, since_ts=since)
                         if top > after else [])
+                pend = self._pending.setdefault(key, {})
+                if pend:  # rows seen before Wispr filled them in (the watcher may be off)
+                    rows += wispr.fetch_rows(conn, schema, rowids=list(pend))
+            now_m, now_w = time.monotonic(), time.time()
+            for r in rows:
+                first = pend.pop(r.rowid, now_m)
+                ep = r.epoch
+                if r.is_pending and ep is not None and now_w - ep < wispr.PENDING_MAX_S and \
+                        now_m - first < wispr.PENDING_MAX_S:
+                    pend[r.rowid] = first
             self.add_rows(rows)
             self.note_rowid(db_path, max([top] + [r.rowid for r in rows]))
             self._sig[key] = sig

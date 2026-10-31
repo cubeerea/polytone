@@ -14,7 +14,7 @@ import hmac
 import os
 import secrets
 import threading
-from functools import lru_cache
+from functools import cache, lru_cache
 
 KEYCHAIN_SERVICE = "com.polytone.app"
 KEYCHAIN_ACCOUNT = "data-key-v1"
@@ -76,7 +76,7 @@ def _hkdf(key: bytes, info: bytes, length: int = KEY_BYTES) -> bytes:
     return out[:length]
 
 
-@lru_cache(maxsize=None)
+@cache
 def subkey(purpose: str) -> bytes:
     return _hkdf(master_key(), f"polytone/{purpose}/v1".encode())
 

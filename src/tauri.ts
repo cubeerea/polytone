@@ -35,6 +35,8 @@ export interface CaptureStatus {
   captured_this_session: number;
   last_captured_at: string | null;
   last_error: string | null;
+  /** Why the last send key in an allowlisted app wasn't learned from (absent on older builds). */
+  last_skip?: string | null;
 }
 
 export interface RunningApp {

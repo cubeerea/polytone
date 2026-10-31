@@ -21,6 +21,12 @@ const KNOWN_APPS: Record<string, string> = {
   "com.microsoft.Outlook": "Outlook",
 };
 
+/** `"com.tinyspeck.slackmacgap: fewer than 3 words"` → `"Slack: fewer than 3 words"`. */
+function appLabel(skip: string, name: (id: string) => string): string {
+  const i = skip.indexOf(": ");
+  return i > 0 ? `${name(skip.slice(0, i))}: ${skip.slice(i + 2)}` : skip;
+}
+
 /** "Learn from what I type": the opt-in switch and its app allowlist. */
 export function CaptureGroup({ tauri, online, config }: { tauri: boolean; online: boolean; config: AppConfig | null }) {
   const supported = config != null && typeof config.capture_enabled === "boolean";
@@ -57,11 +63,12 @@ export function CaptureGroup({ tauri, online, config }: { tauri: boolean; online
   };
 
   const err = capErr ?? cap?.last_error ?? null;
+  const skip = cap?.last_skip ? `Last message skipped (${appLabel(cap.last_skip, (id) => nameOf(id))})` : null;
   const statusLine = !enabled
     ? "Off"
     : tauri && cap
       ? cap.running
-        ? `${cap.captured_this_session.toLocaleString()} captured this session${cap.last_captured_at ? ` · last ${relativeTime(cap.last_captured_at)}` : ""}`
+        ? `${cap.captured_this_session.toLocaleString()} sent to the engine this session${cap.last_captured_at ? ` · last ${relativeTime(cap.last_captured_at)}` : ""}`
         : "On, not running"
       : "On";
 
@@ -69,7 +76,22 @@ export function CaptureGroup({ tauri, online, config }: { tauri: boolean; online
     <section>
       <h2 className="group-title">Learning</h2>
       <div className="inset">
-        <Row title="Learn from what I type" subtitle={err ? <span className="text-bad">{err}</span> : statusLine}>
+        <Row
+          title="Learn from what I type"
+          subtitle={
+            err ? (
+              <span className="text-bad">{err}</span>
+            ) : enabled && skip ? (
+              <>
+                {statusLine}
+                <br />
+                <span className="text-text-3">{skip}</span>
+              </>
+            ) : (
+              statusLine
+            )
+          }
+        >
           {enabled && tauri && cap && <StatusDot state={err ? "down" : cap.running ? "ok" : "warn"} />}
           <Switch
             checked={enabled}

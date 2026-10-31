@@ -79,20 +79,35 @@ Learns from messages the user types and **sends** in allowlisted native apps.
 - Rust (`src-tauri/src/typing_capture/`): listen-only `CGEventTap` (keyDown) on its own thread; the
   callback only forwards keys / re-enables a timed-out tap. A worker skips everything unless capture is
   on, the hotkey isn't paused (`AppState.paused`), `IsSecureEventInputEnabled()` is false and the
-  frontmost app is allowlisted. Edit keys → debounced (300ms) read of the focused element's `AXValue`
-  (roles AXTextArea/AXTextField/AXComboBox; never `AXSecureTextField` or `AXSearchField`), cached per app.
+  frontmost app is allowlisted. The focused element is asked of the frontmost app's own AX element
+  (system-wide AX queries fail outright on macOS 26). First key in a process: Electron apps (they
+  answer `AXManualAccessibility`) get `AXManualAccessibility=true`, Chromium browsers (Chrome, Arc,
+  Edge, Brave, Vivaldi, Opera) `AXEnhancedUserInterface=true` — without it their web content has no AX
+  tree. Edit keys → read of the focused element's `AXValue` 40ms later (once the app applied the key;
+  keys inside that delay share one read) and again after a 250ms pause, cached per app. Roles:
+  AXTextArea/AXTextField/AXComboBox, but only AXTextArea (message boxes / contenteditable) in browsers,
+  Electron apps and Mail; never `AXSecureTextField` or `AXSearchField`.
   Send keys: Return without Shift/Opt/Ctrl/Cmd (except Mail, Notes, Notion where Return is a newline),
-  Cmd+Return (any app), Cmd+Shift+D (Mail). The send is **confirmed** by re-reading the field after
-  250ms / 900ms: it must clear, change, or lose focus, else the Return was a newline and nothing is sent.
-  Never captures on app switch. Drops < 3 words, caps at 5000 chars, never resends identical text per app.
+  Cmd+Return (any app), Cmd+Shift+D (Mail). The send is **confirmed** by re-reading *the element the text
+  was in* (wherever focus is now) after 250ms / 900ms: it must be gone/unreadable, empty, or hold
+  something unrelated; if it still contains the text (newline) or most of it (shared prefix + suffix ≥
+  half: Return accepted an autocomplete or committed an IME composition) nothing is sent.
+  Never captures on app switch. Drops < 3 words and slash commands (`/…`), caps at 5000 chars, never
+  resends identical text per app.
   A send in the app Polytone last injected into, within 10 minutes of that inject → `after_inject=true`.
-  `POST /ingest/typed` fire-and-forget; failures go to `last_error`, never per-item notifications.
+  `POST /ingest/typed` fire-and-forget (30s timeout; retried after 2s/5s/13s while the backend isn't
+  listening); failures go to `last_error`, never per-item notifications. Why a send key was ignored is
+  logged at debug (`RUST_LOG=polytone_lib::typing_capture=debug`) and kept in `last_skip`.
 - Tauri commands: `set_capture(enabled: bool, apps: string[]) -> CaptureStatus` (applies at once and
   retries a failed start; the UI also PUTs `/config`), `get_capture_status() -> CaptureStatus`,
   `list_running_apps() -> [{"bundle_id":str,"name":str}]` (regular GUI apps).
   `CaptureStatus` = `{"enabled":bool,"running":bool,"apps":[str],"captured_this_session":u32,
-  "last_captured_at":iso|null,"last_error":str|null}`. Missing Input Monitoring/Accessibility → the tap
-  can't be created: `running=false`, `last_error` says which permission. Startup reads `/config`
+  "last_captured_at":iso|null,"last_error":str|null,"last_skip":str|null}` (`captured_this_session` =
+  messages POSTed; `last_skip` (additive) = `"<bundle id>: <why>"` for the last send key in an allowlisted
+  app that wasn't learned — a local skip such as `fewer than 3 words` / `the field did not clear` or
+  `not learned: <engine reason>`; cleared by the next learned message). Missing Input
+  Monitoring/Accessibility → the tap can't be created: `running=false`, `last_error` says which
+  permission (also set when a read fails because Accessibility was revoked). Startup reads `/config`
   (`sync_from_backend_config`).
 - Backend `POST /ingest/typed`: `after_inject=true` → never learned; stored in SQLite `draft_edits`
   (`id, created_at, app, text, nearest_draft_id` = newest draft of the last 10 min or null) and returns
@@ -109,7 +124,7 @@ Learns from messages the user types and **sends** in allowlisted native apps.
   `{"accepted":0,"rejected":1,"reasons":["wispr_inserted: the message is Wispr Flow dictation output (<firewall reason>)"]}`;
   if it passes it is learned with provenance `wispr_removed: {"rowids":[int],"tokens":int}`. The
   index is fed by the live watcher and refreshed from the DB on demand whenever the DB changed
-  (looks back ≤ 50 rows); with no match it re-polls for `WISPR_TYPED_GRACE_MS` (default 1500) in
+  (looks back ≤ 50 rows, plus rows it saw before Wispr filled them in); with no match it re-polls for `WISPR_TYPED_GRACE_MS` (default 1500) in
   case the dictation is still being committed. No Wispr install → no check, no wait.
 
 ## Wispr Flow (source `wispr`; local, read-only)
@@ -119,7 +134,7 @@ Learns from messages the user types and **sends** in allowlisted native apps.
   changed mid-copy) and the copy is opened `mode=ro`. Only named columns are selected (`rowid`,
   `transcriptEntityId`, `timestamp`, `duration`, `app`, `url`, `asrText`, `status`, `isArchived`,
   `pastedText`, `serverFinalizedText`, `formattedText`) — never `*`, never the blob columns.
-- Learned: `asrText` (raw ASR) only, unchanged; rows with status `dismissed` (or error-like), blank
+- Learned: `asrText` (raw ASR) only, unchanged; rows with status `dismissed`/`no_audio` (or error-like), blank
   `asrText`, or filler-only text ("um uh") are skipped; **archived rows are learned**. Item = `{"text": asrText,
   "persona": "Default", "provenance": {"source":"wispr","raw_transcript":true,"kind":"spoken",
   "origin":"wispr_local_history","field":"asrText","rowid","transcript_id","timestamp","app","url"?,
@@ -127,7 +142,12 @@ Learns from messages the user types and **sends** in allowlisted native apps.
 - Cursor: SQLite config `wispr.history_rowid` (`rowid > cursor`, insert order; `timestamp` is the
   dictation start and not monotonic). Migrated once from `wispr.history_last_ts` (kept updated) as
   `MAX(rowid) WHERE timestamp <= old`. Shared by the live watcher and `POST /ingest/sources/wispr/run`
-  (one read at a time). Rows with no text and no status that are < 15 min old are re-read later.
+  (one read at a time). `History`'s primary key is TEXT, so rowids are not stable (a table rebuild by a
+  Wispr migration renumbers them; a reinstall restarts at 1): `wispr.history_rowid_id` records the
+  `transcriptEntityId` at the cursor, and when that row changed or the cursor is past the end the
+  cursor is re-found by that id, else by `wispr.history_last_ts`. Rows with no text and no final status
+  (`formatted`, `raw_transcript`, `dismissed`, `no_audio`, error-like) that are < 15 min old are
+  re-read later (Wispr may insert a row first and fill it in).
 - Live: `POLYTONE_WISPR_LIVE` (default `1`; only when the DB exists and `POLYTONE_WISPR_LOCAL` ≠ `0`)
   starts `wispr_live.WisprLiveWatcher` with the server: stat DB + `-wal` every 1 s → on change debounce
   300 ms → snapshot + incremental read (≤ 200 rows per tick) → `run_ingest_batch(items, "wispr")` +

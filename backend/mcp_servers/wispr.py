@@ -70,8 +70,15 @@ DEFAULT_HISTORY_DIRS = (
 )
 DB_SUFFIXES = (".sqlite", ".sqlite3", ".db")
 LOCAL_CAP = 2000
-SKIP_STATUSES = {"dismissed", "error", "failed", "cancelled", "canceled", "discarded"}
+SKIP_STATUSES = {"dismissed", "error", "failed", "cancelled", "canceled", "discarded", "no_audio"}
+# statuses after which Wispr no longer fills a row in (seen in real History tables: formatted,
+# raw_transcript, dismissed, no_audio). A text-less row with any OTHER status (or none) may still
+# be in progress and is re-read while recent.
+FINAL_STATUSES = SKIP_STATUSES | {"formatted", "raw_transcript"}
 CURSOR_KEY = "wispr.history_rowid"  # rowid = insert order (see fetch_rows)
+# transcript id of the row at the cursor: History's primary key is TEXT, so a VACUUM may renumber
+# rowids (or the DB may be replaced); the cursor is re-found by this id.
+CURSOR_ID_KEY = "wispr.history_rowid_id"
 OLD_CURSOR_KEY = "wispr.history_last_ts"  # pre-rowid cursor; migrated once, still updated
 SPOKEN_PERSONA = "Default"
 PENDING_MAX_S = 900.0  # how long a text-less, status-less recent row is re-checked
@@ -387,8 +394,9 @@ class HistoryRow:
 
     @property
     def is_pending(self) -> bool:
-        """No text and no status yet: possibly a row Wispr inserts first and fills in later."""
-        return not self.text.strip() and not (self.status or "").strip()
+        """No text and no final status yet: possibly a row Wispr inserted when the dictation
+        started and fills in when it ends."""
+        return not self.text.strip() and (self.status or "").strip().lower() not in FINAL_STATUSES
 
 
 def parse_ts(stamp: Any) -> float | None:
@@ -537,6 +545,37 @@ def load_cursor(db: Any, conn: sqlite3.Connection, schema: dict[str, Any]) -> in
     return cur
 
 
+def _row_id_at(conn: sqlite3.Connection, schema: dict[str, Any], rowid: int) -> str | None:
+    r = conn.execute(f"SELECT {_q(schema['id_col'])} FROM {_q(schema['table'])} WHERE rowid = ?",
+                     (int(rowid),)).fetchone()
+    return None if r is None or r[0] is None else str(r[0])
+
+
+def verify_cursor(db: Any, conn: sqlite3.Connection, schema: dict[str, Any], cursor: int) -> int:
+    """The cursor, re-anchored if rowids moved under it: a VACUUM renumbered them (History has a
+    TEXT primary key, so rowids aren't stable) or the DB was replaced. Re-found by the transcript id
+    recorded with the cursor, else by the newest ingested timestamp (``wispr.history_last_ts``)."""
+    if cursor <= 0:
+        return cursor
+    top, id_col, ts = max_rowid(conn, schema), schema.get("id_col"), schema.get("ts_col")
+    want = get_state(db, CURSOR_ID_KEY)
+    if cursor <= top and (not want or not id_col or _row_id_at(conn, schema, cursor) == want):
+        return cursor
+    new: int | None = None
+    if want and id_col:
+        r = conn.execute(f"SELECT rowid FROM {_q(schema['table'])} WHERE {_q(id_col)} = ?", (want,)).fetchone()
+        new = None if r is None else int(r[0])
+    old = get_state(db, OLD_CURSOR_KEY)
+    if new is None and old and ts:
+        r = conn.execute(f"SELECT MAX(rowid) FROM {_q(schema['table'])} WHERE {_q(ts)} <= ?", (old,)).fetchone()
+        new = int(r[0] or 0)
+    if new is None:
+        new = min(cursor, top)
+    log.warning("wispr: History rowids moved (cursor %d, newest %d); cursor re-anchored at %d", cursor, top, new)
+    set_state(db, **{CURSOR_KEY: str(new)})
+    return new
+
+
 def read_increment(
     db_path: Path, db: Any, cap: int = LOCAL_CAP, conn: sqlite3.Connection | None = None,
 ) -> tuple[list[SourceItem], list[HistoryRow], dict[str, Any]]:
@@ -556,7 +595,7 @@ def _read_increment(db_path: Path, db: Any, cap: int, conn: sqlite3.Connection):
     schema = inspect_schema(conn)
     if schema is None:
         return [], [], {"db": str(db_path), "error": "no table with a raw transcript column"}
-    cursor = load_cursor(db, conn, schema)
+    cursor = verify_cursor(db, conn, schema, load_cursor(db, conn, schema))
     rows = fetch_rows(conn, schema, after_rowid=cursor, cap=cap)
     key = str(db_path)
     now_m, now_w = time.monotonic(), time.time()
@@ -583,6 +622,8 @@ def _read_increment(db_path: Path, db: Any, cap: int, conn: sqlite3.Connection):
     newest_ts = max((r.timestamp for r in rows if r.timestamp), default=None)
     if new_cursor != cursor:
         state = {CURSOR_KEY: str(new_cursor)}
+        if rows[-1].transcript_id:
+            state[CURSOR_ID_KEY] = rows[-1].transcript_id
         old = get_state(db, OLD_CURSOR_KEY)
         if newest_ts and (old is None or newest_ts > old):
             state[OLD_CURSOR_KEY] = newest_ts  # kept for older builds; the rowid cursor rules
