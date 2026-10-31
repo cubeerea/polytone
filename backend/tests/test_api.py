@@ -17,6 +17,28 @@ def test_health(client):
     body = r.json()
     assert body["status"] == "ok" and body["neo4j"] is False
     assert body["llm"] == "mock" and body["embeddings"] == "none" and body["graph_store"] == "memory"
+    assert body["llm_ready"] is True
+
+
+def test_health_reports_unusable_llm(tmp_path):
+    """POLYTONE_LLM=anthropic without a key: /health says so, /generate answers 502."""
+    from fastapi.testclient import TestClient
+
+    from backend.config import Settings
+    from backend.daemon.server import create_app
+    from backend.graph.store import InMemoryGraphStore
+    from backend.llm.client import MockLLM
+    from backend.runtime import build_runtime
+
+    s = Settings(polytone_data_dir=tmp_path, polytone_llm="anthropic", anthropic_api_key="",
+                 polytone_embeddings="none", polytone_watch_dir=tmp_path / "inbox")
+    rt = build_runtime(s, db_path=tmp_path / "x.sqlite3", store=InMemoryGraphStore(), llm=MockLLM(), scorer=False)
+    with TestClient(create_app(rt)) as c:
+        body = c.get("/health").json()
+        assert body["llm"] == "anthropic" and body["llm_ready"] is False
+        r = c.post("/generate", json={"intent": "hello there friend", "persona": None, "app_context": None})
+        assert r.status_code == 502 and r.json()["error"] == "llm_failed"
+    rt.close()
 
 
 def test_cors(client):
@@ -144,11 +166,46 @@ def test_config(client):
 
 def test_scores_summary(client, runtime):
     assert client.get("/scores/summary").json() == {"mean": None, "count": 0, "trend": []}
-    runtime.scorer = lambda text, base: {"score": 60.0, "distance": 0.4, "components": {}}
+    runtime.scorer = lambda text, base, persona=None: {"score": 60.0, "distance": 0.4, "components": {}}
     client.post("/ingest/manual", json={"text": HUMAN_SAMPLES[2]})
     client.post("/generate", json={"intent": "a"})
-    runtime.scorer = lambda text, base: {"score": 80.0, "distance": 0.2, "components": {}}
+    runtime.scorer = lambda text, base, persona=None: {"score": 80.0, "distance": 0.2, "components": {}}
     client.post("/generate", json={"intent": "b"})
     s = client.get("/scores/summary").json()
     assert s["count"] == 2 and s["mean"] == 70.0 and [x["score"] for x in s["trend"]] == [60.0, 80.0]
     assert client.get("/drafts").json()[0]["score"]["score"] == 80.0
+
+
+def test_embedding_warmup_is_background_and_optional(runtime, monkeypatch):
+    from backend.daemon import server
+    from backend.evaluation import embeddings
+
+    assert server._warm_embeddings(runtime) is None  # POLYTONE_EMBEDDINGS=none → no thread
+    runtime.settings.polytone_embeddings = "qwen"
+    started = []
+
+    def slow_load():
+        started.append(1)
+        time.sleep(0.2)
+
+    monkeypatch.setattr(embeddings, "get_model", slow_load)
+    t0 = time.perf_counter()
+    t = server._warm_embeddings(runtime)
+    assert t is not None and t.daemon and time.perf_counter() - t0 < 0.1  # never blocks
+    t.join(2)
+    assert started == [1]
+
+
+def test_env_file_switches_reach_os_environ(tmp_path, monkeypatch):
+    import os
+
+    from backend.config import export_env_file
+
+    env = tmp_path / ".env"
+    env.write_text("POLYTONE_USER_EMAILS=me@example.com\nPOLYTONE_WATCHER=0\nANTHROPIC_API_KEY=sk-x\n")
+    monkeypatch.delenv("POLYTONE_USER_EMAILS", raising=False)
+    monkeypatch.setenv("POLYTONE_WATCHER", "1")  # real env wins over .env
+    export_env_file(env)
+    assert os.environ["POLYTONE_USER_EMAILS"] == "me@example.com"
+    assert os.environ["POLYTONE_WATCHER"] == "1"
+    assert os.environ.get("ANTHROPIC_API_KEY") == ""  # secrets stay in Settings only

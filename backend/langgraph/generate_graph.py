@@ -221,7 +221,7 @@ def score_draft(rt: Runtime, draft_id: str, text: str, persona: str) -> dict | N
             baseline = [s["text"] for s in rt.db.list_samples(limit=200)]
         if not baseline:
             return None
-        result = scorer(text, baseline)
+        result = scorer(text, baseline, persona)
         if result is not None and not isinstance(result, dict):
             result = dict(result)
         rt.db.update_draft_score(draft_id, result)

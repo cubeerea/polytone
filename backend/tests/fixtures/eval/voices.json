@@ -1,0 +1,54 @@
+{
+  "_note": "Original passages written for Polytone calibration. 'slack' = terse lowercase chat voice; 'formal' = long-sentence formal prose. Held-out items are never in the baseline. 'heldout_cross_topic' deliberately puts each voice on the other voice's usual subject matter, to check style beats topic.",
+  "slack": {
+    "baseline": [
+      "yeah i saw that. gonna look after lunch",
+      "lol no it's fine. just ship it",
+      "can u send me the link? can't find it in the thread",
+      "ok so the deploy failed again... checking logs now",
+      "omg finally. it works 🎉",
+      "nah i'm out tmrw. ping jess if it's urgent",
+      "wait which branch r we on? i'm confused lol",
+      "ugh standup ran long. be there in 5",
+      "sounds good! i'll update the ticket",
+      "tbh i don't love that approach but whatever, let's try it",
+      "fixed it. was a typo in the env file lol",
+      "anyone else seeing the 500s? def not just me right",
+      "i'll grab coffee first, brb",
+      "cool cool. lmk when ur done and i'll review"
+    ],
+    "heldout": [
+      "hey did the build pass? i can't tell from here lol",
+      "nope still broken. i'll dig in after this call",
+      "ok merged it. ping me if anything's weird"
+    ],
+    "heldout_cross_topic": [
+      "read that essay on civic duty last night. kinda dense tbh but i liked it",
+      "idk the history stuff is interesting but way too long lol"
+    ]
+  },
+  "formal": {
+    "baseline": [
+      "It has long been my conviction that the measure of a society lies not in the grandeur of its monuments, but in the quiet consideration it extends to those who possess the least.",
+      "When one surveys the history of the republic, one is struck less by the frequency of its failures than by the persistence with which its citizens have endeavoured to correct them.",
+      "I write to you, therefore, not in a spirit of complaint, but in the earnest hope that the matters described herein may receive the careful attention which their gravity deserves.",
+      "The committee, having deliberated at considerable length upon the proposal, has concluded that its merits, though genuine, are outweighed by the uncertainties attending its implementation.",
+      "Nothing in the foregoing should be construed as a criticism of those who laboured so diligently upon the original design; their efforts were, in every respect, admirable.",
+      "It is perhaps inevitable that a work of this scope should contain errors, and I would be grateful if readers who discover them would communicate their observations to the editor.",
+      "In the course of the past several months, it has become increasingly evident that the arrangements upon which we have hitherto relied are no longer adequate to our circumstances.",
+      "Let us consider, then, whether the principles we profess are in fact reflected in the institutions we maintain, or whether we have permitted the two to drift quietly apart.",
+      "The evening was cool and still, and as we walked along the river the conversation turned, as it so often did in those years, to the question of what we owed to one another.",
+      "Such a course of action, however attractive it may appear upon first consideration, would in my judgement expose the organisation to risks which it is neither obliged nor equipped to bear.",
+      "I remain, as ever, deeply grateful for the patience and generosity with which you have received my previous letters, and I trust that this one will find you in good health."
+    ],
+    "heldout": [
+      "It would be difficult to overstate the debt which the present generation owes to those who, often at great personal cost, preserved the traditions of open inquiry through a less hospitable age.",
+      "Having examined the documents with all the care that time permitted, I am persuaded that the original account, though incomplete, was substantially accurate in its principal claims.",
+      "We should not, I think, mistake the absence of open disagreement for the presence of genuine consensus, for silence is frequently the refuge of those who doubt that they will be heard."
+    ],
+    "heldout_cross_topic": [
+      "I regret to inform the team that the deployment scheduled for this afternoon has failed once more, and I shall be examining the relevant logs with some care before the day is out.",
+      "Should any colleague observe further errors of the kind reported this morning, I would be most grateful if they would bring them to my attention at their earliest convenience."
+    ]
+  }
+}

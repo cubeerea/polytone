@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from contextlib import asynccontextmanager
 from typing import Any, Literal
 
@@ -69,6 +70,28 @@ def _start_watcher(r: Runtime) -> Any:
         return None
 
 
+def _warm_embeddings(r: Runtime) -> threading.Thread | None:
+    """Load the Qwen embedding model in a daemon thread so the first draft's score isn't delayed.
+
+    Only when POLYTONE_EMBEDDINGS=qwen; never blocks startup and never raises.
+    """
+    if (r.settings.polytone_embeddings or "").strip().lower() != "qwen":
+        return None
+
+    def _load() -> None:
+        try:
+            from backend.evaluation import embeddings
+
+            if embeddings.get_model() is not None:
+                log.info("embedding model warm (%.1fs)", embeddings.load_seconds() or 0.0)
+        except Exception as e:  # noqa: BLE001 - optional component
+            log.warning("embedding warm-up failed: %s", e)
+
+    t = threading.Thread(target=_load, name="polytone-embed-warmup", daemon=True)
+    t.start()
+    return t
+
+
 def create_app(runtime: Runtime | None = None) -> FastAPI:
     holder: dict[str, Runtime] = {}
 
@@ -84,6 +107,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         if r.store.kind != "neo4j":
             log.warning("Neo4j not in use — style graph is in-memory and will not persist")
         watcher = _start_watcher(r)
+        _warm_embeddings(r)
         yield
         if watcher is not None:
             from backend.mcp_servers.file_watcher import stop_watcher
@@ -105,10 +129,14 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
     def health() -> dict[str, Any]:
         r = rt()
         neo4j_ok = r.store.kind == "neo4j" and r.store.healthy()
+        configured = "anthropic" if r.settings.llm_backend == "anthropic" else "mock"
         return {
             "status": "ok",
             "neo4j": bool(neo4j_ok),
-            "llm": "anthropic" if r.llm.name == "anthropic" else "mock",
+            # the configured backend; `llm_ready` is False when it can't actually run
+            # (POLYTONE_LLM=anthropic without a key → /generate answers 502)
+            "llm": configured,
+            "llm_ready": configured == "mock" or r.llm.name == "anthropic",
             "embeddings": "none" if r.settings.polytone_embeddings == "none" else "qwen",
             "graph_store": r.store.kind,
         }
@@ -212,6 +240,8 @@ def main() -> None:
     import uvicorn
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    # "constraint already exists" etc. are INFO-level server notifications — just noise here
+    logging.getLogger("neo4j.notifications").setLevel(logging.WARNING)
     settings = get_settings()
     rt = build_runtime(settings, score_async=True)
     set_runtime(rt)

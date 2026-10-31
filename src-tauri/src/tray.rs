@@ -95,6 +95,11 @@ fn on_menu_event(app: &AppHandle, event: MenuEvent) {
 }
 
 pub fn show_main_window(app: &AppHandle) {
+    // Undo an app-level hide (Test trigger hides the app to hand focus back).
+    #[cfg(target_os = "macos")]
+    {
+        let _ = app.show();
+    }
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
         let _ = w.unminimize();

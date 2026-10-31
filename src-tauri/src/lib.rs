@@ -89,7 +89,6 @@ pub fn run() {
 
     let app = tauri::Builder::default()
         .manage(AppState::default())
-        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
@@ -104,8 +103,18 @@ pub fn run() {
             tray::build(&handle)?;
             keyboard_hooks::register_initial(&handle);
             backend_process::autostart(&handle);
+            #[cfg(unix)]
+            backend_process::exit_on_signals(&handle);
+            // First launch (or permission revoked): open the window so the user sees the
+            // onboarding guide instead of a silent menu-bar icon. POLYTONE_SHOW_WINDOW=1 forces it.
+            let force_show = std::env::var("POLYTONE_SHOW_WINDOW").is_ok_and(|v| v == "1");
             if !permissions::accessibility_trusted() {
-                log::warn!("Accessibility permission not granted yet");
+                log::warn!(
+                    "Accessibility permission not granted yet; showing the onboarding window"
+                );
+                tray::show_main_window(&handle);
+            } else if force_show {
+                tray::show_main_window(&handle);
             }
             Ok(())
         })
@@ -130,7 +139,9 @@ pub fn run() {
 
     app.run(|handle, event| match event {
         // Keep running in the menu bar when the window is hidden/closed.
-        RunEvent::ExitRequested { code: None, api, .. } => api.prevent_exit(),
+        RunEvent::ExitRequested {
+            code: None, api, ..
+        } => api.prevent_exit(),
         RunEvent::Exit => backend_process::shutdown(handle),
         _ => {}
     });

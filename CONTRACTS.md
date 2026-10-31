@@ -39,7 +39,7 @@ Every component builds against this file. Change it only with the orchestrator's
 
 | Method | Path | Request | Response |
 |---|---|---|---|
-| GET | `/health` | – | `{"status":"ok","neo4j":bool,"llm":"anthropic"\|"mock","embeddings":"qwen"\|"none","graph_store":"neo4j"\|"memory"}` |
+| GET | `/health` | – | `{"status":"ok","neo4j":bool,"llm":"anthropic"\|"mock","embeddings":"qwen"\|"none","graph_store":"neo4j"\|"memory","llm_ready":bool}` (`llm` = configured backend; `llm_ready` false → `/generate` will 502) |
 | POST | `/generate` | `{"intent":str,"persona":str\|null,"app_context":str\|null}` | `{"draft_id":str,"text":str,"persona":str,"latency_ms":int,"constraints":Constraints}`; errors `502/504 {"error":"llm_failed"\|"llm_timeout","detail":str}` |
 | POST | `/ingest/manual` | `{"text":str,"persona":str\|null}` | `IngestResult` |
 | GET | `/ingest/sources` | – | `[{"name":"manual"\|"gmail"\|"wispr"\|"watcher","enabled":bool,"status":str,"last_run":iso\|null,"items_ingested":int}]` |

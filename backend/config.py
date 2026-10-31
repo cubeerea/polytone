@@ -1,4 +1,5 @@
 """Runtime settings, read from environment / .env. See CONTRACTS.md."""
+import os
 from functools import lru_cache
 from pathlib import Path
 
@@ -41,8 +42,31 @@ class Settings(BaseSettings):
         return self.polytone_data_dir / "polytone.sqlite3"
 
 
+# Switches some modules read straight from os.environ (not Settings fields).
+_ENV_PASSTHROUGH = ("POLYTONE_", "WISPR_", "HF_")
+
+
+def export_env_file(path: Path = REPO_ROOT / ".env") -> None:
+    """Copy POLYTONE_*/WISPR_*/HF_* keys from ``.env`` into ``os.environ`` (never overriding).
+
+    pydantic-settings maps ``.env`` onto ``Settings`` fields only; switches such as
+    ``POLYTONE_USER_EMAILS``, ``POLYTONE_WISPR_LOCAL`` or ``POLYTONE_WATCHER`` are read from the
+    process environment, so without this they would be silently ignored when set in ``.env``.
+    """
+    if not path.is_file():
+        return
+    try:
+        from dotenv import dotenv_values
+    except ImportError:  # pragma: no cover - python-dotenv ships with pydantic-settings
+        return
+    for k, v in dotenv_values(path).items():
+        if v and k.startswith(_ENV_PASSTHROUGH) and k not in os.environ:
+            os.environ[k] = v
+
+
 @lru_cache
 def get_settings() -> Settings:
+    export_env_file()
     s = Settings()
     s.polytone_data_dir.mkdir(parents=True, exist_ok=True)
     return s

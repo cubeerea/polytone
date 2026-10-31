@@ -4,6 +4,17 @@
 //! The pure decision logic (`capture`, `inject`) is written against the
 //! [`ClipboardIo`] and [`KeySim`] traits so it can be unit-tested with fakes.
 //! The real implementations use `arboard` and `enigo`.
+//!
+//! Clipboard restore: before touching the clipboard we take a [`SavedClipboard`]
+//! snapshot and put it back afterwards. On macOS that snapshot is every
+//! NSPasteboard item with every representation as raw bytes (plain + rich text,
+//! images, file URLs, app-private types), so images and copied files survive a
+//! run. Elsewhere — or if the macOS snapshot is unavailable/too large — it falls
+//! back to text, then an arboard RGBA image. Anything still unreadable is
+//! [`SavedClipboard::Unrestorable`]: we then leave the clipboard as-is (holding the
+//! draft) instead of wiping it. Known limits: lazily-promised data (file promises)
+//! is only kept if the source app hands it over when asked, and the snapshot is
+//! capped at [`MAX_SNAPSHOT_BYTES`].
 
 use std::sync::atomic::Ordering;
 use std::thread;
@@ -24,11 +35,94 @@ pub const EVENT_FINISHED: &str = "generation-finished";
 // Abstractions
 // ---------------------------------------------------------------------------
 
+/// Marker contained in every sentinel (see [`make_sentinel`]).
+pub const SENTINEL_MARK: &str = "polytone-sentinel";
+/// Larger native snapshots are skipped (we fall back to text / image).
+pub const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
+
+/// RGBA8 image, as arboard reads/writes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageSnapshot {
+    pub width: usize,
+    pub height: usize,
+    pub rgba: Vec<u8>,
+}
+
+/// One pasteboard item: every `(type identifier, raw bytes)` representation it offered.
+pub type NativeItem = Vec<(String, Vec<u8>)>;
+
+/// Everything we need to put the user's clipboard back the way it was.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum SavedClipboard {
+    #[default]
+    Empty,
+    Text(String),
+    Image(ImageSnapshot),
+    /// Full macOS pasteboard snapshot (all items, all types).
+    Native(Vec<NativeItem>),
+    /// Something is on the clipboard but we could not read it; never clobber it with `clear`.
+    Unrestorable,
+}
+
+pub const PLAIN_TEXT_UTI: &str = "public.utf8-plain-text";
+
+impl SavedClipboard {
+    /// Plain-text view of the saved content (used as the step-3 capture fallback).
+    pub fn text(&self) -> Option<String> {
+        match self {
+            SavedClipboard::Text(t) => Some(t.clone()),
+            SavedClipboard::Native(items) => items
+                .iter()
+                .flatten()
+                .find(|(t, _)| t == PLAIN_TEXT_UTI)
+                .and_then(|(_, d)| String::from_utf8(d.clone()).ok())
+                .filter(|t| !t.is_empty()),
+            _ => None,
+        }
+    }
+}
+
 pub trait ClipboardIo {
     /// Current clipboard text, `None` if empty / not text / unreadable.
     fn get_text(&mut self) -> Option<String>;
     fn set_text(&mut self, text: &str) -> Result<(), String>;
     fn clear(&mut self) -> Result<(), String>;
+    /// Current clipboard image, `None` if there is none.
+    fn get_image(&mut self) -> Option<ImageSnapshot> {
+        None
+    }
+    fn set_image(&mut self, _img: &ImageSnapshot) -> Result<(), String> {
+        Err("restoring images is not supported here".into())
+    }
+    /// Full-fidelity snapshot of every item/type (macOS). `None` = unsupported / unavailable.
+    fn save_native(&mut self) -> Option<Vec<NativeItem>> {
+        None
+    }
+    fn restore_native(&mut self, _items: &[NativeItem]) -> Result<(), String> {
+        Err("native clipboard restore is not supported here".into())
+    }
+    /// Whether the clipboard holds anything at all, of any type.
+    fn has_content(&mut self) -> bool {
+        false
+    }
+}
+
+/// Snapshot the clipboard before the loop overwrites it.
+pub fn save_clipboard<C: ClipboardIo>(clip: &mut C) -> SavedClipboard {
+    if let Some(items) = clip.save_native().filter(|i| !i.is_empty()) {
+        return SavedClipboard::Native(items);
+    }
+    if let Some(t) = clip.get_text() {
+        return SavedClipboard::Text(t);
+    }
+    if let Some(img) = clip.get_image() {
+        return SavedClipboard::Image(img);
+    }
+    if clip.has_content() {
+        SavedClipboard::Unrestorable
+    } else {
+        SavedClipboard::Empty
+    }
 }
 
 pub trait KeySim {
@@ -97,8 +191,10 @@ pub enum CaptureOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CaptureResult {
     pub outcome: CaptureOutcome,
-    /// Clipboard content before we touched it; must be restored afterwards.
+    /// Clipboard text before we touched it (the step-3 fallback).
     pub original: Option<String>,
+    /// Full clipboard content before we touched it; restore with [`restore_clipboard`].
+    pub saved: SavedClipboard,
 }
 
 /// A clipboard value is usable intent if it is non-blank and not our sentinel.
@@ -115,7 +211,7 @@ pub fn make_sentinel() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!("\u{2063}polytone-sentinel-{nanos}\u{2063}")
+    format!("\u{2063}{SENTINEL_MARK}-{nanos}\u{2063}")
 }
 
 fn poll_clipboard<C: ClipboardIo>(clip: &mut C, sentinel: &str, timing: &Timing) -> Option<String> {
@@ -140,12 +236,17 @@ pub fn capture<C: ClipboardIo, K: KeySim>(
     sentinel: &str,
     timing: &Timing,
 ) -> Result<CaptureResult, String> {
-    let original = clip.get_text();
+    let saved = save_clipboard(clip);
+    let original = saved.text();
     let result = capture_inner(clip, keys, sentinel, timing, original.as_deref());
     match result {
-        Ok(outcome) => Ok(CaptureResult { outcome, original }),
+        Ok(outcome) => Ok(CaptureResult {
+            outcome,
+            original,
+            saved,
+        }),
         Err(e) => {
-            let _ = restore_clipboard(clip, original.as_deref());
+            let _ = restore_clipboard(clip, &saved);
             Err(e)
         }
     }
@@ -194,10 +295,36 @@ fn capture_inner<C: ClipboardIo, K: KeySim>(
     Ok(CaptureOutcome::Empty)
 }
 
-pub fn restore_clipboard<C: ClipboardIo>(clip: &mut C, original: Option<&str>) -> Result<(), String> {
-    match original {
-        Some(text) => clip.set_text(text),
-        None => clip.clear(),
+/// Put the saved clipboard back. Falls back to plain text if a native restore fails;
+/// for [`SavedClipboard::Unrestorable`] it only removes our own sentinel and otherwise
+/// leaves the clipboard untouched.
+pub fn restore_clipboard<C: ClipboardIo>(
+    clip: &mut C,
+    saved: &SavedClipboard,
+) -> Result<(), String> {
+    match saved {
+        SavedClipboard::Empty => clip.clear(),
+        SavedClipboard::Text(text) => clip.set_text(text),
+        SavedClipboard::Image(img) => clip.set_image(img),
+        SavedClipboard::Native(items) => {
+            clip.restore_native(items).or_else(|e| match saved.text() {
+                Some(t) => {
+                    log::warn!("full clipboard restore failed ({e}); restored text only");
+                    clip.set_text(&t)
+                }
+                None => Err(e),
+            })
+        }
+        SavedClipboard::Unrestorable => {
+            if clip.get_text().is_some_and(|t| t.contains(SENTINEL_MARK)) {
+                clip.clear()
+            } else {
+                log::warn!(
+                    "original clipboard content could not be saved; leaving the draft on it"
+                );
+                Ok(())
+            }
+        }
     }
 }
 
@@ -208,7 +335,7 @@ pub fn inject<C: ClipboardIo, K: KeySim>(
     keys: &mut K,
     draft: &str,
     mode: &InjectMode,
-    original: Option<&str>,
+    saved: &SavedClipboard,
     timing: &Timing,
 ) -> Result<(), String> {
     let res = match mode {
@@ -223,7 +350,7 @@ pub fn inject<C: ClipboardIo, K: KeySim>(
         })(),
         InjectMode::Type => keys.type_text(draft),
     };
-    let restored = restore_clipboard(clip, original);
+    let restored = restore_clipboard(clip, saved);
     res.and(restored)
 }
 
@@ -257,6 +384,102 @@ impl ClipboardIo for SystemClipboard {
     }
     fn clear(&mut self) -> Result<(), String> {
         self.0.clear().map_err(|e| e.to_string())
+    }
+    fn get_image(&mut self) -> Option<ImageSnapshot> {
+        let img = self.0.get_image().ok()?;
+        Some(ImageSnapshot {
+            width: img.width,
+            height: img.height,
+            rgba: img.bytes.into_owned(),
+        })
+    }
+    fn set_image(&mut self, img: &ImageSnapshot) -> Result<(), String> {
+        self.0
+            .set_image(arboard::ImageData {
+                width: img.width,
+                height: img.height,
+                bytes: std::borrow::Cow::Borrowed(&img.rgba),
+            })
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(target_os = "macos")]
+    fn save_native(&mut self) -> Option<Vec<NativeItem>> {
+        macos_pasteboard::save(MAX_SNAPSHOT_BYTES)
+    }
+    #[cfg(target_os = "macos")]
+    fn restore_native(&mut self, items: &[NativeItem]) -> Result<(), String> {
+        macos_pasteboard::restore(items)
+    }
+    #[cfg(target_os = "macos")]
+    fn has_content(&mut self) -> bool {
+        macos_pasteboard::has_content()
+    }
+}
+
+/// Raw NSPasteboard snapshot / restore (all items, all representations).
+#[cfg(target_os = "macos")]
+mod macos_pasteboard {
+    use super::NativeItem;
+    use objc2::rc::{Retained, autoreleasepool};
+    use objc2::runtime::ProtocolObject;
+    use objc2_app_kit::{NSPasteboard, NSPasteboardItem, NSPasteboardWriting};
+    use objc2_foundation::{NSArray, NSData, NSString};
+
+    pub fn save(max_bytes: usize) -> Option<Vec<NativeItem>> {
+        autoreleasepool(|_| {
+            let pb = NSPasteboard::generalPasteboard();
+            let items = pb.pasteboardItems()?;
+            let mut out = Vec::with_capacity(items.count());
+            let mut total = 0usize;
+            for item in items.iter() {
+                let mut reps: NativeItem = Vec::new();
+                for ty in item.types().iter() {
+                    if let Some(data) = item.dataForType(&ty) {
+                        let bytes = data.to_vec();
+                        total += bytes.len();
+                        if total > max_bytes {
+                            log::warn!("clipboard snapshot over {max_bytes} bytes; falling back");
+                            return None;
+                        }
+                        reps.push((ty.to_string(), bytes));
+                    }
+                }
+                if !reps.is_empty() {
+                    out.push(reps);
+                }
+            }
+            Some(out)
+        })
+    }
+
+    pub fn restore(items: &[NativeItem]) -> Result<(), String> {
+        autoreleasepool(|_| {
+            let pb = NSPasteboard::generalPasteboard();
+            let objs: Vec<Retained<ProtocolObject<dyn NSPasteboardWriting>>> = items
+                .iter()
+                .map(|reps| {
+                    let item = NSPasteboardItem::new();
+                    for (ty, bytes) in reps {
+                        item.setData_forType(&NSData::with_bytes(bytes), &NSString::from_str(ty));
+                    }
+                    ProtocolObject::from_retained(item)
+                })
+                .collect();
+            pb.clearContents();
+            if pb.writeObjects(&NSArray::from_retained_slice(&objs)) {
+                Ok(())
+            } else {
+                Err("NSPasteboard rejected the restored items".into())
+            }
+        })
+    }
+
+    pub fn has_content() -> bool {
+        autoreleasepool(|_| {
+            NSPasteboard::generalPasteboard()
+                .types()
+                .is_some_and(|t| t.count() > 0)
+        })
     }
 }
 
@@ -441,7 +664,7 @@ fn run_loop_inner(state: &AppState, started: Instant) -> RunResult {
     let (intent, source) = match cap.outcome {
         CaptureOutcome::Captured { text, source } => (text, source),
         CaptureOutcome::Empty => {
-            let _ = restore_clipboard(&mut clip, cap.original.as_deref());
+            let _ = restore_clipboard(&mut clip, &cap.saved);
             return RunResult::err(started, backend_client::MSG_EMPTY);
         }
     };
@@ -455,19 +678,12 @@ fn run_loop_inner(state: &AppState, started: Instant) -> RunResult {
     let draft = match tauri::async_runtime::block_on(client.generate(&req)) {
         Ok(r) => r.text,
         Err(e) => {
-            let _ = restore_clipboard(&mut clip, cap.original.as_deref());
+            let _ = restore_clipboard(&mut clip, &cap.saved);
             return RunResult::err(started, e.user_message());
         }
     };
 
-    if let Err(e) = inject(
-        &mut clip,
-        &mut keys,
-        &draft,
-        &mode,
-        cap.original.as_deref(),
-        &timing,
-    ) {
+    if let Err(e) = inject(&mut clip, &mut keys, &draft, &mode, &cap.saved, &timing) {
         return RunResult::err(started, format!("Polytone could not insert the draft: {e}"));
     }
 
@@ -630,9 +846,18 @@ pub fn set_hotkey_paused(app: AppHandle, paused: bool) -> HotkeyStatus {
 
 #[tauri::command]
 pub async fn trigger_now(app: AppHandle) -> Result<RunResult, String> {
-    tauri::async_runtime::spawn_blocking(move || run_loop(&app))
-        .await
-        .map_err(|e| e.to_string())
+    // Invoked from Polytone's own window, which has focus: hide the app so macOS
+    // re-activates the app the user was in, then run the loop against that.
+    #[cfg(target_os = "macos")]
+    {
+        let _ = app.hide();
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        thread::sleep(Duration::from_millis(350));
+        run_loop(&app)
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -655,6 +880,13 @@ mod tests {
         fail_copy: bool,
         /// If false, copy does nothing (app ignores Cmd+C, e.g. password field).
         copy_works: bool,
+        /// Non-text clipboard content.
+        image: Option<ImageSnapshot>,
+        /// Opaque content we can't read at all (e.g. a file promise).
+        opaque: bool,
+        /// Simulate the macOS full-pasteboard snapshot.
+        native: bool,
+        native_restore_fails: bool,
     }
 
     type W = Rc<RefCell<World>>;
@@ -670,13 +902,73 @@ mod tests {
             let mut w = self.0.borrow_mut();
             w.log.push(format!("set:{t}"));
             w.clipboard = Some(t.to_string());
+            w.image = None;
+            w.opaque = false;
             Ok(())
         }
         fn clear(&mut self) -> Result<(), String> {
             let mut w = self.0.borrow_mut();
             w.log.push("clear".into());
             w.clipboard = None;
+            w.image = None;
+            w.opaque = false;
             Ok(())
+        }
+        fn get_image(&mut self) -> Option<ImageSnapshot> {
+            let w = self.0.borrow();
+            w.image.clone().filter(|_| w.clipboard.is_none())
+        }
+        fn set_image(&mut self, img: &ImageSnapshot) -> Result<(), String> {
+            let mut w = self.0.borrow_mut();
+            w.log.push("set_image".into());
+            w.clipboard = None;
+            w.image = Some(img.clone());
+            Ok(())
+        }
+        fn save_native(&mut self) -> Option<Vec<NativeItem>> {
+            let w = self.0.borrow();
+            if !w.native {
+                return None;
+            }
+            let mut reps: NativeItem = Vec::new();
+            if let Some(t) = &w.clipboard {
+                reps.push((PLAIN_TEXT_UTI.into(), t.clone().into_bytes()));
+                reps.push(("public.rtf".into(), format!("{{\\rtf1 {t}}}").into_bytes()));
+            }
+            if let Some(img) = &w.image {
+                reps.push(("public.png".into(), img.rgba.clone()));
+            }
+            Some(if reps.is_empty() { vec![] } else { vec![reps] })
+        }
+        fn restore_native(&mut self, items: &[NativeItem]) -> Result<(), String> {
+            let mut w = self.0.borrow_mut();
+            if w.native_restore_fails {
+                return Err("nope".into());
+            }
+            w.log.push(format!(
+                "restore_native:{}",
+                items.iter().map(|i| i.len()).sum::<usize>()
+            ));
+            w.clipboard = None;
+            w.image = None;
+            for (ty, data) in items.iter().flatten() {
+                match ty.as_str() {
+                    PLAIN_TEXT_UTI => w.clipboard = Some(String::from_utf8(data.clone()).unwrap()),
+                    "public.png" => {
+                        w.image = Some(ImageSnapshot {
+                            width: 1,
+                            height: 1,
+                            rgba: data.clone(),
+                        })
+                    }
+                    _ => {}
+                }
+            }
+            Ok(())
+        }
+        fn has_content(&mut self) -> bool {
+            let w = self.0.borrow();
+            w.clipboard.is_some() || w.image.is_some() || w.opaque
         }
     }
 
@@ -734,7 +1026,7 @@ mod tests {
         }))
     }
 
-    const S: &str = "<<SENTINEL>>";
+    const S: &str = "<<polytone-sentinel>>";
 
     fn run_capture(w: &W) -> Result<CaptureResult, String> {
         capture(
@@ -789,7 +1081,12 @@ mod tests {
         let log = w.borrow().log.clone();
         assert_eq!(
             log,
-            vec![format!("set:{S}"), "copy".into(), "select_all".into(), "copy".into()]
+            vec![
+                format!("set:{S}"),
+                "copy".into(),
+                "select_all".into(),
+                "copy".into()
+            ]
         );
     }
 
@@ -862,7 +1159,7 @@ mod tests {
             &mut FakeKeys(w.clone()),
             "Polished draft.",
             &InjectMode::Paste,
-            r.original.as_deref(),
+            &r.saved,
             &Timing::INSTANT,
         )
         .unwrap();
@@ -880,7 +1177,7 @@ mod tests {
             &mut FakeKeys(w.clone()),
             "nice bit",
             &InjectMode::Paste,
-            r.original.as_deref(),
+            &r.saved,
             &Timing::INSTANT,
         )
         .unwrap();
@@ -900,7 +1197,7 @@ mod tests {
             &mut FakeKeys(w.clone()),
             "Typed draft",
             &InjectMode::Type,
-            r.original.as_deref(),
+            &r.saved,
             &Timing::INSTANT,
         )
         .unwrap();
@@ -908,6 +1205,128 @@ mod tests {
         assert_eq!(w.field, "Typed draft");
         assert_eq!(w.clipboard.as_deref(), Some("orig"));
         assert!(!w.log.contains(&"paste".to_string()));
+    }
+
+    fn paste_run(w: &W, draft: &str) -> CaptureResult {
+        let r = run_capture(w).unwrap();
+        inject(
+            &mut FakeClip(w.clone()),
+            &mut FakeKeys(w.clone()),
+            draft,
+            &InjectMode::Paste,
+            &r.saved,
+            &Timing::INSTANT,
+        )
+        .unwrap();
+        r
+    }
+
+    fn img() -> ImageSnapshot {
+        ImageSnapshot {
+            width: 1,
+            height: 1,
+            rgba: vec![1, 2, 3, 255],
+        }
+    }
+
+    #[test]
+    fn image_clipboard_is_restored_not_cleared() {
+        let w = world(None, "rough intent", None);
+        w.borrow_mut().image = Some(img());
+        let r = paste_run(&w, "Draft.");
+        assert_eq!(r.saved, SavedClipboard::Image(img()));
+        let w = w.borrow();
+        assert_eq!(w.field, "Draft.");
+        assert_eq!(w.image, Some(img()));
+        assert_eq!(w.clipboard, None);
+        assert!(!w.log.contains(&"clear".to_string()));
+    }
+
+    #[test]
+    fn native_snapshot_restores_every_representation() {
+        let w = world(Some("orig"), "rough intent", None);
+        w.borrow_mut().native = true;
+        let r = paste_run(&w, "Draft.");
+        assert!(matches!(&r.saved, SavedClipboard::Native(items) if items[0].len() == 2));
+        assert_eq!(r.original.as_deref(), Some("orig"));
+        let w = w.borrow();
+        assert_eq!(w.field, "Draft.");
+        assert_eq!(w.clipboard.as_deref(), Some("orig"));
+        assert_eq!(w.log.last().map(String::as_str), Some("restore_native:2"));
+    }
+
+    #[test]
+    fn native_text_still_works_as_capture_fallback() {
+        let w = world(Some("from clipboard"), "", None);
+        w.borrow_mut().native = true;
+        let r = run_capture(&w).unwrap();
+        assert_eq!(
+            r.outcome,
+            CaptureOutcome::Captured {
+                text: "from clipboard".into(),
+                source: CaptureSource::Clipboard
+            }
+        );
+    }
+
+    #[test]
+    fn native_restore_failure_falls_back_to_text() {
+        let w = world(Some("orig"), "rough", None);
+        {
+            let mut b = w.borrow_mut();
+            b.native = true;
+            b.native_restore_fails = true;
+        }
+        paste_run(&w, "Draft.");
+        assert_eq!(w.borrow().clipboard.as_deref(), Some("orig"));
+    }
+
+    #[test]
+    fn unreadable_clipboard_is_not_clobbered_with_clear() {
+        let w = world(None, "rough intent", None);
+        w.borrow_mut().opaque = true;
+        let r = paste_run(&w, "Draft.");
+        assert_eq!(r.saved, SavedClipboard::Unrestorable);
+        let w = w.borrow();
+        assert_eq!(w.field, "Draft.");
+        // We could not save it, so we leave the draft rather than wiping the clipboard.
+        assert_eq!(w.clipboard.as_deref(), Some("Draft."));
+        assert!(!w.log.contains(&"clear".to_string()));
+    }
+
+    #[test]
+    fn unreadable_clipboard_sentinel_is_removed_on_empty_capture() {
+        let w = world(None, "", None);
+        w.borrow_mut().opaque = true;
+        let r = run_capture(&w).unwrap();
+        assert_eq!(r.outcome, CaptureOutcome::Empty);
+        restore_clipboard(&mut FakeClip(w.clone()), &r.saved).unwrap();
+        assert_eq!(w.borrow().clipboard, None);
+    }
+
+    /// Touches the real macOS pasteboard (and puts the user's content back). Run with
+    /// `cargo test -- --ignored real_pasteboard`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn real_pasteboard_image_round_trip() {
+        let mut clip = SystemClipboard::new().unwrap();
+        let users = save_clipboard(&mut clip);
+        let pixel = ImageSnapshot {
+            width: 2,
+            height: 1,
+            rgba: vec![255, 0, 0, 255, 0, 0, 255, 255],
+        };
+        clip.set_image(&pixel).unwrap();
+        let saved = save_clipboard(&mut clip);
+        assert!(matches!(saved, SavedClipboard::Native(_)), "{saved:?}");
+        clip.set_text("draft text").unwrap();
+        restore_clipboard(&mut clip, &saved).unwrap();
+        let back = clip.get_image();
+        let text = clip.get_text();
+        restore_clipboard(&mut clip, &users).unwrap();
+        assert_eq!(back.map(|i| (i.width, i.height)), Some((2, 1)));
+        assert_eq!(text, None);
     }
 
     #[test]

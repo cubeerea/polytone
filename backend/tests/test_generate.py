@@ -99,14 +99,14 @@ def test_llm_failure_raises_instead_of_mock_fallback(runtime):
 def test_score_hook(runtime):
     calls = []
 
-    def fake_score(text, baseline):
-        calls.append((text, baseline))
+    def fake_score(text, baseline, persona=None):
+        calls.append((text, baseline, persona))
         return {"score": 77.0, "distance": 0.23, "components": {}}
 
     runtime.scorer = fake_score
     run_ingest(HUMAN_SAMPLES[0], "manual", "Default", {}, runtime=runtime)
     out = run_generation("- hi", "Default", runtime=runtime)
-    assert calls and calls[0][1] == [HUMAN_SAMPLES[0]]
+    assert calls and calls[0][1] == [HUMAN_SAMPLES[0]] and calls[0][2] == "Default"
     assert runtime.db.get_draft(out["draft_id"])["score"]["score"] == 77.0
 
 

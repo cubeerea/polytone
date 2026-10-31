@@ -139,6 +139,33 @@ pub fn shutdown(app: &AppHandle) {
     }
 }
 
+/// SIGTERM / SIGINT / SIGHUP (e.g. `kill`, Ctrl-C under `pnpm tauri dev`) bypass Tauri's
+/// exit events, which would orphan the backend we spawned. Route them through a clean exit.
+#[cfg(unix)]
+pub fn exit_on_signals(app: &AppHandle) {
+    use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+    let mut signals = match signal_hook::iterator::Signals::new([SIGTERM, SIGINT, SIGHUP]) {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!("signal handler not installed: {e}");
+            return;
+        }
+    };
+    let app = app.clone();
+    let spawned = std::thread::Builder::new()
+        .name("polytone-signals".into())
+        .spawn(move || {
+            if let Some(sig) = signals.forever().next() {
+                log::info!("received signal {sig}; shutting down");
+                shutdown(&app);
+                app.exit(0);
+            }
+        });
+    if let Err(e) = spawned {
+        log::warn!("signal thread not started: {e}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -75,8 +75,28 @@ impl BackendError {
             BackendError::NotRunning => MSG_NOT_RUNNING.to_string(),
             BackendError::Timeout => MSG_TIMEOUT.to_string(),
             BackendError::Http { status, body } => {
-                let body: String = body.chars().take(140).collect();
-                format!("Polytone backend error ({status}): {body}")
+                // CONTRACTS: 502 {"error":"llm_failed","detail"} · 504 {"error":"llm_timeout"} · 422 empty intent
+                let parsed: Option<serde_json::Value> = serde_json::from_str(body).ok();
+                let field = |k: &str| {
+                    parsed
+                        .as_ref()
+                        .and_then(|v| v.get(k))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                };
+                let detail: String = field("detail")
+                    .unwrap_or_else(|| body.clone())
+                    .chars()
+                    .take(140)
+                    .collect();
+                match (status, field("error").as_deref()) {
+                    (_, Some("llm_timeout")) | (504, _) => {
+                        format!("{MSG_TIMEOUT} (the model took too long)")
+                    }
+                    (_, Some("llm_failed")) => format!("Polytone couldn't write a draft: {detail}"),
+                    (422, _) => MSG_EMPTY.to_string(),
+                    _ => format!("Polytone backend error ({status}): {detail}"),
+                }
             }
             BackendError::Decode(e) => format!("Polytone got a bad response: {e}"),
             BackendError::Other(e) => format!("Polytone error: {e}"),
@@ -162,7 +182,12 @@ impl BackendClient {
     }
 
     pub async fn generate(&self, req: &GenerateRequest) -> Result<GenerateResponse, BackendError> {
-        let resp = self.http.post(self.url("/generate")).json(req).send().await?;
+        let resp = self
+            .http
+            .post(self.url("/generate"))
+            .json(req)
+            .send()
+            .await?;
         Ok(Self::check(resp).await?.json().await?)
     }
 
@@ -197,10 +222,9 @@ mod tests {
             serde_json::from_str(r#"{"active_persona":"Boss","hotkey":"CmdOrCtrl+Shift+P"}"#)
                 .unwrap();
         assert_eq!(cfg.inject_mode, InjectMode::Paste);
-        let cfg: BackendConfig = serde_json::from_str(
-            r#"{"active_persona":"Boss","hotkey":"X","inject_mode":"type"}"#,
-        )
-        .unwrap();
+        let cfg: BackendConfig =
+            serde_json::from_str(r#"{"active_persona":"Boss","hotkey":"X","inject_mode":"type"}"#)
+                .unwrap();
         assert_eq!(cfg.inject_mode, InjectMode::Type);
         let s = serde_json::to_string(&cfg).unwrap();
         assert!(s.contains(r#""inject_mode":"type""#));
@@ -234,6 +258,26 @@ mod tests {
     fn user_messages() {
         assert_eq!(BackendError::NotRunning.user_message(), MSG_NOT_RUNNING);
         assert_eq!(BackendError::Timeout.user_message(), MSG_TIMEOUT);
+        let http = |status: u16, body: &str| {
+            BackendError::Http {
+                status,
+                body: body.into(),
+            }
+            .user_message()
+        };
+        assert_eq!(
+            http(
+                502,
+                r#"{"error":"llm_failed","detail":"no LLM configured"}"#
+            ),
+            "Polytone couldn't write a draft: no LLM configured"
+        );
+        assert!(http(504, r#"{"error":"llm_timeout","detail":"x"}"#).starts_with(MSG_TIMEOUT));
+        assert_eq!(http(422, r#"{"detail":"intent is empty"}"#), MSG_EMPTY);
+        assert_eq!(
+            http(500, "Internal Server Error"),
+            "Polytone backend error (500): Internal Server Error"
+        );
     }
 
     #[test]

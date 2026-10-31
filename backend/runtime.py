@@ -22,7 +22,8 @@ from backend.storage.db import Database
 
 log = logging.getLogger(__name__)
 
-Scorer = Callable[[str, list[str]], dict]
+# scorer(text, baseline_texts, persona) -> ScoreBreakdown
+Scorer = Callable[[str, list[str], str | None], dict]
 
 
 def load_scorer() -> Scorer | None:
