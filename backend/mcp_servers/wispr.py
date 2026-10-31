@@ -144,7 +144,12 @@ def _connect(url: str, api_key: str, open_timeout: float):
     from websockets.asyncio.client import connect
 
     headers = {"Authorization": f"Bearer {api_key}", "X-API-Key": api_key} if api_key else {}
-    return connect(url, additional_headers=headers, open_timeout=open_timeout, max_size=2**22)
+    kw: dict[str, Any] = {}
+    if url.lower().startswith("wss://"):
+        from backend.security.tls import tls13_context
+
+        kw["ssl"] = tls13_context()  # TLS 1.3 minimum, like every other outbound connection
+    return connect(url, additional_headers=headers, open_timeout=open_timeout, max_size=2**22, **kw)
 
 
 async def stream_transcripts(

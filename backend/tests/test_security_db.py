@@ -164,3 +164,32 @@ def test_purge_and_wipe(tmp_path):
     assert sorted(s["text"] for s in db.list_samples()) == ["manual long ago by me", "typed just now by me"]
     assert db.wipe_user_data() == {"samples": 2, "drafts": 0, "draft_edits": 0}
     assert db.count_samples() == 0
+
+
+def test_wrong_key_refuses_to_open(tmp_path, monkeypatch):
+    """A database written under one data key must not be opened (and written to) under another."""
+    import base64
+
+    import pytest
+
+    from backend.security import keys
+
+    p = tmp_path / "k.sqlite3"
+    db = Database(p)
+    db.insert_sample(text=f"honestly {SECRET} is fine", source="manual", persona="Default")
+    db.insert_draft(persona="Default", intent="x", text="draft one")
+    db.close()
+    before = _raw(p, "SELECT text FROM samples")
+    monkeypatch.setenv(keys.ENV_KEY, base64.b64encode(b"k" * 32).decode())
+    crypto.reset_cache()
+    try:
+        with pytest.raises(crypto.KeyMismatch):
+            Database(p)
+        assert _raw(p, "SELECT text FROM samples") == before
+        assert _raw(p, "SELECT COUNT(*) FROM drafts") == [(1,)]
+        # an empty database opens fine under any key (nothing to lose)
+        Database(tmp_path / "empty.sqlite3")
+    finally:
+        monkeypatch.undo()
+        crypto.reset_cache()
+    assert Database(p).list_samples()[0]["text"] == f"honestly {SECRET} is fine"

@@ -80,6 +80,28 @@ def test_missing_head_file_detected(audit):
     assert v["ok"] is False and "missing" in v["reason"]
 
 
+@pytest.mark.parametrize("content", ["[]", '"x"', "{}", '{"seq": "5", "mac": ""}', '{"seq": true}', "", "{"])
+def test_malformed_head_file_reported_not_raised(audit, content):
+    audit.head_path.write_text(content)
+    v = audit.verify()
+    assert v["ok"] is False and "unreadable" in v["reason"]
+
+
+def test_head_behind_log_must_name_a_real_row(audit):
+    # Crash between commit and head write: head one row behind with that row's mac is fine.
+    row3 = audit.entries(limit=1, before_seq=4)[0]
+    audit.head_path.write_text(json.dumps({"seq": 3, "mac": row3["mac"]}))
+    assert audit.verify()["ok"] is True
+    # Tail deleted and a made-up head written behind the log: detected.
+    c = _raw(audit)
+    c.execute("DROP TRIGGER audit_log_no_delete")
+    c.execute("DELETE FROM audit_log WHERE seq >= 4")
+    c.close()
+    audit.head_path.write_text(json.dumps({"seq": 2, "mac": "0" * 64}))
+    v = audit.verify()
+    assert v["ok"] is False and v["first_bad_seq"] == 2 and "does not match" in v["reason"]
+
+
 def test_key_mismatch_detected(audit, monkeypatch):
     monkeypatch.setenv(keys.ENV_KEY, base64.b64encode(b"x" * 32).decode())
     crypto.reset_cache()

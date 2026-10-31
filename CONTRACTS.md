@@ -260,7 +260,8 @@ an attacker running as the same user with the Polytone window unlocked, or root.
 - Decryption is memoized in process memory (bounded LRU keyed by ciphertext, plus the graph store's
   key→word map), so the hot path does not decrypt per request. A legacy plaintext value read after the
   migration (written by an older build) is returned as is and encrypted at the next start; a corrupt or
-  wrong-key `enc1:` value raises.
+  wrong-key `enc1:` value raises. `Database.init` probes the newest `enc1:` value of each table and refuses to
+  start (`KeyMismatch`) when it does not decrypt, so a replaced key never writes rows under a second key.
 - Migration runs at every start (`Database.init`, `connect_graph_store`) and is a no-op once done:
   idempotent (already-`enc1:`/`idx1:` values skipped), one transaction per table (two legacy samples whose
   stripped text collides are deduped) then `VACUUM` + `wal_checkpoint(TRUNCATE)` so plaintext pages don't
@@ -322,8 +323,8 @@ an attacker running as the same user with the Polytone window unlocked, or root.
   `capture.start/stop` (`PUT /config`), `data.*`, `key.created` and `migration.encrypted` (`build_runtime`).
   `session.unlock_failed` and Rust-side capture events come via `POST /audit/event`. Actors: `app`, `ui`,
   `backend`, `unknown` (denied requests). `generate`/`ingest` rows are written off the request thread.
-- Verify also fails when `.audit_head` is missing while rows exist, or its mac doesn't match the last row;
-  `.audit_head` behind the log (crash between commit and head write) is fine. Appends are serialized
+- Verify also fails when `.audit_head` is missing while rows exist, is malformed, or its mac doesn't match
+  the row it names; `.audit_head` behind the log (crash between commit and head write) is fine. Appends are serialized
   across processes (`flock` on `data/.audit.lock`). Strings longer than 200 chars in `detail` are replaced
   by `<n chars dropped>`. Limitation: an attacker with the data dir can delete the tail AND rewrite
   `.audit_head` to the new last row (its mac is in the log); detecting that needs an external anchor.
@@ -337,13 +338,15 @@ an attacker running as the same user with the Polytone window unlocked, or root.
   (SDK timeout 6.5 s / 0 retries / prompt caching unchanged); googleapiclient → `AuthorizedHttp` over
   `httplib2.Http(tls_minimum_version=TLSv1_3)` (API calls, discovery doc and its token refreshes);
   google-auth refresh at load and the OAuth code exchange → a `requests` session whose HTTPS adapter
-  carries the context.
+  carries the context. Optional Wispr WebSocket (`WISPR_WS_URL`, `wss://`) → the same context.
 - Loopback (UI/Rust ↔ backend, backend ↔ Neo4j on 127.0.0.1): no TLS; protected by tokens / password.
   Neo4j ports stay bound to 127.0.0.1.
 - Neo4j password: `scripts/rotate-neo4j-password.sh` generates a random 32-char one, applies it in the
   running container (`docker compose exec -T -e NEO4J_PASSWORD neo4j cypher-shell -u neo4j -d system`,
   the `ALTER CURRENT USER SET PASSWORD FROM … TO …` statement on stdin so neither password is in argv),
-  and only after that succeeds rewrites `NEO4J_PASSWORD` in `.env` (atomic, 0600). `dev.sh` runs it when
+  and only after that succeeds rewrites `NEO4J_PASSWORD` in `.env` (atomic, 0600). Until then the new
+  password sits in `.env.neo4j-password-pending` (0600), so an unknown outcome (exec dies after the commit,
+  Ctrl-C) never loses it; the script refuses to run while that file exists. `dev.sh` runs it when
   `.env` still has the default (or no `NEO4J_PASSWORD`). `docker-compose.yml` takes the initial
   `NEO4J_AUTH` password from `.env` (`${NEO4J_PASSWORD:-polytone-local}`; Neo4j only reads it on first init).
 

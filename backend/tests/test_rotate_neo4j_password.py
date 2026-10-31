@@ -76,6 +76,23 @@ def test_failure_leaves_env_untouched(env):
     assert ".env was NOT modified" in r.stderr and "does not match" in r.stderr
 
 
+def test_new_password_recoverable_when_the_outcome_is_unknown(env):
+    """exec fails after Neo4j may have committed the change: the new password must not be lost."""
+    e, envfile, log = env
+    r = _run(e, FAKE_EXIT="1", FAKE_MSG="connection reset")
+    assert r.returncode == 1
+    pending = envfile.parent / ".env.neo4j-password-pending"
+    new = pending.read_text().strip()
+    assert re.fullmatch(r"[A-Za-z0-9]{32}", new) and f"TO '{new}'" in log.read_text()
+    assert stat.S_IMODE(pending.stat().st_mode) == 0o600
+    assert str(pending) in r.stderr and new not in r.stderr  # pointed to, never printed
+    # a second run must not overwrite the only copy of a password Neo4j may now be using
+    r = _run(e)
+    assert r.returncode == 1 and "outcome is unknown" in r.stderr and pending.read_text().strip() == new
+    pending.unlink()
+    assert _run(e).returncode == 0 and not pending.exists()  # removed once .env holds it
+
+
 def test_container_down_message(env):
     e, envfile, _ = env
     r = _run(e, FAKE_EXIT="1", FAKE_MSG='service "neo4j" is not running')
