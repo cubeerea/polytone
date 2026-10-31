@@ -17,6 +17,7 @@ export const KEYS = {
   hotkey: "native:hotkey",
   capture: "native:capture",
   runningApps: "native:apps",
+  audit: "audit",
 } as const;
 
 /** What a finished generation can change. */
@@ -66,6 +67,7 @@ export const useGraph = (persona: string) =>
   useQuery(KEYS.graph(persona), () => api.graph(60, persona), { keepPrevious: true });
 export const useStats = () => useQuery(KEYS.stats, api.stats);
 export const useSources = () => useQuery(KEYS.sources, api.ingestSources);
+export const useAudit = () => useQuery(KEYS.audit, () => api.audit(50));
 
 // ---------- Native (Tauri IPC). Disabled outside the app. ----------
 

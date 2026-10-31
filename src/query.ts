@@ -160,6 +160,19 @@ export function invalidateQueries(match: string | string[] | ((key: string) => b
   }
 }
 
+/**
+ * Forget queries' data and errors (on lock: nothing the engine returned stays in memory).
+ * Responses in flight are dropped; whatever mounts next fetches afresh.
+ */
+export function resetQueries(match: (key: string) => boolean) {
+  for (const [key, e] of cache) {
+    if (!match(key)) continue;
+    e.version++;
+    e.state = IDLE;
+    e.listeners.forEach((l) => l());
+  }
+}
+
 // ---------- The one polling timer ----------
 
 let timer: ReturnType<typeof setTimeout> | null = null;

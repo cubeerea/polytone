@@ -16,6 +16,8 @@ import { Header, type ViewId } from "./components/Header";
 import { Drafts } from "./views/Drafts";
 import { Style } from "./views/Style";
 import { Settings } from "./views/Settings";
+import { BrowserOnly, LockScreen } from "./components/LockScreen";
+import { lockApp, lockUi, useLocked } from "./lock";
 
 const TAB_KEY = "polytone.tab";
 const VIEWS: readonly ViewId[] = ["drafts", "style", "settings"];
@@ -29,7 +31,51 @@ function prefetchGraphChunk() {
   else setTimeout(load, 1500);
 }
 
+const DEFAULT_IDLE_MINUTES = 15;
+const ACTIVITY = ["pointermove", "pointerdown", "keydown", "wheel", "touchstart"] as const;
+
+/**
+ * Lock after `minutes` without mouse / keyboard activity in this window (the engine has its
+ * own sliding timeout; this one locks the moment it is due, even while polls keep that alive).
+ */
+function useIdleLock(minutes: number) {
+  useEffect(() => {
+    const ms = Math.min(240, Math.max(1, minutes)) * 60_000;
+    let last = Date.now();
+    const bump = () => {
+      last = Date.now();
+    };
+    const check = () => {
+      if (Date.now() - last >= ms) lockApp("idle");
+    };
+    for (const e of ACTIVITY) window.addEventListener(e, bump, { passive: true, capture: true });
+    // Timers are throttled while hidden: also check the moment the window comes back.
+    const timer = setInterval(check, 15_000);
+    document.addEventListener("visibilitychange", check);
+    window.addEventListener("focus", check);
+    return () => {
+      for (const e of ACTIVITY) window.removeEventListener(e, bump, { capture: true });
+      clearInterval(timer);
+      document.removeEventListener("visibilitychange", check);
+      window.removeEventListener("focus", check);
+    };
+  }, [minutes]);
+}
+
 export default function App() {
+  // A plain browser can reach the engine but has no way to unlock: show none of the data.
+  if (!inTauri()) return <BrowserOnly />;
+  return <Gate />;
+}
+
+function Gate() {
+  const locked = useLocked();
+  // Rust locked (screen lock, sleep, the tray's "Lock Polytone").
+  useEffect(() => onNative("locked", () => lockUi()), []);
+  return locked ? <LockScreen /> : <Main />;
+}
+
+function Main() {
   const [storedTab, setStoredTab] = useLocalStorage(TAB_KEY, "drafts");
   const tab: ViewId = VIEWS.includes(storedTab as ViewId) ? (storedTab as ViewId) : (LEGACY[storedTab ?? ""] ?? "drafts");
   const setTab = useCallback((t: ViewId) => setStoredTab(t), [setStoredTab]);
@@ -38,6 +84,7 @@ export default function App() {
   const online = health.data != null && !health.error;
   const personas = usePersonas();
   const config = useConfig();
+  useIdleLock(config.data?.lock_idle_minutes ?? DEFAULT_IDLE_MINUTES);
 
   // Engine came back after being offline: everything we hold may be out of date.
   const wasOffline = useRef(false);
