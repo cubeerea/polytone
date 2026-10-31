@@ -13,7 +13,9 @@ Collected items still pass through the full ingest graph (validate → firewall 
 
 ``typed`` is push-only: the Tauri shell's typing capture POSTs each message the user sends in an
 allowlisted app to ``/ingest/typed`` (→ ``ingest_typed``). It has nothing to collect, so running it
-is refused; it is "enabled" exactly when ``capture_enabled`` is set in ``/config``.
+is refused; it is "enabled" exactly when ``capture_enabled`` is set in ``/config``. Text Wispr Flow
+inserted into the message (its AI-formatted dictation) is removed first; when what is left would
+not pass the firewall on its own the message is rejected as ``wispr_inserted``.
 """
 from __future__ import annotations
 
@@ -32,6 +34,7 @@ TYPED_MAX_CHARS = 5000
 AFTER_INJECT_REASON = "after_polytone_inject: stored for edit learning"
 DRAFT_EDIT_WINDOW_S = 600
 TYPED_PERSONA = "Default"  # "persona = null": the global pool, not the active persona
+WISPR_INSERTED_REASON = "wispr_inserted: the message is Wispr Flow dictation output"
 SOURCE_MODULES: dict[str, str] = {
     "gmail": "backend.mcp_servers.gmail_outbound",
     "wispr": "backend.mcp_servers.wispr",
@@ -150,4 +153,27 @@ def ingest_typed(
     prov: dict[str, Any] = {"typed": True, "app": app, "generated": False, "direction": "outbound"}
     if app_name:
         prov["app_name"] = app_name
+    stripped = _strip_wispr(text, app)
+    if stripped is not None and stripped.matched:
+        from backend.ingestion import firewall
+
+        ok, why = firewall.check(stripped.text, "typed", prov, rt.db)
+        if not ok:
+            res = empty_result()
+            res.update(rejected=1, reasons=[f"{WISPR_INSERTED_REASON} ({why})"])
+            return res
+        prov["wispr_removed"] = {"rowids": stripped.matched, "tokens": stripped.removed_tokens}
+        text = stripped.text
     return run_ingest_batch([{"text": text, "provenance": prov}], "typed", TYPED_PERSONA, runtime=rt)
+
+
+def _strip_wispr(text: str, app: str | None) -> Any:
+    """Spans of a typed message that Wispr Flow inserted (its AI-formatted dictation output),
+    or None when Wispr isn't installed / the check failed. See ``mcp_servers.wispr_live``."""
+    try:
+        from backend.mcp_servers import wispr_live
+
+        return wispr_live.check_typed(text, app)
+    except Exception as e:  # noqa: BLE001 - typing capture must work without Wispr
+        log.warning("wispr insertion check failed: %s", e)
+        return None

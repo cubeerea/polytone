@@ -5,13 +5,14 @@
 
 Startup: ``/health`` answers as soon as uvicorn is up. LangGraph (~0.3s of imports) is imported
 lazily by the routes that need it; one background thread (``_warm_up``) then compiles the
-generate graph, primes the active persona's constraints, starts the drop-folder watcher and
-finally loads the embedding model, so the first hotkey press pays for none of it.
+generate graph, primes the active persona's constraints, starts the drop-folder watcher and the
+live Wispr Flow watcher (``mcp_servers/wispr_live.py``) and finally loads the embedding model, so the first hotkey press pays for none of it.
 """
 from __future__ import annotations
 
 import logging
 import os
+import sys
 import threading
 from contextlib import asynccontextmanager
 from typing import Any, Literal
@@ -104,6 +105,17 @@ def _start_watcher(r: Runtime) -> Any:
         return None
 
 
+def _start_wispr_live(r: Runtime) -> Any:
+    """Start the live Wispr Flow watcher if POLYTONE_WISPR_LIVE (default 1) and Wispr's DB exists."""
+    try:
+        from backend.mcp_servers.wispr_live import start_live
+
+        return start_live(r)
+    except Exception as e:  # noqa: BLE001 - the API must start even if Wispr can't be watched
+        log.warning("wispr live watcher not started: %s", e)
+        return None
+
+
 def _warm_embeddings(r: Runtime) -> None:
     """Load the Qwen embedding model (+ one tiny encode) when POLYTONE_EMBEDDINGS=qwen. Never raises."""
     if (r.settings.polytone_embeddings or "").strip().lower() != "qwen":
@@ -128,7 +140,14 @@ def _warm_up(r: Runtime, watcher: dict[str, Any], stopping: threading.Event) -> 
     if not stopping.is_set():
         watcher["t"] = _start_watcher(r)
     if not stopping.is_set():
+        watcher["wispr"] = _start_wispr_live(r)
+    if not stopping.is_set():
         _warm_embeddings(r)
+
+
+def _wispr_live() -> bool:
+    mod = sys.modules.get("backend.mcp_servers.wispr_live")  # never imported → not running
+    return bool(mod and mod.active() is not None)
 
 
 def create_app(runtime: Runtime | None = None) -> FastAPI:
@@ -157,6 +176,10 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             from backend.mcp_servers.file_watcher import stop_watcher
 
             stop_watcher(watcher["t"])
+        if watcher.get("wispr") is not None:
+            from backend.mcp_servers.wispr_live import stop_live
+
+            stop_live(watcher["wispr"])
         if runtime is None:
             r.close()
 
@@ -183,6 +206,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             "llm_ready": configured == "mock" or r.llm.name == "anthropic",
             "embeddings": "none" if r.settings.polytone_embeddings == "none" else "qwen",
             "graph_store": r.store.kind,
+            "wispr_live": _wispr_live(),  # additive: the live Wispr Flow watcher is running
         }
 
     @app.post("/generate", response_model=None)

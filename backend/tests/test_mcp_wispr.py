@@ -148,13 +148,20 @@ def test_local_history_raw_only_incremental_and_readonly(runtime, history_dir):
     assert texts == [
         "um so i think we should uh push the launch to friday",
         "yeah no that works for me lets do it",
+        "archived transcript text",  # archived = hidden in Wispr's UI, still the user's speech
         "ok cool ill send the deck over tonight",
-    ]  # raw asrText; dismissed / archived / polished-only rows skipped
+    ]  # raw asrText; dismissed / polished-only rows skipped
     assert not any("." in t or "I think" in t for t in texts)
     p = items[0]["provenance"]
     assert p["source"] == "wispr" and p["raw_transcript"] is True and p["field"] == "asrText"
+    assert p["kind"] == "spoken" and p["rowid"] == 1 and p["transcript_id"] == "t1"
+    assert p["url"] == "https://app.slack.com/client" and p["duration"] == 3.5
+    assert items[2]["provenance"]["archived"] is True
+    assert all(i["persona"] == "Default" for i in items)
     assert info["ignored_cols"]
-    assert runtime.db.get_config()["wispr.history_last_ts"] == "2026-09-11 09:00:00.000 +00:00"
+    cfg = runtime.db.get_config()
+    assert cfg["wispr.history_rowid"] == "6"
+    assert cfg["wispr.history_last_ts"] == "2026-09-11 09:00:00.000 +00:00"  # still kept up to date
     again, _ = wispr.collect_local(runtime.settings, db=runtime.db)
     assert again == []  # incremental
     assert db_file.read_bytes() == before  # original untouched
@@ -164,8 +171,9 @@ def test_wispr_source_run_through_firewall(runtime, history_dir):
     d = sources.describe_source("wispr", runtime)
     assert d["enabled"] is True and "local history" in d["status"]
     r = sources.run_source("wispr", runtime)
-    assert r["accepted"] == 3
-    assert runtime.db.count_samples(source="wispr") == 3
+    assert r["accepted"] == 4
+    assert runtime.db.count_samples(source="wispr") == 4
+    assert {s["persona"] for s in runtime.db.list_samples(source="wispr")} == {"Default"}
 
 
 def test_needs_credentials_when_nothing_configured(runtime, no_local):

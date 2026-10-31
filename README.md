@@ -109,7 +109,7 @@ Quoted reply chains and signatures are stripped first, and only the cleaned text
 |---|---|---|
 | **Manual** | Feed tab: paste text, tag a persona, ⌘↵ | `POST /ingest/manual` |
 | **Gmail** | Put a Google OAuth *Desktop app* client JSON at `./credentials.json` (`GMAIL_CREDENTIALS_PATH`), then run `uv run python -m backend.mcp_servers.gmail_outbound auth` once | Searches `in:sent from:me` only. Each message must carry the `SENT` label and come from your address. Incremental. Press *Run* in Feed, or `… gmail_outbound sync`. |
-| **Wispr Flow** | Automatic if Wispr Flow is installed: reads its local history DB (`~/Library/Application Support/Wispr Flow`) read-only | **Raw** ASR transcripts only, never the formatted or AI-polished text. Turn off with `POLYTONE_WISPR_LOCAL=0`. Optional live WebSocket: `WISPR_WS_URL` + `WISPR_API_KEY`. |
+| **Wispr Flow** | Automatic and live if Wispr Flow is installed: the backend watches its local history DB (`~/Library/Application Support/Wispr Flow/flow.sqlite`, read from a snapshot copy) and learns each dictation ~1.5 s after it lands | **Raw** ASR transcripts only, never the formatted or AI-polished text, under the `Default` persona tagged `kind: "spoken"`. Archived dictations count. `POLYTONE_WISPR_LIVE=0` stops the live watch (*Run* still works); `POLYTONE_WISPR_LOCAL=0` turns local history off. Optional WebSocket: `WISPR_WS_URL` + `WISPR_API_KEY`. |
 | **Watch folder** | Drop files into `data/inbox` (`POLYTONE_WATCH_DIR`). The backend watches it continuously (`POLYTONE_WATCHER=0` turns that off) | `.txt`/`.md` (paragraphs), `.mbox` (only messages **From:** one of `POLYTONE_USER_EMAILS`, comma-separated, or your Gmail address), iMessage `chat.db` and similar SQLite dumps (`is_from_me = 1` rows only). Files are tracked by sha256, so rescans are idempotent. |
 
 Each source module is also a stdio MCP server. See `backend/mcp_servers/README.md`.
@@ -129,6 +129,12 @@ reason for:
 
 If you paste one of Polytone's own drafts into Feed, you get `rejected: matches a Polytone-generated draft`.
 
+Wispr Flow's output is kept out the same way: when you dictate into Slack and press Return, typing
+capture sees Wispr's AI-formatted text in the message. Polytone removes every span Wispr inserted in
+that app in the last 30 minutes (verbatim, or ≥ 80% of its shingles) and learns only what you typed
+around it. If nothing learnable is left, the message is rejected as `wispr_inserted`. Your dictation is
+still learned, from its raw transcript.
+
 ## Style score
 
 `evaluation/style_distance.py` compares a draft with the persona's human samples on sentence length,
@@ -144,7 +150,7 @@ has been downloaded). Run `uv run python -m backend.evaluation.calibrate` for sa
 
 `.env` (see `.env.example`): `ANTHROPIC_API_KEY`, `POLYTONE_MODEL` (default `claude-sonnet-5-5`),
 `POLYTONE_LLM` (`anthropic`/`mock`), `POLYTONE_EFFORT` (`low` default; higher = more thinking, slower drafts), `NEO4J_*`, `POLYTONE_API_PORT` (8765), `POLYTONE_DATA_DIR`,
-`POLYTONE_WATCH_DIR`, `POLYTONE_USER_EMAILS`, `POLYTONE_WISPR_LOCAL`, `POLYTONE_WATCHER`,
+`POLYTONE_WATCH_DIR`, `POLYTONE_USER_EMAILS`, `POLYTONE_WISPR_LOCAL`, `POLYTONE_WISPR_LIVE`, `POLYTONE_WATCHER`,
 `POLYTONE_EMBEDDINGS` (`qwen`/`none`), `GMAIL_*`, `WISPR_*`. App-side variables: `POLYTONE_REPO` (backend
 location for a bundled app) and `POLYTONE_START_HIDDEN=1` (start in the menu bar only; the window still opens when permissions are missing).
 

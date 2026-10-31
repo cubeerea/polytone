@@ -89,13 +89,24 @@ Until the token exists, the source reports `needs credentials: ...` and `collect
 
 - **Local history**: the source reads Wispr Flow's Electron SQLite DB
   (`~/Library/Application Support/Wispr Flow/flow.sqlite`, or `com.electron.wispr-flow`).
-  It never opens the original file. It snapshots the DB (with `-wal`/`-shm`, using an APFS clone
-  when possible) into a temp dir and opens the copy `mode=ro`. The schema is inspected at run
-  time: on current versions it picks table `History`, column `asrText` (raw ASR), and ignores
-  `formattedText`, `editedText`, `toneMatchedText`, `pastedText` and the other polished columns.
-  Dismissed and archived rows are skipped. The run is incremental by `timestamp`
-  (`wispr.history_last_ts`). Override the search dirs with `WISPR_HISTORY_DIRS`, or turn this
-  path off with `POLYTONE_WISPR_LOCAL=0`.
+  It never opens the original file (even a read-only open writes its `-shm`). It snapshots the DB
+  and its `-wal` (APFS clone, ~4 ms for ~1 GB; retried if Wispr committed mid-copy) into a temp dir
+  and opens the copy `mode=ro`. The schema is inspected at run time: on current versions it picks
+  table `History`, column `asrText` (raw ASR). Only named columns are selected — never `*` and
+  never the `audio`/`screenshot`/`additionalContext` blobs. `formattedText`, `pastedText` and
+  `serverFinalizedText` are read only to recognise Wispr output in typed messages (below), never
+  learned. Dismissed rows and filler-only transcripts ("um uh") are skipped; **archived rows are
+  learned** (archiving only hides a dictation in Wispr's UI). The run is incremental by `rowid`
+  (insert order; `timestamp` is the dictation *start*, so it is not monotonic) — cursor
+  `wispr.history_rowid`, migrated once from the old `wispr.history_last_ts` as
+  `MAX(rowid) WHERE timestamp <= old`. Rows with no text and no status yet are re-checked for
+  15 min in case Wispr fills them in later. Override the search dirs with `WISPR_HISTORY_DIRS`, or
+  turn this path off with `POLYTONE_WISPR_LOCAL=0`.
+- **Live** (`wispr_live.py`): the API server starts `WisprLiveWatcher` at boot when the DB exists
+  (`POLYTONE_WISPR_LIVE=0` turns it off). It stats `flow.sqlite` + `-wal` every second, debounces
+  300 ms, and runs the same rowid-cursor read (≈20 ms for one new dictation on a 970 MB DB), so a
+  dictation is learned ~1.5 s after Wispr commits it. The first run works off the whole history
+  200 rows per tick. It also feeds the **insertion index** used by `POST /ingest/typed`.
 - **WebSocket**: no public Wispr developer WebSocket API could be verified, so the client is
   configurable. It needs `WISPR_WS_URL` and `WISPR_API_KEY` (sent as `Authorization: Bearer`
   and `X-API-Key`). It reconnects with exponential backoff and reads tolerant JSON field names
@@ -103,7 +114,9 @@ Until the token exists, the source reports `needs credentials: ...` and `collect
   nested under `data`, `payload` or `result`). Any formatted or polished field is ignored, and
   interim results are dropped. `collect()` listens for `WISPR_WS_COLLECT_SECONDS` (default 3).
   `uv run python -m backend.mcp_servers.wispr listen` streams continuously into `run_ingest`.
-- Every item gets provenance `{"source": "wispr", "raw_transcript": true, ...}`.
+- Every item gets provenance `{"source": "wispr", "raw_transcript": true, ...}`; local-history
+  items add `kind: "spoken"`, `rowid`, `transcript_id`, `timestamp`, `app`, `url`, `duration`
+  (and `archived`), persona `Default`.
 
 ## file_watcher
 

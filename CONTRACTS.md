@@ -41,11 +41,11 @@ Every component builds against this file. Change it only with the orchestrator's
 
 | Method | Path | Request | Response |
 |---|---|---|---|
-| GET | `/health` | – | `{"status":"ok","neo4j":bool,"llm":"anthropic"\|"mock","embeddings":"qwen"\|"none","graph_store":"neo4j"\|"memory","llm_ready":bool}` (`llm` = configured backend; `llm_ready` false → `/generate` will 502). Answers as soon as uvicorn is up; graph compile, constraint priming, the drop-folder watcher and the embedding model warm in a background thread afterwards. |
+| GET | `/health` | – | `{"status":"ok","neo4j":bool,"llm":"anthropic"\|"mock","embeddings":"qwen"\|"none","graph_store":"neo4j"\|"memory","llm_ready":bool,"wispr_live":bool}` (`llm` = configured backend; `llm_ready` false → `/generate` will 502; additive `wispr_live` = the live Wispr Flow watcher is running). Answers as soon as uvicorn is up; graph compile, constraint priming, the drop-folder watcher, the live Wispr watcher and the embedding model warm in a background thread afterwards. |
 | POST | `/generate` | `{"intent":str,"persona":str\|null,"app_context":str\|null}` | `{"draft_id":str,"text":str,"persona":str,"latency_ms":int,"constraints":Constraints}`; errors `502/504 {"error":"llm_failed"\|"llm_timeout","detail":str}` |
 | POST | `/ingest/manual` | `{"text":str,"persona":str\|null}` | `IngestResult` |
 | POST | `/ingest/typed` | `{"text":str,"app":str /*bundle id*/,"app_name":str\|null,"after_inject":bool}` | `IngestResult` (see "Typing capture") |
-| GET | `/ingest/sources` | – | `[{"name":"manual"\|"gmail"\|"wispr"\|"watcher"\|"typed","enabled":bool,"status":str,"last_run":iso\|null,"items_ingested":int}]` (`typed`: `enabled` = `capture_enabled`, `status` `"listening"`\|`"disabled"`) |
+| GET | `/ingest/sources` | – | `[{"name":"manual"\|"gmail"\|"wispr"\|"watcher"\|"typed","enabled":bool,"status":str,"last_run":iso\|null,"items_ingested":int}]` (`typed`: `enabled` = `capture_enabled`, `status` `"listening"`\|`"disabled"`; `wispr` while live: `"live (watching flow.sqlite; last dictation picked up <iso> (<app>); <n> ingested live)"`, else `"ready (local history: flow.sqlite)"` / `"needs credentials: …"`) |
 | POST | `/ingest/sources/{name}/run` | – | `IngestResult`; `typed` → `400 {"detail":"typed is push-only"}`; unknown → 404 |
 | GET | `/personas` | – | `[{"name":str,"description":str}]` (defaults: Boss, Friend, Investor, Default) |
 | GET/PUT | `/config` | `{"active_persona":str,"hotkey":str,"inject_mode":"paste"\|"type","capture_enabled":bool,"capture_apps":[str]}` (PUT: every field optional, omitted = unchanged) | same (full config) |
@@ -76,7 +76,7 @@ Learns from messages the user types and **sends** in allowlisted native apps.
   `com.tinyspeck.slackmacgap, com.apple.MobileSMS, com.apple.mail, com.apple.Notes, com.hnc.Discord,
   net.whatsapp.WhatsApp, ru.keepcoder.Telegram, com.google.Chrome, com.apple.Safari,
   company.thebrowser.Browser, notion.id`). Persisted in SQLite `config` (bool/list stored as JSON).
-- Rust (`src-tauri/src/typing_capture.rs`): listen-only `CGEventTap` (keyDown) on its own thread; the
+- Rust (`src-tauri/src/typing_capture/`): listen-only `CGEventTap` (keyDown) on its own thread; the
   callback only forwards keys / re-enables a timed-out tap. A worker skips everything unless capture is
   on, the hotkey isn't paused (`AppState.paused`), `IsSecureEventInputEnabled()` is false and the
   frontmost app is allowlisted. Edit keys → debounced (300ms) read of the focused element's `AXValue`
@@ -100,6 +100,38 @@ Learns from messages the user types and **sends** in allowlisted native apps.
   Otherwise, if `capture_enabled` is false → rejected (`"typing capture is disabled ..."`); else the full
   ingest graph with source `typed`, provenance `{"typed":true,"app":...,"app_name"?}`, persona `Default`
   (the global pool — not the active persona). Text capped at 5000 chars.
+- Wispr Flow interplay: before learning, spans Wispr inserted into the message are removed
+  (`wispr_live.check_typed`): any recent Wispr insertion (History rows of the last 30 min — by
+  `timestamp` + `duration` — with the same `app` bundle id; variants `pastedText`,
+  `serverFinalizedText`, `formattedText`, `asrText`) whose tokens occur verbatim in the text (≥ 2
+  tokens, or the whole text), or whose 3-word shingles cover ≥ 80% of it / of the text, is cut out
+  (with ≤ 2-token gaps between cut spans). The remainder must pass `firewall.check` on its own, else
+  `{"accepted":0,"rejected":1,"reasons":["wispr_inserted: the message is Wispr Flow dictation output (<firewall reason>)"]}`;
+  if it passes it is learned with provenance `wispr_removed: {"rowids":[int],"tokens":int}`. The
+  index is fed by the live watcher and refreshed from the DB on demand whenever the DB changed
+  (looks back ≤ 50 rows); with no match it re-polls for `WISPR_TYPED_GRACE_MS` (default 1500) in
+  case the dictation is still being committed. No Wispr install → no check, no wait.
+
+## Wispr Flow (source `wispr`; local, read-only)
+
+- DB: `~/Library/Application Support/Wispr Flow/flow.sqlite` (WAL). Never opened in place: the DB + `-wal`
+  are APFS-cloned to a temp dir (no `-shm`: SQLite rebuilds the WAL index; retried if the file signature
+  changed mid-copy) and the copy is opened `mode=ro`. Only named columns are selected (`rowid`,
+  `transcriptEntityId`, `timestamp`, `duration`, `app`, `url`, `asrText`, `status`, `isArchived`,
+  `pastedText`, `serverFinalizedText`, `formattedText`) — never `*`, never the blob columns.
+- Learned: `asrText` (raw ASR) only, unchanged; rows with status `dismissed` (or error-like), blank
+  `asrText`, or filler-only text ("um uh") are skipped; **archived rows are learned**. Item = `{"text": asrText,
+  "persona": "Default", "provenance": {"source":"wispr","raw_transcript":true,"kind":"spoken",
+  "origin":"wispr_local_history","field":"asrText","rowid","transcript_id","timestamp","app","url"?,
+  "duration"?,"archived"?}}`. Formatted/pasted text is never ingested or stored in provenance.
+- Cursor: SQLite config `wispr.history_rowid` (`rowid > cursor`, insert order; `timestamp` is the
+  dictation start and not monotonic). Migrated once from `wispr.history_last_ts` (kept updated) as
+  `MAX(rowid) WHERE timestamp <= old`. Shared by the live watcher and `POST /ingest/sources/wispr/run`
+  (one read at a time). Rows with no text and no status that are < 15 min old are re-read later.
+- Live: `POLYTONE_WISPR_LIVE` (default `1`; only when the DB exists and `POLYTONE_WISPR_LOCAL` ≠ `0`)
+  starts `wispr_live.WisprLiveWatcher` with the server: stat DB + `-wal` every 1 s → on change debounce
+  300 ms → snapshot + incremental read (≤ 200 rows per tick) → `run_ingest_batch(items, "wispr")` +
+  feed the typed-capture insertion index (see Typing capture).
 
 ## Python module boundaries (backend/)
 
@@ -116,7 +148,8 @@ Learns from messages the user types and **sends** in allowlisted native apps.
   identical to comparing against every draft. Required source provenance:
   gmail → `from_me=True` or `label`/`labels` containing `SENT` (`from_me=False` always rejects);
   watcher → `.mbox` items (`kind`/`format`="mbox" or `file`/`path` *.mbox) need `from_me=True`;
-  wispr → `raw_transcript=True` (or `text_kind="raw"`); `formatted`/`edited`/`ai_edited`/`polished` = reject;
+  wispr → `raw_transcript=True` (or `text_kind="raw"`); `formatted`/`edited`/`ai_edited`/`polished` = reject
+  (local-history items also carry `kind="spoken"` — the spoken register, learned under `Default`, splittable later);
   typed → `typed=True` (`after_inject=True` always rejects).
 - `langgraph/ingest_graph.py` — LangGraph: `validate → firewall → extract → write_graph → record`. `validate` strips
   quoted reply chains and signatures (`ingestion/text.clean_message`); the cleaned text is what is checked, learned, stored.
@@ -130,7 +163,7 @@ Learns from messages the user types and **sends** in allowlisted native apps.
   `cache_system = True` (AnthropicLLM) receive `system` as the `(stable, volatile)` parts; others get one string.
   `stop_reason == "refusal"` raises `LLMRefusal` (→ 502 `llm_failed`).
 - `evaluation/style_distance.py` — `score(text, baseline_texts, persona=None) -> ScoreBreakdown`; `score_draft(draft_id, runtime_or_db)` re-scores + persists. Features in `evaluation/features.py`, optional Qwen3 embedding in `evaluation/embeddings.py`, `python -m backend.evaluation.calibrate` prints sanity numbers.
-- `mcp_servers/` — FastMCP stdio servers: `graph_server.py` (tool `execute_read`, `get_constraints`), `gmail_outbound.py` (only `in:sent from:me`; inbound blocked), `wispr.py` (WebSocket client; falls back to local Wispr history), `file_watcher.py` (.txt, .mbox [only messages From: the user], SQLite dumps).
+- `mcp_servers/` — FastMCP stdio servers: `graph_server.py` (tool `execute_read`, `get_constraints`), `gmail_outbound.py` (only `in:sent from:me`; inbound blocked), `wispr.py` (WebSocket client; falls back to local Wispr history), `wispr_live.py` (live Wispr watcher + insertion index), `file_watcher.py` (.txt, .mbox [only messages From: the user], SQLite dumps).
 - `daemon/server.py` — FastAPI app wiring everything (`create_app(runtime)`).
 - `runtime.py` — `Runtime(settings, db, store, llm, scorer)`; `build_runtime(...)`, `get_runtime()`, `set_runtime()`.
 - `ingestion/types.py` — `Extraction` dataclass (producer: `extract`, consumer: `GraphStore.write_extraction`).

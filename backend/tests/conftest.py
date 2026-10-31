@@ -6,6 +6,9 @@ import os
 os.environ["POLYTONE_LLM"] = "mock"
 os.environ["POLYTONE_EMBEDDINGS"] = "none"
 os.environ["ANTHROPIC_API_KEY"] = ""
+# never read the real Wispr Flow install: Wispr tests point WISPR_HISTORY_DIRS at a temp copy
+os.environ["WISPR_HISTORY_DIRS"] = os.path.join(os.sep, "nonexistent", "polytone-tests", "wispr")
+os.environ.setdefault("WISPR_TYPED_GRACE_MS", "0")
 
 import pytest
 
