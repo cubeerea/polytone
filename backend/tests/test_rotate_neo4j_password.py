@@ -38,11 +38,11 @@ def env(tmp_path):
 
 
 def _run(e, **extra):
-    return subprocess.run(["bash", str(SCRIPT)], env={**e, **extra}, capture_output=True, text=True, timeout=30)
+    return subprocess.run(["bash", str(SCRIPT)], env={**e, **extra}, capture_output=True, text=True, timeout=30, check=False)
 
 
 def _pw(envfile):
-    return re.findall(r"^NEO4J_PASSWORD=(.*)$", envfile.read_text(), re.M)
+    return re.findall(r"^NEO4J_PASSWORD=(.*)$", envfile.read_text(), re.MULTILINE)
 
 
 def test_rotates_and_rewrites_env(env):
