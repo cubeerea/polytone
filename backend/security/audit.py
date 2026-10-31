@@ -169,12 +169,18 @@ class AuditLog:
         return int(row[0])
 
     def _read_head(self) -> dict[str, Any] | None:
+        """``{"seq": int, "mac": str}``, None if the file is missing, seq -1 if it is unreadable
+        or malformed (verify must report that, not crash)."""
         try:
-            return json.loads(self.head_path.read_text())
+            head = json.loads(self.head_path.read_text())
         except FileNotFoundError:
             return None
         except (OSError, ValueError):
             return {"seq": -1, "mac": ""}
+        seq = head.get("seq") if isinstance(head, dict) else None
+        if not isinstance(seq, int) or isinstance(seq, bool):
+            return {"seq": -1, "mac": ""}
+        return {"seq": seq, "mac": str(head.get("mac", ""))}
 
     def verify(self) -> dict[str, Any]:
         """Walk the chain: ``{"ok", "count", "first_bad_seq", "reason"}``."""
@@ -186,6 +192,7 @@ class AuditLog:
                 "SELECT seq, ts, event, actor, detail, prev, mac FROM audit_log ORDER BY seq"
             ).fetchall()
         prev, expect, count = GENESIS, 1, 0
+        macs: dict[int, str] = {}
         for seq, ts, event, actor, detail, row_prev, mac in rows:
             if seq != expect:
                 return bad(expect, f"missing rows (expected seq {expect}, found {seq})", count)
@@ -197,17 +204,19 @@ class AuditLog:
                 return bad(seq, "detail is not valid JSON", count)
             if not hmac.compare_digest(compute_mac(prev, seq, ts, event, actor, d), mac):
                 return bad(seq, "mac mismatch (row altered, or the audit key changed)", count)
+            macs[seq] = mac
             prev, expect, count = mac, expect + 1, count + 1
         head = self._read_head()
         last = expect - 1
         if head is None:
             if last:
                 return bad(last + 1, f"{HEAD_FILE} is missing", count)
-        elif int(head.get("seq", -1)) > last:
-            return bad(last + 1, f"truncated: {HEAD_FILE} records seq {head.get('seq')}, log ends at {last}", count)
-        elif int(head.get("seq", -1)) == last and last and head.get("mac") != prev:
-            return bad(last, f"{HEAD_FILE} mac does not match the last row", count)
-        elif int(head.get("seq", -1)) < 0:
+        elif head["seq"] < 0:
             return bad(None, f"{HEAD_FILE} is unreadable", count)
-        # head < last: a crash between commit and head write; the extra rows verified above
+        elif head["seq"] > last:
+            return bad(last + 1, f"truncated: {HEAD_FILE} records seq {head['seq']}, log ends at {last}", count)
+        elif head["seq"] and not hmac.compare_digest(head["mac"].encode(), macs[head["seq"]].encode()):
+            # head == last, or head < last (a crash between commit and head write; the extra
+            # rows verified above): either way the head must name a real row
+            return bad(head["seq"], f"{HEAD_FILE} mac does not match row {head['seq']}", count)
         return {"ok": True, "count": count, "first_bad_seq": None, "reason": None}

@@ -322,8 +322,8 @@ an attacker running as the same user with the Polytone window unlocked, or root.
   `capture.start/stop` (`PUT /config`), `data.*`, `key.created` and `migration.encrypted` (`build_runtime`).
   `session.unlock_failed` and Rust-side capture events come via `POST /audit/event`. Actors: `app`, `ui`,
   `backend`, `unknown` (denied requests). `generate`/`ingest` rows are written off the request thread.
-- Verify also fails when `.audit_head` is missing while rows exist, or its mac doesn't match the last row;
-  `.audit_head` behind the log (crash between commit and head write) is fine. Appends are serialized
+- Verify also fails when `.audit_head` is missing while rows exist, is malformed, or its mac doesn't match
+  the row it names; `.audit_head` behind the log (crash between commit and head write) is fine. Appends are serialized
   across processes (`flock` on `data/.audit.lock`). Strings longer than 200 chars in `detail` are replaced
   by `<n chars dropped>`. Limitation: an attacker with the data dir can delete the tail AND rewrite
   `.audit_head` to the new last row (its mac is in the log); detecting that needs an external anchor.
