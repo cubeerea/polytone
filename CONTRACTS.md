@@ -338,7 +338,7 @@ an attacker running as the same user with the Polytone window unlocked, or root.
   (SDK timeout 6.5 s / 0 retries / prompt caching unchanged); googleapiclient → `AuthorizedHttp` over
   `httplib2.Http(tls_minimum_version=TLSv1_3)` (API calls, discovery doc and its token refreshes);
   google-auth refresh at load and the OAuth code exchange → a `requests` session whose HTTPS adapter
-  carries the context.
+  carries the context. Optional Wispr WebSocket (`WISPR_WS_URL`, `wss://`) → the same context.
 - Loopback (UI/Rust ↔ backend, backend ↔ Neo4j on 127.0.0.1): no TLS; protected by tokens / password.
   Neo4j ports stay bound to 127.0.0.1.
 - Neo4j password: `scripts/rotate-neo4j-password.sh` generates a random 32-char one, applies it in the

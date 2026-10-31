@@ -180,3 +180,13 @@ def test_needs_credentials_when_nothing_configured(runtime, no_local):
     assert wispr.is_enabled(runtime.settings) is False
     assert wispr.status(runtime.settings).startswith("needs credentials")
     assert wispr.collect(runtime.settings) == []
+
+
+def test_ws_connect_uses_tls13_for_wss():
+    import ssl
+
+    c = wispr._connect("wss://example.invalid/stream", "k", 1.0)
+    ctx = c.create_connection_kwargs.get("ssl")
+    assert isinstance(ctx, ssl.SSLContext)
+    assert ctx.minimum_version == ssl.TLSVersion.TLSv1_3 and ctx.verify_mode == ssl.CERT_REQUIRED
+    assert "ssl" not in wispr._connect("ws://127.0.0.1:1/stream", "", 1.0).create_connection_kwargs
