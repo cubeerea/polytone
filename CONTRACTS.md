@@ -193,3 +193,78 @@ Implementation notes (backend core, additive — see `graph/queries.py`):
   counter keeps a computation that raced a write out of the cache). After an accepted ingest the server re-primes
   the active persona's constraints in the background. Each Neo4j aggregate is read in one read transaction.
 - `IntentContext` also stores `opener_phrase_keys/opener_phrase_counts` (2–3 word openers).
+
+## Security
+
+Threat model: one user on their own Mac. Protect learned text at rest (stolen disk image, backups,
+other local programs), stop other local processes and web pages from reading the API, record who did
+what in a log that reveals tampering, and keep everything leaving the machine on TLS 1.3. Out of scope:
+an attacker running as the same user with the Polytone window unlocked, or root.
+
+### Keys (`backend/security/keys.py`)
+- 256-bit master key in the macOS Keychain (service `com.polytone.app`, account `data-key-v1`),
+  created on first use. `POLYTONE_DATA_KEY` (base64, 32 bytes) overrides it (tests set it in conftest).
+- `subkey(purpose)` = HKDF-SHA256(master, `polytone/<purpose>/v1`). Purposes: `enc`, `index`, `audit`.
+- Only the backend reads the key. Rust never sees it.
+
+### Encryption at rest (`backend/security/crypto.py`)
+- AES-256-GCM, random 96-bit nonce, AAD = a context string (`"<table>.<column>"` / `"neo4j:<Label>.<prop>"`).
+  Stored as text `enc1:<base64url(nonce||ciphertext||tag)>`. Decrypt failure raises, never returns garbage.
+- Blind index for anything looked up / made unique by content: `idx1:<base64url(HMAC-SHA256(subkey("index"), context||value))[:32]>`.
+  Replaces the plain `sha256` dedupe column (a plain hash of short text is guessable).
+- Every column/property holding user text is encrypted: SQLite `drafts.intent/text`, `samples.text`,
+  `samples.provenance` (if it carries text), `draft_edits.text`, and Neo4j word/bigram/opener/text
+  properties (lookup key = blind index, display value = ciphertext). Counts, timestamps, persona names,
+  config and cursors stay plain.
+- Migration runs once at backend start: idempotent (already-`enc1:` values skipped), one transaction
+  per table / Neo4j batch, then `VACUUM` + WAL checkpoint so plaintext pages don't linger.
+- Embedding vectors (if stored) are encrypted too.
+
+### Local API auth (backend ↔ Rust ↔ UI)
+- **App token**: backend uses `POLYTONE_API_TOKEN` if set, else generates 32 random bytes (base64url).
+  It always writes the token to `<data_dir>/.api_token` (mode 0600, atomic replace). Rust generates the
+  token and passes it in the env when it spawns the backend; when it attaches to an already-running
+  backend it reads the file. Sent as `Authorization: Bearer <token>`. Only Rust holds it. Full scope.
+- **UI session** ("auto-logout"): `POST /session` (app token only) → `{"token":str,"idle_timeout_s":int,"expires_at":iso}`.
+  Session tokens are in memory only (backend and UI; never localStorage). Sliding idle timeout =
+  config `lock_idle_minutes` (int 1–240, default 15); absolute cap 12 h. `DELETE /session` (app token)
+  revokes all sessions; `DELETE /session/current` (session token) locks this session.
+  Session scope = every endpoint except `POST /session` / `DELETE /session` / `POST /audit/event`.
+- Unauthenticated: `GET /health` only (no user content in it). Missing/invalid/expired token → 401
+  `{"detail":"locked"}`. Tokens compared in constant time. Requests whose `Host` isn't
+  `127.0.0.1:<port>` / `localhost:<port>` → 403 (DNS rebinding). CORS list unchanged.
+- Rust (Tauri commands): `unlock() -> {token, idle_timeout_s}` = LocalAuthentication
+  `deviceOwnerAuthentication` (Touch ID or Mac password), then `POST /session`; `lock()`;
+  `get_lock_state() -> {locked: bool}`. Rust locks (DELETE /session + emits event `locked`) on screen
+  lock (`com.apple.screenIsLocked`), system sleep, and tray "Lock Polytone". Hotkey and typing capture
+  keep working while locked (they use the app token).
+- UI: any 401 → lock screen ("Unlock with Touch ID"); idle timer on its side too, for an immediate lock.
+
+### Audit log (`backend/security/audit.py`, `data/audit.sqlite3`)
+- Table `audit_log(seq INTEGER PRIMARY KEY, ts TEXT, event TEXT, actor TEXT, detail TEXT /*JSON*/, prev TEXT, mac TEXT)`.
+  `mac` = HMAC-SHA256(subkey("audit"), prev || canonical-JSON(seq, ts, event, actor, detail)); genesis prev = 64×"0".
+  SQLite triggers abort UPDATE and DELETE. Head (`seq`, `mac`) also kept in `data/.audit_head`
+  (0600) so truncation is detected. Never contains user text: lengths, counts, ids, app bundle ids only.
+- Events (at least): `session.unlock`, `session.unlock_failed`, `session.lock`, `session.expired`,
+  `auth.denied`, `generate` (persona, chars in/out, model, latency), `ingest` (source, accepted/rejected),
+  `config.change` (keys changed, not values of secrets), `capture.start`/`capture.stop`,
+  `data.wipe`, `data.retention_purge`, `key.created`, `migration.encrypted`.
+- `GET /audit?limit=&before_seq=` → `{"entries":[...], "head_seq":int}`; `GET /audit/verify` →
+  `{"ok":bool,"count":int,"first_bad_seq":int|null,"reason":str|null}`; `POST /audit/event`
+  (app token only) `{event, detail}` for Rust-side events (actor `app`).
+
+### Network
+- Outbound HTTPS (Anthropic, Google APIs): TLS 1.3 minimum, certificate verification on (default CA store).
+- Loopback (UI/Rust ↔ backend, backend ↔ Neo4j on 127.0.0.1): no TLS; protected by tokens / password.
+  Neo4j ports stay bound to 127.0.0.1.
+- Neo4j password: `scripts/rotate-neo4j-password.sh` generates a random one, applies it in the running
+  container, writes it to `.env` (0600). `dev.sh` runs it when `.env` still has the default.
+
+### Retention and files
+- Config `retention_days` (0 = keep forever, default 0): daily purge of `samples` from `typed`/`wispr`,
+  `draft_edits` and `drafts` older than N days (style graph aggregates stay). `POST /data/wipe`
+  `{"confirm":"delete everything"}` deletes all samples, drafts, draft_edits and the style graph.
+- `data/` is 0700, files in it 0600 (including `backend.log`, `gmail_token.json`, `.env`).
+  Logs never contain user text.
+- `ANTHROPIC_API_KEY` may live in the Keychain (service `com.polytone.app`, account `anthropic-api-key`)
+  instead of `.env`; env wins when both exist.

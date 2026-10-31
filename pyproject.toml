@@ -16,6 +16,8 @@ dependencies = [
   "websockets>=12",
   "watchdog>=4",
   "numpy>=1.26",
+  "cryptography>=43",
+  "keyring>=25",
 ]
 
 [project.optional-dependencies]

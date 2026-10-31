@@ -9,6 +9,8 @@ os.environ["ANTHROPIC_API_KEY"] = ""
 # never read the real Wispr Flow install: Wispr tests point WISPR_HISTORY_DIRS at a temp copy
 os.environ["WISPR_HISTORY_DIRS"] = os.path.join(os.sep, "nonexistent", "polytone-tests", "wispr")
 os.environ.setdefault("WISPR_TYPED_GRACE_MS", "0")
+# fixed test data key: tests never read or create the real Keychain item
+os.environ["POLYTONE_DATA_KEY"] = "dGVzdC1rZXktdGVzdC1rZXktdGVzdC1rZXktdGVzdCE="
 
 import pytest
 
