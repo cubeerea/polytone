@@ -325,7 +325,11 @@ impl BackendClient {
         req: &TypedIngestRequest,
     ) -> Result<IngestResult, BackendError> {
         let url = self.url("/ingest/typed");
-        Ok(self.send(|h| h.post(&url).timeout(TYPED_TIMEOUT).json(req)).await?.json().await?)
+        Ok(self
+            .send(|h| h.post(&url).timeout(TYPED_TIMEOUT).json(req))
+            .await?
+            .json()
+            .await?)
     }
 
     /// `POST /session` (app token) -> a UI session token.

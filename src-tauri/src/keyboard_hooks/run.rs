@@ -355,7 +355,7 @@ fn frontmost_app() -> Option<FrontApp> {
 
 #[cfg(target_os = "macos")]
 fn selection_hint() -> Option<bool> {
-    crate::macos::ax::focused_selection()
+    crate::macos::ax::focused_selection(frontmost_app().map(|a| a.pid))
 }
 
 #[cfg(not(target_os = "macos"))]

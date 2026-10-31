@@ -776,11 +776,9 @@ fn bench_real_os_costs() {
         20,
         crate::macos::apps::frontmost_app,
     );
-    time(
-        "ax focused_selection hint",
-        20,
-        crate::macos::ax::focused_selection,
-    );
+    time("ax focused_selection hint", 20, || {
+        crate::macos::ax::focused_selection(crate::macos::apps::frontmost_app().map(|a| a.pid))
+    });
     time("arboard Clipboard::new", 20, || {
         SystemClipboard::new().is_ok()
     });

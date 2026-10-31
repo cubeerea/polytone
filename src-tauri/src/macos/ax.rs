@@ -153,9 +153,12 @@ fn is_text_role(role: &str) -> bool {
 
 /// Does the focused text field have a non-empty selection? `None` = unknown (no permission,
 /// not a text element, or the app doesn't expose `AXSelectedText` — e.g. Chromium web content
-/// before its accessibility tree is enabled). Bounded to ~100ms for a hung app.
-pub fn focused_selection() -> Option<bool> {
-    let el = Element::focused(0.1)?;
+/// before its accessibility tree is enabled). Bounded to ~100ms for a hung app. Asks app `pid`
+/// directly when known: on macOS 26 the system-wide element fails every query.
+pub fn focused_selection(pid: Option<i32>) -> Option<bool> {
+    let el = pid
+        .and_then(|p| Element::focused_in(p, 0.1))
+        .or_else(|| Element::focused(0.1))?;
     let role = el.string_attr("AXRole")?;
     if !is_text_role(&role) || el.string_attr("AXSubrole").as_deref() == Some("AXSecureTextField") {
         return None;
