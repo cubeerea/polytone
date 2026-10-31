@@ -2,10 +2,14 @@
 
 Tables
 ------
-- ``config``      key/value settings (active_persona, hotkey, inject_mode).
+- ``config``      key/value settings (active_persona, hotkey, inject_mode, capture_enabled,
+                  capture_apps). Values are strings; bools/lists are stored as JSON
+                  (``"true"``, ``["com.apple.mail", ...]``) — use ``capture_config()`` to read them.
 - ``drafts``      every generated draft (NEVER fed back into the graph).
 - ``samples``     ingested *human* text, unique by sha256, with provenance.
 - ``ingest_runs`` one row per ingestion run of a source.
+- ``draft_edits`` text the user sent right after a Polytone inject (typing capture with
+                  ``after_inject=True``). NEVER learned from; kept for future edit learning.
 
 Usage
 -----
@@ -33,10 +37,27 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+# Typing capture (source "typed") watches only these apps by default; opt-in, default OFF.
+DEFAULT_CAPTURE_APPS: list[str] = [
+    "com.tinyspeck.slackmacgap",
+    "com.apple.MobileSMS",
+    "com.apple.mail",
+    "com.apple.Notes",
+    "com.hnc.Discord",
+    "net.whatsapp.WhatsApp",
+    "ru.keepcoder.Telegram",
+    "com.google.Chrome",
+    "com.apple.Safari",
+    "company.thebrowser.Browser",
+    "notion.id",
+]
+
 DEFAULT_CONFIG: dict[str, str] = {
     "active_persona": "Default",
     "hotkey": "CmdOrCtrl+Shift+P",
     "inject_mode": "paste",
+    "capture_enabled": "false",
+    "capture_apps": json.dumps(DEFAULT_CAPTURE_APPS),
 }
 
 _SCHEMA = """
@@ -78,6 +99,14 @@ CREATE TABLE IF NOT EXISTS ingest_runs (
     status TEXT NOT NULL DEFAULT 'ok'
 );
 CREATE INDEX IF NOT EXISTS idx_runs_source ON ingest_runs(source);
+CREATE TABLE IF NOT EXISTS draft_edits (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    app TEXT NOT NULL,
+    text TEXT NOT NULL,
+    nearest_draft_id TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_draft_edits_created ON draft_edits(created_at);
 """
 
 
@@ -88,6 +117,13 @@ def utcnow_iso() -> str:
 def sha256_text(text: str) -> str:
     """Canonical hash used for drafts AND samples (stripped UTF-8)."""
     return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()
+
+
+def _config_value(v: Any) -> str:
+    """bools/lists/dicts are stored as JSON so they round-trip; everything else as str."""
+    if isinstance(v, (bool, list, tuple, dict)):
+        return json.dumps(list(v) if isinstance(v, tuple) else v)
+    return str(v)
 
 
 def _loads(s: str | None) -> Any:
@@ -147,9 +183,18 @@ class Database:
                 c.execute(
                     "INSERT INTO config(k, v) VALUES (?, ?) "
                     "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
-                    (k, str(v)),
+                    (k, _config_value(v)),
                 )
         return self.get_config()
+
+    def capture_config(self) -> tuple[bool, list[str]]:
+        """``(capture_enabled, capture_apps)`` parsed from the config table."""
+        cfg = self.get_config()
+        enabled = str(cfg.get("capture_enabled", "false")).strip().lower() in ("true", "1", "yes")
+        apps = _loads(cfg.get("capture_apps"))
+        if not isinstance(apps, list):
+            apps = list(DEFAULT_CAPTURE_APPS)
+        return enabled, [str(a) for a in apps if str(a).strip()]
 
     # ------------------------------------------------------------------ drafts
     def insert_draft(
@@ -222,6 +267,36 @@ class Database:
                 "UPDATE drafts SET score_json = ? WHERE draft_id = ?",
                 (json.dumps(score) if score is not None else None, draft_id),
             )
+
+    def recent_draft_id(self, within_seconds: float = 600) -> str | None:
+        """Id of the newest draft created in the last ``within_seconds``, else None."""
+        cutoff = datetime.fromtimestamp(datetime.now(UTC).timestamp() - within_seconds, UTC)
+        with self.connect() as c:
+            row = c.execute(
+                "SELECT draft_id FROM drafts WHERE created_at >= ? ORDER BY created_at DESC, rowid DESC"
+                " LIMIT 1",
+                (cutoff.isoformat(timespec="milliseconds"),),
+            ).fetchone()
+        return row[0] if row else None
+
+    # ------------------------------------------------------------------ draft edits
+    def insert_draft_edit(
+        self, *, app: str, text: str, nearest_draft_id: str | None = None, created_at: str | None = None
+    ) -> int:
+        """Store text the user sent right after a Polytone inject. Never reaches samples/graph."""
+        with self.connect() as c:
+            cur = c.execute(
+                "INSERT INTO draft_edits(created_at, app, text, nearest_draft_id) VALUES (?, ?, ?, ?)",
+                (created_at or utcnow_iso(), app, text, nearest_draft_id),
+            )
+            return int(cur.lastrowid)
+
+    def list_draft_edits(self, limit: int = 50) -> list[dict[str, Any]]:
+        with self.connect() as c:
+            rows = c.execute(
+                "SELECT * FROM draft_edits ORDER BY created_at DESC, id DESC LIMIT ?", (int(limit),)
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def all_draft_texts(self) -> list[str]:
         with self.connect() as c:

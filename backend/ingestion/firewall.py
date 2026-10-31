@@ -13,6 +13,8 @@ string whenever ``ok`` is False, else None. Checks run in this order:
               must carry ``from_me=True`` (message From: the user)
    - wispr:   must be the raw transcript — ``raw_transcript=True`` or ``text_kind == "raw"``;
               Wispr's AI-formatted/edited text (``formatted``/``edited``/``ai_edited``) is rejected
+   - typed:   text the user typed and sent in a native app (typing capture) — needs
+              ``typed=True``; ``after_inject=True`` (sent right after a Polytone inject) rejects
 5. too short (< ``MIN_TOKENS`` word tokens or < ``MIN_CHARS`` characters)
 6. duplicate of an existing sample (sha256)                       → "duplicate sample"
 7. stored-draft checks (drafts NEVER reach the graph):
@@ -43,6 +45,7 @@ SOURCE_RULES = {
     "gmail": "sent mail only (from_me=True or label:sent)",
     "watcher": ".mbox messages only when From: the user (from_me=True)",
     "wispr": "raw transcripts only (raw_transcript=True or text_kind='raw')",
+    "typed": "typed in a native app by the user (typed=True), never right after a Polytone inject",
 }
 
 
@@ -81,6 +84,11 @@ def _check_source(source: str, prov: dict[str, Any]) -> str | None:
         kind = str(prov.get("text_kind") or prov.get("kind") or "").lower()
         if not (_truthy(prov.get("raw_transcript")) or kind in ("raw", "raw_transcript")):
             return "wispr item is not marked as a raw transcript (needs raw_transcript=True)"
+    elif src == "typed":
+        if _truthy(prov.get("after_inject")):
+            return "typed text was sent right after a Polytone inject (after_inject=True)"
+        if not _truthy(prov.get("typed")):
+            return "typed item lacks typing-capture provenance (needs typed=True)"
     return None
 
 

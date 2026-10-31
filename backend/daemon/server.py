@@ -14,10 +14,10 @@ from typing import Any, Literal
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from backend.config import get_settings
-from backend.ingestion.sources import SOURCES, list_sources, run_source
+from backend.ingestion.sources import PUSH_ONLY, SOURCES, ingest_typed, list_sources, run_source
 from backend.langgraph.generate_graph import GenerationError, run_generation
 from backend.langgraph.ingest_graph import run_ingest_batch
 from backend.langgraph.prompts import PERSONAS
@@ -39,17 +39,42 @@ class IngestManualRequest(BaseModel):
     persona: str | None = None
 
 
+class IngestTypedRequest(BaseModel):
+    text: str
+    app: str
+    app_name: str | None = None
+    after_inject: bool = False
+
+
 class ConfigBody(BaseModel):
     active_persona: str | None = Field(default=None, min_length=1)
     hotkey: str | None = Field(default=None, min_length=1)
     inject_mode: Literal["paste", "type"] | None = None
+    capture_enabled: bool | None = None
+    capture_apps: list[str] | None = None
+
+    @field_validator("capture_apps")
+    @classmethod
+    def _clean_apps(cls, v: list[str] | None) -> list[str] | None:
+        if v is None:
+            return None
+        out: list[str] = []
+        for a in v:
+            a = a.strip()
+            if a and a not in out:
+                out.append(a)
+        return out
 
 
-def _config_out(cfg: dict[str, str]) -> dict[str, str]:
+def _config_out(db: Any) -> dict[str, Any]:
+    cfg = db.get_config()
+    enabled, apps = db.capture_config()
     return {
         "active_persona": cfg.get("active_persona", "Default"),
         "hotkey": cfg.get("hotkey", "CmdOrCtrl+Shift+P"),
         "inject_mode": cfg.get("inject_mode", "paste"),
+        "capture_enabled": enabled,
+        "capture_apps": apps,
     }
 
 
@@ -157,6 +182,10 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         item = {"text": req.text, "provenance": {"source": "manual", "generated": False, "direction": "outbound"}}
         return run_ingest_batch([item], "manual", req.persona, runtime=rt())
 
+    @app.post("/ingest/typed")
+    def ingest_typed_route(req: IngestTypedRequest) -> dict[str, Any]:
+        return ingest_typed(rt(), req.text, req.app, req.app_name, req.after_inject)
+
     @app.get("/ingest/sources")
     def ingest_sources() -> list[dict[str, Any]]:
         return list_sources(rt())
@@ -165,6 +194,8 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
     def ingest_source_run(name: str) -> dict[str, Any]:
         if name not in SOURCES:
             raise HTTPException(status_code=404, detail=f"unknown source '{name}'")
+        if name in PUSH_ONLY:
+            raise HTTPException(status_code=400, detail=f"{name} is push-only")
         return run_source(name, rt())
 
     @app.get("/personas")
@@ -178,12 +209,13 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         return out
 
     @app.get("/config")
-    def get_config() -> dict[str, str]:
-        return _config_out(rt().db.get_config())
+    def get_config() -> dict[str, Any]:
+        return _config_out(rt().db)
 
     @app.put("/config")
-    def put_config(body: ConfigBody) -> dict[str, str]:
-        return _config_out(rt().db.set_config(body.model_dump(exclude_none=True)))
+    def put_config(body: ConfigBody) -> dict[str, Any]:
+        rt().db.set_config(body.model_dump(exclude_none=True))
+        return _config_out(rt().db)
 
     @app.get("/drafts")
     def drafts(limit: int = Query(50, ge=1, le=1000)) -> list[dict[str, Any]]:

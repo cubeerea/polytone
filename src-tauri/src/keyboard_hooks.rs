@@ -686,6 +686,8 @@ fn run_loop_inner(state: &AppState, started: Instant) -> RunResult {
     if let Err(e) = inject(&mut clip, &mut keys, &draft, &mode, &cap.saved, &timing) {
         return RunResult::err(started, format!("Polytone could not insert the draft: {e}"));
     }
+    // A message sent from this app soon after is (an edit of) the draft: never learn style from it.
+    crate::typing_capture::record_injection();
 
     RunResult {
         ok: true,

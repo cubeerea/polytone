@@ -42,10 +42,11 @@ Every component builds against this file. Change it only with the orchestrator's
 | GET | `/health` | – | `{"status":"ok","neo4j":bool,"llm":"anthropic"\|"mock","embeddings":"qwen"\|"none","graph_store":"neo4j"\|"memory","llm_ready":bool}` (`llm` = configured backend; `llm_ready` false → `/generate` will 502) |
 | POST | `/generate` | `{"intent":str,"persona":str\|null,"app_context":str\|null}` | `{"draft_id":str,"text":str,"persona":str,"latency_ms":int,"constraints":Constraints}`; errors `502/504 {"error":"llm_failed"\|"llm_timeout","detail":str}` |
 | POST | `/ingest/manual` | `{"text":str,"persona":str\|null}` | `IngestResult` |
-| GET | `/ingest/sources` | – | `[{"name":"manual"\|"gmail"\|"wispr"\|"watcher","enabled":bool,"status":str,"last_run":iso\|null,"items_ingested":int}]` |
-| POST | `/ingest/sources/{name}/run` | – | `IngestResult` |
+| POST | `/ingest/typed` | `{"text":str,"app":str /*bundle id*/,"app_name":str\|null,"after_inject":bool}` | `IngestResult` (see "Typing capture") |
+| GET | `/ingest/sources` | – | `[{"name":"manual"\|"gmail"\|"wispr"\|"watcher"\|"typed","enabled":bool,"status":str,"last_run":iso\|null,"items_ingested":int}]` (`typed`: `enabled` = `capture_enabled`, `status` `"listening"`\|`"disabled"`) |
+| POST | `/ingest/sources/{name}/run` | – | `IngestResult`; `typed` → `400 {"detail":"typed is push-only"}`; unknown → 404 |
 | GET | `/personas` | – | `[{"name":str,"description":str}]` (defaults: Boss, Friend, Investor, Default) |
-| GET/PUT | `/config` | `{"active_persona":str,"hotkey":str,"inject_mode":"paste"\|"type"}` | same |
+| GET/PUT | `/config` | `{"active_persona":str,"hotkey":str,"inject_mode":"paste"\|"type","capture_enabled":bool,"capture_apps":[str]}` (PUT: every field optional, omitted = unchanged) | same (full config) |
 | GET | `/drafts?limit=50` | – | `[{"draft_id","created_at","persona","intent","text","latency_ms","score":ScoreBreakdown\|null}]` |
 | GET | `/scores/summary` | – | `{"mean":float\|null,"count":int,"trend":[{"t":iso,"score":float}]}` |
 | GET | `/graph?limit=60&persona=` | – | `{"nodes":[{"id":str,"label":"Word"\|"SentenceStructure"\|"PunctuationMark"\|"IntentContext","name":str,"weight":float}],"edges":[{"source":str,"target":str,"type":"FOLLOWED_BY"\|"PART_OF_STRUCTURE"\|"USED_IN","weight":float}]}` |
@@ -65,10 +66,43 @@ Signature format `LEN|<n>c|<skeleton>|<opener>|<end>`, e.g. `M|2c|,—|conj|.` (
 
 `ScoreBreakdown` = `{"score":float /*0-100, 100 = identical style*/,"distance":float /*0-1*/,"components":{"sentence_length":float,"punctuation":float,"lexical":float,"function_words":float,"embedding":float|null},"confidence":"low"|"medium"|"high" /*additive: trust in the number given baseline size + draft length*/}`
 
+## Typing capture (source `typed`; opt-in, default OFF, local only)
+
+Learns from messages the user types and **sends** in allowlisted native apps.
+
+- Config: `capture_enabled` (default `false`), `capture_apps` (bundle ids; default
+  `com.tinyspeck.slackmacgap, com.apple.MobileSMS, com.apple.mail, com.apple.Notes, com.hnc.Discord,
+  net.whatsapp.WhatsApp, ru.keepcoder.Telegram, com.google.Chrome, com.apple.Safari,
+  company.thebrowser.Browser, notion.id`). Persisted in SQLite `config` (bool/list stored as JSON).
+- Rust (`src-tauri/src/typing_capture.rs`): listen-only `CGEventTap` (keyDown) on its own thread; the
+  callback only forwards keys / re-enables a timed-out tap. A worker skips everything unless capture is
+  on, the hotkey isn't paused (`AppState.paused`), `IsSecureEventInputEnabled()` is false and the
+  frontmost app is allowlisted. Edit keys → debounced (300ms) read of the focused element's `AXValue`
+  (roles AXTextArea/AXTextField/AXComboBox; never `AXSecureTextField` or `AXSearchField`), cached per app.
+  Send keys: Return without Shift/Opt/Ctrl/Cmd (except Mail, Notes, Notion where Return is a newline),
+  Cmd+Return (any app), Cmd+Shift+D (Mail). The send is **confirmed** by re-reading the field after
+  250ms / 900ms: it must clear, change, or lose focus, else the Return was a newline and nothing is sent.
+  Never captures on app switch. Drops < 3 words, caps at 5000 chars, never resends identical text per app.
+  A send in the app Polytone last injected into, within 10 minutes of that inject → `after_inject=true`.
+  `POST /ingest/typed` fire-and-forget; failures go to `last_error`, never per-item notifications.
+- Tauri commands: `set_capture(enabled: bool, apps: string[]) -> CaptureStatus` (applies at once and
+  retries a failed start; the UI also PUTs `/config`), `get_capture_status() -> CaptureStatus`,
+  `list_running_apps() -> [{"bundle_id":str,"name":str}]` (regular GUI apps).
+  `CaptureStatus` = `{"enabled":bool,"running":bool,"apps":[str],"captured_this_session":u32,
+  "last_captured_at":iso|null,"last_error":str|null}`. Missing Input Monitoring/Accessibility → the tap
+  can't be created: `running=false`, `last_error` says which permission. Startup reads `/config`
+  (`sync_from_backend_config`).
+- Backend `POST /ingest/typed`: `after_inject=true` → never learned; stored in SQLite `draft_edits`
+  (`id, created_at, app, text, nearest_draft_id` = newest draft of the last 10 min or null) and returns
+  `{"accepted":0,"rejected":1,"reasons":["after_polytone_inject: stored for edit learning"],...}`.
+  Otherwise, if `capture_enabled` is false → rejected (`"typing capture is disabled ..."`); else the full
+  ingest graph with source `typed`, provenance `{"typed":true,"app":...,"app_name"?}`, persona `Default`
+  (the global pool — not the active persona). Text capped at 5000 chars.
+
 ## Python module boundaries (backend/)
 
 - `config.py` — `Settings`, `get_settings()`.
-- `storage/db.py` — SQLite (`data/polytone.sqlite3`): tables `config`, `drafts`, `samples` (ingested human text + provenance + sha256), `ingest_runs`. Functions documented in that file.
+- `storage/db.py` — SQLite (`data/polytone.sqlite3`): tables `config`, `drafts`, `samples` (ingested human text + provenance + sha256), `ingest_runs`, `draft_edits` (post-inject sends; never learned). Functions documented in that file.
 - `graph/store.py` — `GraphStore` protocol + `Neo4jGraphStore` + `InMemoryGraphStore` (tests). Cypher templates live in `graph/queries.py`.
 - `ingestion/extract.py` — `extract(text) -> Extraction` (pure python, deterministic, no network). Triplets: Word FOLLOWED_BY Word (weight), Word PART_OF_STRUCTURE SentenceStructure, SentenceStructure USED_IN IntentContext, PunctuationMark nodes.
 - `ingestion/firewall.py` — `HumanText` provenance gate; every rejection returns a reason string. Rejects: empty,
@@ -78,7 +112,8 @@ Signature format `LEN|<n>c|<skeleton>|<opener>|<end>`, e.g. `M|2c|,—|conj|.` (
   **Generated drafts never reach the graph.** Required source provenance:
   gmail → `from_me=True` or `label`/`labels` containing `SENT` (`from_me=False` always rejects);
   watcher → `.mbox` items (`kind`/`format`="mbox" or `file`/`path` *.mbox) need `from_me=True`;
-  wispr → `raw_transcript=True` (or `text_kind="raw"`); `formatted`/`edited`/`ai_edited`/`polished` = reject.
+  wispr → `raw_transcript=True` (or `text_kind="raw"`); `formatted`/`edited`/`ai_edited`/`polished` = reject;
+  typed → `typed=True` (`after_inject=True` always rejects).
 - `langgraph/ingest_graph.py` — LangGraph: `validate → firewall → extract → write_graph → record`. `validate` strips
   quoted reply chains and signatures (`ingestion/text.clean_message`); the cleaned text is what is checked, learned, stored.
 - `langgraph/generate_graph.py` — LangGraph: `capture → retrieve_constraints → build_prompt → generate → postprocess → record → score`.
@@ -94,7 +129,8 @@ Signature format `LEN|<n>c|<skeleton>|<opener>|<end>`, e.g. `M|2c|,—|conj|.` (
 - `ingestion/sources.py` — source registry. Each `mcp_servers` source module may expose
   `collect(settings) -> Iterable[{"text", "provenance"?, "persona"?} | str]`, optional `is_enabled(settings)`,
   `status(settings)`; items go through `run_ingest_batch` (full firewall). Modules: gmail→`gmail_outbound`,
-  wispr→`wispr`, watcher→`file_watcher`.
+  wispr→`wispr`, watcher→`file_watcher`. `typed` is push-only (`ingest_typed(rt, text, app, app_name, after_inject)`,
+  called by `POST /ingest/typed`); running it is refused.
 
 ## Neo4j schema
 
