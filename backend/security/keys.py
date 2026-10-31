@@ -14,7 +14,7 @@ import hmac
 import os
 import secrets
 import threading
-from functools import lru_cache
+from functools import cache, lru_cache
 
 KEYCHAIN_SERVICE = "com.polytone.app"
 KEYCHAIN_ACCOUNT = "data-key-v1"
@@ -22,6 +22,9 @@ ENV_KEY = "POLYTONE_DATA_KEY"
 KEY_BYTES = 32
 
 _lock = threading.Lock()
+# set when this process created the master key (the server records a ``key.created`` audit event)
+_created = False
+ANTHROPIC_ACCOUNT = "anthropic-api-key"
 
 
 class KeyUnavailable(RuntimeError):
@@ -48,11 +51,13 @@ def _keychain_get_or_create() -> bytes:
         stored = keyring.get_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
         if stored:
             return _decode(stored)
+        global _created
         fresh = base64.b64encode(secrets.token_bytes(KEY_BYTES)).decode()
         keyring.set_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, fresh)
         # Read back: a Keychain that silently drops writes would otherwise lose every record.
         if keyring.get_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT) != fresh:
             raise KeyUnavailable("Keychain did not keep the new data key")
+        _created = True
         return _decode(fresh)
     except KeyringError as e:
         raise KeyUnavailable(f"Keychain unavailable: {e}") from e
@@ -76,9 +81,27 @@ def _hkdf(key: bytes, info: bytes, length: int = KEY_BYTES) -> bytes:
     return out[:length]
 
 
-@lru_cache(maxsize=None)
+@cache
 def subkey(purpose: str) -> bytes:
     return _hkdf(master_key(), f"polytone/{purpose}/v1".encode())
+
+
+def consume_created() -> bool:
+    """True once if this process created the master key (then False)."""
+    global _created
+    was, _created = _created, False
+    return was
+
+
+def keychain_secret(account: str, service: str = KEYCHAIN_SERVICE) -> str | None:
+    """A secret stored in the Keychain (e.g. ``anthropic-api-key``), or None. Never raises."""
+    try:
+        import keyring
+
+        value = keyring.get_password(service, account)
+    except Exception:  # noqa: BLE001 - no Keychain / locked / denied → treat as absent
+        return None
+    return value.strip() if value and value.strip() else None
 
 
 def reset_cache() -> None:

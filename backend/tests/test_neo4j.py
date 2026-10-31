@@ -15,7 +15,7 @@ import pytest
 
 from backend.config import Settings
 from backend.graph.constraints import compute_constraints
-from backend.graph.store import InMemoryGraphStore, Neo4jGraphStore
+from backend.graph.store import InMemoryGraphStore, Neo4jGraphStore, word_key
 from backend.ingestion.extract import extract
 
 pytestmark = pytest.mark.neo4j
@@ -42,8 +42,9 @@ def neo():
     store._driver.execute_query(
         "MATCH (c:IntentContext) WHERE c.name STARTS WITH $p DETACH DELETE c", {"p": persona}
     )
+    # legacy-format words (migration test) still carry plaintext text and no key
     store._driver.execute_query(
-        "MATCH (w:Word) WHERE w.text STARTS WITH $t DETACH DELETE w", {"t": tag}
+        "MATCH (w:Word) WHERE w.key IS NULL AND w.text STARTS WITH $t DETACH DELETE w", {"t": tag}
     )
     # robust to tokenization changes: also drop any Word only this test's personas ever used
     store._driver.execute_query(
@@ -96,11 +97,59 @@ def test_neo4j_matches_in_memory(neo):
     assert c_neo["contractions_rate"] == 1.0 and c_neo["punctuation_rates"]["—"] > 0
     # persona weights on FOLLOWED_BY
     rows = store.execute_read(
-        "MATCH (a:Word {text: $a})-[r:FOLLOWED_BY]->(b:Word {text: $b}) RETURN r.weight AS w,"
+        "MATCH (a:Word {key: $a})-[r:FOLLOWED_BY]->(b:Word {key: $b}) RETURN r.weight AS w,"
         " r.personas AS ps, r.persona_weights AS pw",
-        {"a": f"{tag}hey", "b": f"{tag}ok"},
+        {"a": word_key(f"{tag}hey"), "b": word_key(f"{tag}ok")},
     )
     assert rows == [{"w": 1, "ps": [persona], "pw": [1]}]
+    # at rest: blind index + ciphertext only, never the word itself
+    leaked = store.execute_read(
+        "MATCH (w:Word) WHERE w.text CONTAINS $t RETURN count(w) AS n", {"t": tag}
+    )
+    assert leaked == [{"n": 0}]
+    (ctx,) = store.execute_read("MATCH (c:IntentContext {name: $p}) RETURN properties(c) AS c", {"p": persona})
+    assert all(k.startswith("idx1:") for k in ctx["c"]["opener_keys"])
+    assert all(t.startswith("enc1:") for t in ctx["c"]["opener_texts"])
+    assert not any(tag in str(v) for v in ctx["c"].values() if v != persona)
+
+
+def test_neo4j_migrates_legacy_plaintext_graph(neo):
+    """Plaintext nodes in the pre-encryption format are encrypted in place, in batches, once."""
+    store, tag, persona, created = neo
+    words = [f"{tag}w{i}" for i in range(5)]
+    store._driver.execute_query(
+        "UNWIND $ws AS w CREATE (:Word {text: w, weight: 1, personas: [$p], persona_counts: [1]})",
+        {"ws": words, "p": persona},
+    )
+    store._driver.execute_query(
+        "MATCH (a:Word {text: $a}), (b:Word {text: $b}) "
+        "CREATE (a)-[:FOLLOWED_BY {weight: 1, personas: [$p], persona_weights: [1]}]->(b)",
+        {"a": words[0], "b": words[1], "p": persona},
+    )
+    store._driver.execute_query(
+        "CREATE (:IntentContext {name: $p, sample_count: 1, sentence_count: 1, lower_starts: 1,"
+        " upper_starts: 0, len_sum: 5, len_hist: [0,0,0,0,0,1], contractions: 0, expansions: 0,"
+        " opener_keys: [$o], opener_counts: [1], opener_phrase_keys: [], opener_phrase_counts: [],"
+        " transition_keys: [], transition_counts: []})",
+        {"p": persona, "o": words[0]},
+    )
+    store._driver.execute_query("MATCH (m:PolytoneMeta) DETACH DELETE m")  # scratch DB: force a run
+    counts = store.migrate_encryption(batch=2)
+    assert counts["words"] >= 5 and counts["contexts"] >= 1
+    assert store.migrate_encryption() == {}  # idempotent (marker set)
+    assert store.execute_read(
+        "MATCH (w:Word) WHERE w.text STARTS WITH $t OR w.key IS NULL RETURN count(w) AS n", {"t": tag}
+    ) == [{"n": 0}]
+    store._plain.clear()  # read back through decryption, not the write-side memo
+    agg = store._aggregate(persona, 20)
+    assert agg.words == {w: 1 for w in words}
+    assert agg.bigrams == {(words[0], words[1]): 1}
+    assert agg.openers == {words[0]: 1}
+    # writes after the migration merge into the migrated nodes (same blind index)
+    _write(store, created, f"{words[0]} {words[1]} {tag}more text.", persona)
+    store._plain.clear()
+    agg = store._aggregate(persona, 20)
+    assert agg.words[words[0]] == 2 and agg.openers[words[0]] == 2
 
 
 def test_neo4j_graph_and_stats(neo):

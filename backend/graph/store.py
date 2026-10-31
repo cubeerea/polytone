@@ -11,6 +11,12 @@ with few samples leans on the user's overall style; with none it is pure global,
 invalidated on every write (a generation counter keeps a computation that raced with a write
 out of the cache). The all-persona aggregate is cached separately, so after an ingest each
 persona's first request only re-reads its own aggregate.
+
+Encryption at rest (see ``graph/queries.py``): Neo4j holds blind indexes (lookup keys) and
+ciphertexts, never the user's words; ``Neo4jGraphStore`` decrypts on read through an in-memory
+``key -> word`` map (filled by writes and by the first read of each key), so a warm read decrypts
+nothing. ``InMemoryGraphStore`` keeps plaintext (RAM only, nothing at rest) and breaks ranking
+ties on the same blind index, so both stores return identical aggregates.
 """
 from __future__ import annotations
 
@@ -28,12 +34,30 @@ from backend.graph.constraints import (
     empty_constraints,
 )
 from backend.ingestion.types import Extraction
+from backend.security import crypto
 
 log = logging.getLogger(__name__)
 
 _WORD_FETCH = 400  # words pulled for lexicon computation
 _BIGRAM_SEED = 150  # bigrams are expanded from this many top words
 _STRUCT_FETCH = 100  # structures pulled per aggregate before blending
+
+# blind-index / AAD contexts of the encrypted graph properties
+WORD_CTX = "neo4j:Word.text"
+CTX_LISTS = (  # (aggregate field, keys property, texts property)
+    ("openers", "opener_keys", "opener_texts"),
+    ("opener_phrases", "opener_phrase_keys", "opener_phrase_texts"),
+    ("transitions", "transition_keys", "transition_texts"),
+)
+MIGRATE_BATCH = 2000
+
+
+def word_key(w: str) -> str:
+    return crypto.blind_index(w, WORD_CTX)
+
+
+def list_key(prop: str, value: str) -> str:
+    return crypto.blind_index(value, f"neo4j:IntentContext.{prop}")
 
 
 @runtime_checkable
@@ -53,6 +77,14 @@ class GraphStore(Protocol):
     def stats(self) -> dict[str, Any]: ...
 
     def healthy(self) -> bool: ...
+
+    def wipe(self) -> int:
+        """Delete the whole style graph. Returns the nodes deleted."""
+        ...
+
+    def migrate_encryption(self) -> dict[str, int]:
+        """Encrypt a legacy plaintext graph in place (idempotent). Returns counts."""
+        ...
 
     def close(self) -> None: ...
 
@@ -148,6 +180,9 @@ class _BaseStore:
     def close(self) -> None:
         pass
 
+    def migrate_encryption(self) -> dict[str, int]:
+        return {}
+
 
 def _copy(c: Constraints) -> Constraints:
     return {
@@ -164,6 +199,15 @@ def _copy(c: Constraints) -> Constraints:
 def _top_items(d: dict[Any, int | float], n: int) -> list[tuple[Any, int | float]]:
     """Top ``n`` by value desc, key asc (keys are all str or all str-tuples — same order as Cypher)."""
     return sorted(d.items(), key=lambda kv: (-kv[1], kv[0]))[:n]
+
+
+def _top_words(d: dict[str, int], n: int) -> list[tuple[str, int]]:
+    """Top ``n`` words by count desc, then blind index asc — Neo4j's ``ORDER BY n DESC, key ASC``."""
+    return sorted(d.items(), key=lambda kv: (-kv[1], word_key(kv[0])))[:n]
+
+
+def _top_bigrams(d: dict[tuple[str, str], int], n: int) -> list[tuple[tuple[str, str], int]]:
+    return sorted(d.items(), key=lambda kv: (-kv[1], word_key(kv[0][0]), word_key(kv[0][1])))[:n]
 
 
 # ============================================================================ in-memory
@@ -191,6 +235,15 @@ class InMemoryGraphStore(_BaseStore):
 
     def healthy(self) -> bool:
         return True
+
+    def wipe(self) -> int:
+        with self._lock:
+            n = len(self.words) + len(self.structures) + len(self.punct) + len(self.contexts)
+            for d in (self.words, self.word_p, self.bigrams, self.bigram_p, self.structures, self.struct_ctx,
+                      self.word_struct, self.punct, self.punct_ctx, self.contexts):
+                d.clear()
+        self.invalidate()
+        return n
 
     def write_extraction(self, extraction: Extraction | dict[str, Any], persona: str) -> dict[str, int]:
         ex = Extraction.from_any(extraction)
@@ -253,11 +306,11 @@ class InMemoryGraphStore(_BaseStore):
             else:
                 words = {w: p[persona] for w, p in self.word_p.items() if p.get(persona)}
                 bigrams = {bg: p[persona] for bg, p in self.bigram_p.items() if p.get(persona)}
-            top = _top_items(words, _WORD_FETCH)
+            top = _top_words(words, _WORD_FETCH)
             agg.words = dict(top)
             agg.word_totals = {w: self.words[w] for w in agg.words}
             seed = {w for w, _ in top[:_BIGRAM_SEED]}
-            agg.bigrams = dict(_top_items({bg: n for bg, n in bigrams.items() if bg[0] in seed}, k))
+            agg.bigrams = dict(_top_bigrams({bg: n for bg, n in bigrams.items() if bg[0] in seed}, k))
             structs: dict[str, int] = defaultdict(int)
             for (sig, ctx), n in self.struct_ctx.items():
                 if persona is None or ctx == persona:
@@ -281,7 +334,7 @@ class InMemoryGraphStore(_BaseStore):
                 (n, c["sample_count"]) for n, c in self.contexts.items() if persona is None or n == persona
             ]
         return {
-            "words": _top_items(words, n_words),
+            "words": _top_words(words, n_words),
             "structures": _top_items(agg.structures, n_structs),
             "punctuation": _top_items(agg.punctuation, 8),
             "contexts": sorted(ctxs, key=lambda x: (-x[1], x[0])),
@@ -330,6 +383,54 @@ class Neo4jGraphStore(_BaseStore):
             connection_acquisition_timeout=timeout,
             max_transaction_retry_time=timeout,
         )
+        self._plain: dict[str, str] = {}  # blind index -> decrypted word / opener / transition
+        self._plain_lock = threading.Lock()
+        self.migration: dict[str, int] = {}
+
+    # -- encryption helpers ---------------------------------------------------------
+    def _learn(self, key: str, plain: str) -> None:
+        with self._plain_lock:
+            self._plain[key] = plain
+
+    def _open(self, key: str, token: str | None, ctx: str) -> str:
+        """Plaintext for ``key`` (memoized); decrypts ``token`` on the first sight of a key."""
+        hit = self._plain.get(key)
+        if hit is not None:
+            return hit
+        plain = crypto.decrypt(token, ctx) if token is not None else ""
+        self._learn(key, plain)
+        return plain
+
+    def _word_rows(self, words: dict[str, int]) -> list[dict[str, Any]]:
+        out = []
+        for w, n in words.items():
+            k = word_key(w)
+            self._learn(k, w)
+            out.append({"key": k, "text": crypto.encrypt(w, WORD_CTX), "n": n})
+        return out
+
+    def _keyed_delta(self, d: dict[str, Any]) -> dict[str, Any]:
+        d = dict(d)
+        for field_, keys_p, texts_p in CTX_LISTS:
+            rows = []
+            for value, n in d[field_].items():
+                k = list_key(keys_p, value)
+                self._learn(k, value)
+                rows.append({"k": k, "e": crypto.encrypt(value, f"neo4j:IntentContext.{texts_p}"), "n": n})
+            d[field_] = rows
+        return d
+
+    def _plain_context(self, c: dict[str, Any]) -> dict[str, Any]:
+        """IntentContext properties with the opener / transition keys replaced by plaintext."""
+        c = dict(c)
+        for _, keys_p, texts_p in CTX_LISTS:
+            keys = c.get(keys_p) or []
+            texts = c.get(texts_p)
+            if texts is None:  # legacy plaintext context (migrated at start-up)
+                continue
+            ctx = f"neo4j:IntentContext.{texts_p}"
+            c[keys_p] = [self._open(k, t, ctx) for k, t in zip(keys, texts, strict=False)]
+        return c
 
     @classmethod
     def from_settings(cls, settings: Any, timeout: float = 3.0) -> Neo4jGraphStore:
@@ -360,11 +461,11 @@ class Neo4jGraphStore(_BaseStore):
 
     def write_extraction(self, extraction: Extraction | dict[str, Any], persona: str) -> dict[str, int]:
         ex = Extraction.from_any(extraction)
-        d = context_delta(ex)
-        words = [{"text": w, "n": n} for w, n in ex.words.items()]
-        bigrams = [{"a": a, "b": b, "n": n} for (a, b), n in ex.bigrams.items()]
+        d = self._keyed_delta(context_delta(ex))
+        words = self._word_rows(ex.words)
+        bigrams = [{"a": word_key(a), "b": word_key(b), "n": n} for (a, b), n in ex.bigrams.items()]
         structs = [{"sig": s, "n": n} for s, n in ex.structures.items()]
-        wstructs = [{"w": w, "sig": s, "n": n} for (w, s), n in ex.word_structures.items()]
+        wstructs = [{"w": word_key(w), "sig": s, "n": n} for (w, s), n in ex.word_structures.items()]
         puncts = [{"sym": s, "n": n} for s, n in ex.punctuation.items()]
 
         def work(tx: Any) -> None:
@@ -397,15 +498,18 @@ class Neo4jGraphStore(_BaseStore):
         def work(tx: Any) -> StyleAggregate:
             agg = StyleAggregate()
             for row in rows(tx, Q.READ_CONTEXTS):
-                agg.merge_context(row["c"])
+                agg.merge_context(self._plain_context(row["c"]))
             if agg.sample_count == 0:
                 return agg
             words = rows(tx, Q.READ_TOP_WORDS, limit=_WORD_FETCH)
-            agg.words = {r["text"]: int(r["n"] or 0) for r in words}
-            agg.word_totals = {r["text"]: int(r["total"] or 0) for r in words}
-            seed = [r["text"] for r in words[:_BIGRAM_SEED]]
+            for r in words:
+                r["w"] = self._open(r["key"], r["text"], WORD_CTX)
+            agg.words = {r["w"]: int(r["n"] or 0) for r in words}
+            agg.word_totals = {r["w"]: int(r["total"] or 0) for r in words}
+            seed = [r["key"] for r in words[:_BIGRAM_SEED]]
             agg.bigrams = {
-                (r["a"], r["b"]): int(r["n"] or 0) for r in rows(tx, Q.READ_TOP_BIGRAMS, seed=seed, limit=k)
+                (self._open(r["ak"], r["a"], WORD_CTX), self._open(r["bk"], r["b"], WORD_CTX)): int(r["n"] or 0)
+                for r in rows(tx, Q.READ_TOP_BIGRAMS, seed=seed, limit=k)
             }
             agg.structures = {
                 r["sig"]: int(r["n"] or 0) for r in rows(tx, Q.READ_STRUCTURES, limit=max(k, _STRUCT_FETCH))
@@ -422,7 +526,10 @@ class Neo4jGraphStore(_BaseStore):
             for r in self._read(Q.READ_CONTEXTS, persona=persona)
         ]
         return {
-            "words": [(r["text"], r["n"] or 0) for r in self._read(Q.READ_TOP_WORDS, persona=persona, limit=n_words)],
+            "words": [
+                (self._open(r["key"], r["text"], WORD_CTX), r["n"] or 0)
+                for r in self._read(Q.READ_TOP_WORDS, persona=persona, limit=n_words)
+            ],
             "structures": [
                 (r["sig"], r["n"] or 0) for r in self._read(Q.READ_STRUCTURES, persona=persona, limit=n_structs)
             ],
@@ -433,16 +540,81 @@ class Neo4jGraphStore(_BaseStore):
         }
 
     def _edges_among(self, persona, words, sigs, syms, ctxs) -> dict[str, list]:
+        by_key = {word_key(w): w for w in words}
+        keys = list(by_key)
         followed = [
-            (r["a"], r["b"], r["n"] or 0)
-            for r in self._read(Q.READ_FOLLOWED_AMONG, words=words, persona=persona)
+            (by_key[r["a"]], by_key[r["b"]], r["n"] or 0)
+            for r in self._read(Q.READ_FOLLOWED_AMONG, words=keys, persona=persona)
+            if r["a"] in by_key and r["b"] in by_key
         ]
-        part_of = [(r["w"], r["sig"], r["n"] or 0) for r in self._read(Q.READ_PART_OF_AMONG, words=words, sigs=sigs)]
+        part_of = [
+            (by_key[r["w"]], r["sig"], r["n"] or 0)
+            for r in self._read(Q.READ_PART_OF_AMONG, words=keys, sigs=sigs)
+            if r["w"] in by_key
+        ]
         used_in = [
             (r["kind"], r["key"], r["ctx"], r["n"] or 0)
             for r in self._read(Q.READ_USED_IN_AMONG, ctxs=ctxs, sigs=sigs, syms=syms)
         ]
         return {"followed": followed, "part_of": part_of, "used_in": used_in}
+
+    def wipe(self) -> int:
+        total = 0
+        while True:
+            records, _, _ = self._driver.execute_query(Q.WIPE_BATCH, {"limit": 5000})
+            n = int(records[0]["n"]) if records else 0
+            total += n
+            if n == 0:
+                break
+        with self._plain_lock:
+            self._plain.clear()
+        self.invalidate()
+        return total
+
+    def migrate_encryption(self, batch: int = MIGRATE_BATCH) -> dict[str, int]:
+        """Encrypt a legacy plaintext graph in place (see ``queries.py``). Safe on a live graph:
+        batched (one write transaction per ``batch`` nodes), resumable (only unmigrated nodes are
+        selected; the marker is written last) and idempotent (a migrated graph costs one read)."""
+        records, _, _ = self._driver.execute_query(Q.META_ENC_VERSION, routing_="r")
+        if records and (records[0]["v"] or 0) >= 1:
+            return {}
+        counts = {"words": 0, "contexts": 0}
+        while True:
+            records, _, _ = self._driver.execute_query(Q.MIGRATE_WORDS_BATCH, {"limit": batch}, routing_="r")
+            rows = []
+            for r in records:
+                text = r["text"]
+                if crypto.is_encrypted(text):  # never double-encrypt (cannot happen without a key)
+                    continue
+                k = word_key(text)
+                self._learn(k, text)
+                rows.append({"id": r["id"], "key": k, "enc": crypto.encrypt(text, WORD_CTX)})
+            if not rows:
+                break
+            res, _, _ = self._driver.execute_query(Q.MIGRATE_WORDS_APPLY, {"rows": rows})
+            counts["words"] += int(res[0]["n"]) if res else 0
+        while True:
+            records, _, _ = self._driver.execute_query(Q.MIGRATE_CONTEXTS_BATCH, {"limit": batch}, routing_="r")
+            if not records:
+                break
+            rows = []
+            for r in records:
+                row: dict[str, Any] = {"id": r["id"]}
+                for src, short, (_, keys_p, texts_p) in zip(
+                    ("openers", "phrases", "transitions"), ("opener", "phrase", "transition"), CTX_LISTS, strict=True
+                ):
+                    plain = [str(x) for x in (r[src] or [])]
+                    row[f"{short}_keys"] = [list_key(keys_p, v) for v in plain]
+                    row[f"{short}_texts"] = [crypto.encrypt(v, f"neo4j:IntentContext.{texts_p}") for v in plain]
+                rows.append(row)
+            res, _, _ = self._driver.execute_query(Q.MIGRATE_CONTEXTS_APPLY, {"rows": rows})
+            counts["contexts"] += int(res[0]["n"]) if res else 0
+        self._driver.execute_query(Q.DROP_LEGACY_WORD_CONSTRAINT)
+        self._driver.execute_query(Q.SET_META_ENC_VERSION, {"v": 1})
+        self.invalidate()
+        if counts["words"] or counts["contexts"]:
+            log.info("encrypted the style graph at rest: %s", counts)
+        return {k: v for k, v in counts.items() if v}
 
     def stats(self) -> dict[str, Any]:
         r = self._read(Q.STATS)[0]
@@ -463,6 +635,7 @@ def connect_graph_store(settings: Any, timeout: float = 2.0) -> GraphStore:
         store = Neo4jGraphStore.from_settings(settings, timeout=timeout)
         store._driver.verify_connectivity()
         store.ensure_schema()
+        store.migration = store.migrate_encryption()
         return store
     except Exception as e:  # noqa: BLE001
         if store is not None:
