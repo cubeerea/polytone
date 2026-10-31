@@ -119,9 +119,9 @@ def test_sources_list_and_run(client, monkeypatch):
 
     fake = types.ModuleType("backend.mcp_servers.wispr")
     fake.collect = lambda settings: [
-        {"text": "yo i'm on it. back in five.", "provenance": {"generated": False, "raw_transcript": True}},
+        {"text": "yo i'm on it. back in five.", "provenance": {"generated": False, "raw_transcript": True, "app": "com.tinyspeck.slackmacgap"}},
         {"text": "AI wrote this one", "provenance": {"generated": True, "raw_transcript": True}},
-        {"text": "raw dictation works too.", "provenance": {"text_kind": "raw"}},
+        {"text": "raw dictation works too.", "provenance": {"text_kind": "raw", "app": "com.apple.Notes"}},
         "a bare string has no raw-transcript provenance.",
     ]
     monkeypatch.setitem(sys.modules, "backend.mcp_servers.wispr", fake)

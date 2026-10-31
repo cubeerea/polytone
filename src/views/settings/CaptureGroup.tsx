@@ -19,6 +19,13 @@ const KNOWN_APPS: Record<string, string> = {
   "notion.id": "Notion",
   "com.linear": "Linear",
   "com.microsoft.Outlook": "Outlook",
+  "com.microsoft.VSCode": "VS Code",
+  "com.google.antigravity-ide": "Antigravity",
+  "com.anthropic.claudefordesktop": "Claude",
+  "com.hnc.Discord": "Discord",
+  "net.whatsapp.WhatsApp": "WhatsApp",
+  "ru.keepcoder.Telegram": "Telegram",
+  "company.thebrowser.Browser": "Arc",
 };
 
 /** `"com.tinyspeck.slackmacgap: fewer than 3 words"` → `"Slack: fewer than 3 words"`. */
@@ -27,13 +34,14 @@ function appLabel(skip: string, name: (id: string) => string): string {
   return i > 0 ? `${name(skip.slice(0, i))}: ${skip.slice(i + 2)}` : skip;
 }
 
-/** "Learn from what I type": the opt-in switch and its app allowlist. */
+/** "Learn from what I type" (opt-in switch) and the app list. The list also decides which apps
+ * Wispr Flow dictation is learned from, so it is shown whether or not typing capture is on. */
 export function CaptureGroup({ tauri, online, config }: { tauri: boolean; online: boolean; config: AppConfig | null }) {
   const supported = config != null && typeof config.capture_enabled === "boolean";
   const enabled = config?.capture_enabled ?? false;
   const apps = config?.capture_apps ?? [];
   const cap = useCaptureStatus(enabled).data;
-  const running = useRunningApps(enabled).data ?? [];
+  const running = useRunningApps(supported).data ?? [];
   const [capErr, setCapErr] = useState<string | null>(null);
   const [manualId, setManualId] = useState("");
   const [busy, setBusy] = useState(false);
@@ -101,7 +109,15 @@ export function CaptureGroup({ tauri, online, config }: { tauri: boolean; online
           />
         </Row>
 
-        {enabled &&
+        {supported && (
+          <div className="row !min-h-[30px] !py-1">
+            <span className="text-[12px] text-text-3">
+              Learns only in these apps: what you type{enabled ? "" : " (when on)"} and what you dictate with Wispr Flow
+            </span>
+          </div>
+        )}
+
+        {supported &&
           apps.map((id) => (
             <div className="row fade-in !min-h-[34px] !py-1" key={id}>
               <div className="min-w-0 flex-1 truncate text-[13px]" title={id}>
@@ -120,7 +136,7 @@ export function CaptureGroup({ tauri, online, config }: { tauri: boolean; online
             </div>
           ))}
 
-        {enabled && (
+        {supported && (
           <div className="row !min-h-[38px]">
             {addable.length > 0 ? (
               <select

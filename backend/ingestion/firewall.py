@@ -12,7 +12,9 @@ string whenever ``ok`` is False, else None. Checks run in this order:
    - watcher: ``.mbox`` items (``format == "mbox"`` or a ``path``/``file`` ending in .mbox)
               must carry ``from_me=True`` (message From: the user)
    - wispr:   must be the raw transcript — ``raw_transcript=True`` or ``text_kind == "raw"``;
-              Wispr's AI-formatted/edited text (``formatted``/``edited``/``ai_edited``) is rejected
+              Wispr's AI-formatted/edited text (``formatted``/``edited``/``ai_edited``) is rejected;
+              and the dictation's ``app`` must be in the Learning app list (``capture_apps``, the
+              same list typing capture uses — see ``app_policy``); no recorded app rejects
    - typed:   text the user typed and sent in a native app (typing capture) — needs
               ``typed=True``; ``after_inject=True`` (sent right after a Polytone inject) rejects
 5. too short (< ``MIN_TOKENS`` word tokens or < ``MIN_CHARS`` characters)
@@ -42,6 +44,7 @@ from __future__ import annotations
 import threading
 from typing import Any
 
+from backend.ingestion import app_policy
 from backend.ingestion.text import containment, jaccard, shingles, tokenize
 from backend.storage.db import text_index
 
@@ -73,7 +76,7 @@ def _labels(prov: dict[str, Any]) -> list[str]:
     return [x.lower().removeprefix("label:").removeprefix("in:") for x in out]
 
 
-def _check_source(source: str, prov: dict[str, Any]) -> str | None:
+def _check_source(source: str, prov: dict[str, Any], db: Any) -> str | None:
     src = (source or "").lower()
     if src == "gmail":
         if prov.get("from_me") is False:
@@ -93,6 +96,9 @@ def _check_source(source: str, prov: dict[str, Any]) -> str | None:
         kind = str(prov.get("text_kind") or prov.get("kind") or "").lower()
         if not (_truthy(prov.get("raw_transcript")) or kind in ("raw", "raw_transcript")):
             return "wispr item is not marked as a raw transcript (needs raw_transcript=True)"
+        why = app_policy.skip_reason(prov.get("app"), app_policy.allowed_apps(db))
+        if why:
+            return f"wispr {why}"
     elif src == "typed":
         if _truthy(prov.get("after_inject")):
             return "typed text was sent right after a Polytone inject (after_inject=True)"
@@ -187,7 +193,7 @@ def check(text: str, source: str, provenance: dict[str, Any] | None, db: Any) ->
         return False, "flagged as generated"
     if prov.get("inbound") is True or str(prov.get("direction", "")).lower() == "inbound":
         return False, "inbound mail is not the user's writing"
-    reason = _check_source(source, prov)
+    reason = _check_source(source, prov, db)
     if reason:
         return False, reason
     toks = tokenize(text)
