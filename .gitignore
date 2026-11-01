@@ -15,3 +15,8 @@ data/
 .DS_Store
 .claude/
 .gstack/
+
+# unattended agent loop (orchestrator.py): runtime state and logs
+progress.json
+progress.json.tmp
+.agent/
