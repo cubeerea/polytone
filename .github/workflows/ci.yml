@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read # paths-filter lists the PR's changed files
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            rust:
+              - 'src-tauri/**'
+              - '.github/workflows/ci.yml'
+
+  backend:
+    name: Backend (pytest + ruff)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # Offline: mock LLM, no embeddings, no Neo4j (those tests skip). Never a real key.
+      ANTHROPIC_API_KEY: ""
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --frozen --extra gmail # gmail tests need httplib2
+      - run: uv run ruff check backend
+      - run: uv run pytest -q
+
+  frontend:
+    name: Frontend (tsc + vite build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+
+  rust:
+    name: Tauri app (cargo test + clippy, macOS)
+    needs: changes
+    # macOS minutes count 10x against the private-repo quota: only run when Rust code changed.
+    if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build # tauri.conf.json's frontendDist (../dist) must exist to compile
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: cargo test --locked
+        working-directory: src-tauri
+      - run: cargo clippy --all-targets --locked -- -D warnings
+        working-directory: src-tauri
+
+  # One check to wait on: passes when every job passed (or Rust was skipped as unchanged).
+  ci:
+    name: CI passed
+    if: always()
+    needs: [changes, backend, frontend, rust]
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          for r in "${{ needs.changes.result }}" "${{ needs.backend.result }}" "${{ needs.frontend.result }}" "${{ needs.rust.result }}"; do
+            # "skipped" only happens to rust (no Rust changes); a failed "changes" job fails here first
+            case "$r" in success|skipped) ;; *) echo "a job finished with: $r"; exit 1 ;; esac
+          done
