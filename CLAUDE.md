@@ -15,8 +15,12 @@
 Repo: https://github.com/cubeerea/polytone (private). Never commit `.env`, `credentials.json`, `token.json`, or anything under `data/`.
 
 ## Unattended agent loop
-`orchestrator.py` runs headless Claude Code on one task from `progress.json` (git-ignored), checks the
-work with `validate.py` (the same checks as CI) and feeds failures back until it passes or hits
-`max_iterations`. Run it in its own worktree (`git worktree add ../polytone-agent main`) inside tmux.
+`orchestrator.py` runs headless Claude Code on one task from `progress.json` (git-ignored) as an
+implementor/evaluator pair: the implementor makes the change, `validate.py` (the same checks as CI)
+must pass, then a read-only evaluator agent reviews the diff against the task. Validation failures and
+evaluator rejections are fed back until it passes or hits `max_iterations`. With
+`run --watch --pr --routine` it also queues routine work when idle (validation sweep → tests → bug hunt,
+every 6h by default; none while 2 routine PRs are open). Queue tasks in the worktree the loop runs in:
+each checkout has its own `progress.json`. Run it in its own worktree (`git worktree add ../polytone-agent main`) inside tmux.
 The agent commits on `agent/<task>` only; pushing, PRs and merging stay with the orchestrator/human.
 Agents must never edit `validate.py`, `orchestrator.py`, `progress.json` or `.github/`.
