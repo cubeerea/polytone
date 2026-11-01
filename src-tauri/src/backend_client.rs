@@ -72,6 +72,12 @@ pub struct BackendConfig {
     pub capture_apps: Option<Vec<String>>,
 }
 
+/// One entry of `GET /personas` (only the name is used on the Rust side: the tray menu).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct PersonaInfo {
+    pub name: String,
+}
+
 /// `POST /ingest/typed` body (CONTRACTS.md "Typing capture").
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct TypedIngestRequest {
@@ -385,6 +391,12 @@ impl BackendClient {
         Ok(self.send(|h| h.get(&url)).await?.json().await?)
     }
 
+    /// `GET /personas`: built-ins first, then the user's own, in display order.
+    pub async fn personas(&self) -> Result<Vec<PersonaInfo>, BackendError> {
+        let url = self.url("/personas");
+        Ok(self.send(|h| h.get(&url)).await?.json().await?)
+    }
+
     pub async fn put_config(&self, cfg: &BackendConfig) -> Result<BackendConfig, BackendError> {
         let url = self.url("/config");
         Ok(self.send(|h| h.put(&url).json(cfg)).await?.json().await?)
@@ -640,6 +652,25 @@ mod tests {
             let seen = seen.lock().unwrap();
             assert_eq!(seen[0].0, "POST /warm");
             assert_eq!(seen[0].1.as_deref(), Some("Bearer tok-w"));
+        });
+    }
+
+    #[test]
+    fn personas_lists_names_and_ignores_extra_fields() {
+        tokio_rt().block_on(async {
+            let (url, _seen) = mock_server(|line, _auth| match line {
+                "GET /personas" => (
+                    200,
+                    r#"[{"name":"Default","description":"d","builtin":true,"edited":false,"samples":3},
+                        {"name":"Recruiter","description":"warm","builtin":false,"edited":true,"samples":0}]"#
+                        .into(),
+                ),
+                _ => (404, "{}".into()),
+            })
+            .await;
+            let c = BackendClient::new(url);
+            let names: Vec<String> = c.personas().await.unwrap().into_iter().map(|p| p.name).collect();
+            assert_eq!(names, ["Default", "Recruiter"]);
         });
     }
 

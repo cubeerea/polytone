@@ -45,6 +45,15 @@ _CACHE_SIZE = 4000
 # memo key -> (chosen excerpts, drafts snapshot rows object, drafts checked)
 _picks: OrderedDict[tuple, tuple[list[str], Any, int]] = OrderedDict()
 _PICKS_SIZE = 256
+_gen = 0  # bumped by invalidate(): part of every picks key, so a selection racing it is never reused
+
+
+def invalidate() -> None:
+    """Forget every cached pick (samples moved between personas: the watermark doesn't change)."""
+    global _gen
+    with _cache_lock:
+        _gen += 1
+        _picks.clear()
 
 
 def _excerpts_for(db_key: str, sample: dict[str, Any]) -> list[Excerpt]:
@@ -89,7 +98,7 @@ def select_examples(
     target = min(max(len(tokenize(intent)), 6), 30)
     avg = float(constraints.get("avg_sentence_len") or 0) or None
     top5 = tuple(s["signature"] for s in (constraints.get("structures") or [])[:5])
-    key = (db_key, persona or None, target, avg, top5, k, db.samples_watermark())
+    key = (db_key, persona or None, target, avg, top5, k, db.samples_watermark(), _gen)
     drafts = draft_snapshot(db)  # one sync for every draft check below
     with _cache_lock:
         hit = _picks.get(key)

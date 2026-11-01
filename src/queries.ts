@@ -38,6 +38,12 @@ export function usePersonas() {
   return q.data?.length ? q.data : DEFAULT_PERSONAS;
 }
 
+/** The persona list with its loading / error state (Settings → Personas). */
+export const usePersonaList = () => useQuery(KEYS.personas, api.personas);
+
+/** What adding, rewording or deleting a persona can change (a delete moves samples to Default). */
+export const AFTER_PERSONA_CHANGE = [KEYS.personas, KEYS.config, "graph:", KEYS.stats];
+
 export const useConfig = () => useQuery(KEYS.config, api.getConfig);
 
 /** Optimistic partial config update; rolls back and surfaces the error on failure. */

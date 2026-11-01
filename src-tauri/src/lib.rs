@@ -71,6 +71,9 @@ pub async fn sync_from_backend_config(app: &AppHandle) {
         Ok(cfg) => {
             *app.state::<AppState>().inject_mode.lock().unwrap() = cfg.inject_mode;
             tray::mark_persona(app, &cfg.active_persona);
+            if let Err(e) = tray::refresh_personas(app).await {
+                log::warn!("could not read personas: {e}");
+            }
             if !cfg.hotkey.trim().is_empty() {
                 let handle = app.clone();
                 let accel = cfg.hotkey.clone();
@@ -159,6 +162,7 @@ pub fn run() {
             security::unlock,
             security::lock,
             security::get_lock_state,
+            tray::refresh_tray_personas,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

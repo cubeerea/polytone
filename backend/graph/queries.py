@@ -137,6 +137,55 @@ ON CREATE SET r.weight = 0
 SET r.weight = r.weight + row.n
 """
 
+# ----------------------------------------------------------------------------- persona merge
+# A deleted persona's learning moves to another persona ($src → $dst). Global weights
+# (Word.weight, FOLLOWED_BY.weight, USED_IN totals) are unchanged; only the attribution moves.
+# The no-op SETs take write locks on both contexts, so an ingest into $dst (another thread or
+# process) waits for this transaction instead of being overwritten by SET_PERSONA_CONTEXT.
+READ_CONTEXT_PAIR = """
+MATCH (s:IntentContext {name: $src})
+SET s.name = s.name
+WITH s
+OPTIONAL MATCH (d:IntentContext {name: $dst})
+SET d.name = d.name
+RETURN properties(s) AS s, properties(d) AS d
+"""
+
+# Per-persona lists on Word and FOLLOWED_BY: drop $src's slot, add its count to $dst's slot.
+_MOVE_LIST = """
+WITH x, [i IN range(0, size(x.personas) - 1) WHERE x.personas[i] = $src][0] AS si
+WITH x, coalesce(x.{counts}[si], 0) AS sn,
+     [i IN range(0, size(x.personas) - 1) WHERE x.personas[i] <> $src] AS keep
+WITH x, sn, [i IN keep | x.personas[i]] AS ps, [i IN keep | coalesce(x.{counts}[i], 0)] AS cs
+WITH x, sn, CASE WHEN $dst IN ps THEN ps ELSE ps + $dst END AS ps2,
+     CASE WHEN $dst IN ps THEN cs ELSE cs + 0 END AS cs2
+SET x.personas = ps2,
+    x.{counts} = [i IN range(0, size(ps2) - 1) | cs2[i] + CASE WHEN ps2[i] = $dst THEN sn ELSE 0 END]
+"""
+MOVE_PERSONA_WEIGHTS = (
+    "MATCH (x:Word) WHERE $src IN x.personas" + _MOVE_LIST.replace("{counts}", "persona_counts")
+    + "WITH count(*) AS _\n"
+    + "MATCH ()-[x:FOLLOWED_BY]->() WHERE $src IN x.personas" + _MOVE_LIST.replace("{counts}", "persona_weights")
+)
+
+MOVE_PERSONA_USED_IN = """
+MATCH (x)-[r:USED_IN]->(:IntentContext {name: $src})
+MERGE (d:IntentContext {name: $dst})
+MERGE (x)-[r2:USED_IN]->(d)
+ON CREATE SET r2.weight = 0
+SET r2.weight = r2.weight + r.weight
+DELETE r
+"""
+
+# $props = the merged IntentContext properties (store.merged_context)
+SET_PERSONA_CONTEXT = """
+MERGE (d:IntentContext {name: $dst})
+SET d += $props
+WITH d
+MATCH (s:IntentContext {name: $src})
+DETACH DELETE s
+"""
+
 # ----------------------------------------------------------------------------- reads
 # $persona may be null → aggregate over all personas.
 READ_CONTEXTS = """

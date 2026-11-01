@@ -18,6 +18,7 @@ from typing import Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
+from backend import personas
 from backend.ingestion import extract as extract_mod
 from backend.ingestion import firewall as firewall_mod
 from backend.ingestion.text import clean_message
@@ -120,10 +121,12 @@ def run_ingest(
     runtime: Runtime | None = None,
 ) -> dict[str, Any]:
     rt = runtime or get_runtime()
-    persona = (persona or "").strip() or rt.db.get_config().get("active_persona") or "Default"
-    out = _graph_for(rt).invoke(
-        {"text": text or "", "source": source, "persona": persona, "provenance": dict(provenance or {})}
-    )
+    with personas.lock.read():  # a persona delete waits for this sample, and vice versa
+        persona = (persona or "").strip() or rt.db.get_config().get("active_persona") or "Default"
+        persona = personas.canonical(rt.db, persona) or "Default"
+        out = _graph_for(rt).invoke(
+            {"text": text or "", "source": source, "persona": persona, "provenance": dict(provenance or {})}
+        )
     res = empty_result()
     if out.get("ok", False):
         res.update(accepted=1, sentences=out.get("sentences", 0), words_merged=out.get("words_merged", 0))

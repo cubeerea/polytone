@@ -27,6 +27,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
+from backend import personas as persona_store
 from backend.config import REPO_ROOT, get_settings
 from backend.ingestion.sources import (
     PUSH_ONLY,
@@ -35,7 +36,6 @@ from backend.ingestion.sources import (
     list_sources,
     run_source,
 )
-from backend.langgraph.prompts import PERSONAS
 from backend.runtime import Runtime, build_runtime, get_runtime, set_runtime
 from backend.security import files as file_hygiene
 from backend.security import retention
@@ -67,6 +67,15 @@ class IngestTypedRequest(BaseModel):
     app: str
     app_name: str | None = None
     after_inject: bool = False
+
+
+class PersonaCreateBody(BaseModel):
+    name: str
+    description: str
+
+
+class PersonaUpdateBody(BaseModel):
+    description: str | None = None  # None on a built-in: reset to Polytone's wording
 
 
 class ConfigBody(BaseModel):
@@ -366,13 +375,34 @@ def create_app(runtime: Runtime | None = None, *, api_token: str | None = None) 
         return run_source(name, rt())
 
     @app.get("/personas")
-    def personas() -> list[dict[str, str]]:
-        out = [{"name": n, "description": d} for n, d in PERSONAS.items()]
-        known = set(PERSONAS)
-        for n in rt().db.sample_personas():
-            if n not in known:
-                out.append({"name": n, "description": f"Custom persona learned from your '{n}' samples."})
-                known.add(n)
+    def personas() -> list[dict[str, Any]]:
+        return persona_store.list_personas(rt().db)
+
+    def _persona_call(fn: Any, *args: Any) -> Any:
+        try:
+            return fn(*args)
+        except persona_store.PersonaError as e:
+            raise HTTPException(status_code=e.status, detail=str(e)) from e
+
+    @app.post("/personas")
+    def create_persona(body: PersonaCreateBody, request: Request) -> dict[str, Any]:
+        r = rt()
+        p = _persona_call(persona_store.create, r.db, body.name, body.description)
+        r.audit_event("persona.create", {"persona": p["name"], "chars": len(p["description"])}, actor(request))
+        return p
+
+    @app.put("/personas/{name}")
+    def update_persona(name: str, body: PersonaUpdateBody, request: Request) -> dict[str, Any]:
+        r = rt()
+        p = _persona_call(persona_store.update, r.db, name, body.description)
+        r.audit_event("persona.update", {"persona": p["name"], "reset": body.description is None}, actor(request))
+        return p
+
+    @app.delete("/personas/{name}")
+    def delete_persona(name: str, request: Request) -> dict[str, Any]:
+        r = rt()
+        out = _persona_call(persona_store.delete, r, name)  # GraphUnavailable → 503, nothing changed
+        r.audit_event("persona.delete", {"persona": out["name"], "moved_samples": out["moved_samples"]}, actor(request))
         return out
 
     @app.get("/config")
@@ -382,8 +412,14 @@ def create_app(runtime: Runtime | None = None, *, api_token: str | None = None) 
     @app.put("/config")
     def put_config(body: ConfigBody, request: Request) -> dict[str, Any]:
         r = rt()
+        values = body.model_dump(exclude_none=True)
+        if "active_persona" in values:  # only an existing persona, in its stored spelling
+            p = persona_store.find(r.db, values["active_persona"])
+            if p is None:
+                raise HTTPException(status_code=422, detail=f"No persona called “{values['active_persona']}”.")
+            values["active_persona"] = p["name"]
         before = _config_out(r.db)
-        r.db.set_config(body.model_dump(exclude_none=True))
+        r.db.set_config(values)
         after = _config_out(r.db)
         changed = sorted(k for k in after if after[k] != before[k])
         who = actor(request)

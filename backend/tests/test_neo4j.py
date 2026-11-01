@@ -244,3 +244,32 @@ def test_neo4j_fixture_corpus_personas(neo):
     finally:
         for p in (boss, friend):
             store._driver.execute_query("MATCH (c:IntentContext {name: $p}) DETACH DELETE c", {"p": p})
+
+
+def test_neo4j_merge_persona_matches_in_memory(neo):
+    """Deleting a persona folds its learning into another one; Cypher and in-memory agree."""
+    store, tag, persona, created = neo
+    dst = persona + "_dst"
+    mem = InMemoryGraphStore()
+    for i, t in enumerate(_texts(tag)):
+        p = persona if i % 2 == 0 else dst
+        _write(store, created, t, p)
+        mem.write_extraction(extract(t), p)
+    assert store.merge_persona(persona, dst) == 2
+    assert mem.merge_persona(persona, dst) == 2
+    assert store._aggregate(dst, 20) == mem._aggregate(dst, 20)
+    assert store._aggregate(dst, 20).sample_count == 3
+    assert store.execute_read("MATCH (c:IntentContext {name: $p}) RETURN c", {"p": persona}) == []
+    rows = store.execute_read(
+        "MATCH (w:Word) WHERE $p IN w.personas RETURN count(w) AS n", {"p": persona}
+    )
+    assert rows == [{"n": 0}]
+    rows = store.execute_read(
+        "MATCH (a:Word {key: $a})-[r:FOLLOWED_BY]->(b:Word {key: $b}) RETURN r.weight AS w,"
+        " r.personas AS ps, r.persona_weights AS pw",
+        {"a": word_key(f"{tag}hey"), "b": word_key(f"{tag}ok")},
+    )
+    assert rows and rows[0]["ps"] == [dst] and rows[0]["pw"] == [rows[0]["w"]]
+    ctx = store.execute_read("MATCH (c:IntentContext {name: $p}) RETURN properties(c) AS c", {"p": dst})[0]["c"]
+    assert len(ctx["opener_keys"]) == len(ctx["opener_texts"]) == len(ctx["opener_counts"])
+    assert store.merge_persona(persona, dst) == 0  # idempotent

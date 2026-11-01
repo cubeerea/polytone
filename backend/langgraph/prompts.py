@@ -16,7 +16,11 @@ _SOCIAL_APPS = ("linkedin", "twitter", "x.com", "threads", "bluesky")
 _DOC_APPS = ("notion", "docs", "word", "pages", "notes", "obsidian", "confluence")
 
 
-def persona_guidance(persona: str) -> str:
+def persona_guidance(persona: str, guidance: str | None = None) -> str:
+    """``guidance`` is the tone line resolved by ``backend.personas.guidance`` (the user's own
+    wording or a custom persona's); without it, the built-in wording."""
+    if guidance:
+        return guidance
     return PERSONAS.get(persona) or f"Writing as the user's '{persona}' persona; match that relationship's tone."
 
 
@@ -97,6 +101,7 @@ def build_system_parts(
     persona: str,
     app_context: str | None = None,
     examples: list[str] | None = None,
+    guidance: str | None = None,
 ) -> tuple[str, str]:
     """System prompt as ``(stable, volatile)``.
 
@@ -175,7 +180,7 @@ def build_system_parts(
         lines += [f"{i}. {r}" for i, r in enumerate(rules, 1)]
     lines += [
         "",
-        f"PERSONA: {persona}. {persona_guidance(persona)}",
+        f"PERSONA: {persona}. {persona_guidance(persona, guidance)}",
         "",
         "CONTENT RULES:",
         ("- Convey exactly what the intent says. Never invent facts, names, dates, numbers, links or "

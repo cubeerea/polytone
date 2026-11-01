@@ -82,6 +82,12 @@ class GraphStore(Protocol):
         """Delete the whole style graph. Returns the nodes deleted."""
         ...
 
+    def merge_persona(self, src: str, dst: str) -> int:
+        """Fold everything learned under persona ``src`` into ``dst`` and remove ``src`` (a deleted
+        persona's samples move to Default). All-persona totals are unchanged. Returns the
+        number of samples ``src`` had (0 when it had no IntentContext)."""
+        ...
+
     def migrate_encryption(self) -> dict[str, int]:
         """Encrypt a legacy plaintext graph in place (idempotent). Returns counts."""
         ...
@@ -184,6 +190,47 @@ class _BaseStore:
         return {}
 
 
+_CTX_SCALARS = ("sample_count", "sentence_count", "lower_starts", "upper_starts", "len_sum", "contractions",
+                "expansions")
+_CTX_KEYED = (  # (keys, counts, texts | None) — texts are the Neo4j ciphertexts parallel to keys
+    ("opener_keys", "opener_counts", "opener_texts"),
+    ("opener_phrase_keys", "opener_phrase_counts", "opener_phrase_texts"),
+    ("transition_keys", "transition_counts", "transition_texts"),
+)
+
+
+def merged_context(dst: dict[str, Any] | None, src: dict[str, Any], *, texts: bool) -> dict[str, Any]:
+    """IntentContext properties of ``dst`` with ``src`` added in (same shape as a write). Keyed
+    lists merge by key; with ``texts`` the parallel ciphertext lists follow their keys."""
+    dst = dict(dst or {})
+    out: dict[str, Any] = {}
+    for f in _CTX_SCALARS:
+        out[f] = int(dst.get(f) or 0) + int(src.get(f) or 0)
+    a, b = list(dst.get("len_hist") or []), list(src.get("len_hist") or [])
+    out["len_hist"] = [int(a[i] if i < len(a) else 0) + int(b[i] if i < len(b) else 0)
+                       for i in range(max(len(a), len(b)))]
+    for kf, cf, tf in _CTX_KEYED:
+        keys, counts = list(dst.get(kf) or []), [int(n or 0) for n in dst.get(cf) or []]
+        counts += [0] * (len(keys) - len(counts))
+        ts = list(dst.get(tf) or []) if texts else []
+        for i, k in enumerate(src.get(kf) or []):
+            n = int((src.get(cf) or [])[i] or 0) if i < len(src.get(cf) or []) else 0
+            if k in keys:
+                counts[keys.index(k)] += n
+            else:
+                src_t = src.get(tf) or []
+                if texts and (i >= len(src_t) or not src_t[i]):
+                    continue  # malformed: a key without its ciphertext can't be shown; drop it
+                keys.append(k)
+                counts.append(n)
+                if texts:
+                    ts.append(src_t[i])
+        out[kf], out[cf] = keys, counts
+        if texts:
+            out[tf] = ts
+    return out
+
+
 def _copy(c: Constraints) -> Constraints:
     return {
         **c,
@@ -218,6 +265,7 @@ class InMemoryGraphStore(_BaseStore):
 
     def __init__(self) -> None:
         super().__init__()
+        self.fallback = False
         self._lock = threading.RLock()
         self.words: dict[str, int] = defaultdict(int)
         self.word_p: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
@@ -293,6 +341,25 @@ class InMemoryGraphStore(_BaseStore):
                 self.punct_ctx[(sym, persona)] += n
         self.invalidate()
         return {"words_merged": len(ex.words), "sentences": ex.sentence_count}
+
+    def merge_persona(self, src: str, dst: str) -> int:
+        if src == dst:
+            return 0
+        with self._lock:
+            ctx = self.contexts.pop(src, None)
+            if ctx is None:
+                return 0
+            merged = merged_context(self.contexts.get(dst), ctx, texts=False)
+            self.contexts[dst] = {"name": dst, **merged}
+            for per in (self.word_p, self.bigram_p):
+                for p in per.values():
+                    if src in p:
+                        p[dst] += p.pop(src)
+            for edges in (self.struct_ctx, self.punct_ctx):
+                for (x, c) in [key for key in edges if key[1] == src]:
+                    edges[(x, dst)] += edges.pop((x, c))
+        self.invalidate()
+        return int(ctx.get("sample_count") or 0)
 
     def _aggregate(self, persona: str | None, k: int) -> StyleAggregate:
         agg = StyleAggregate()
@@ -558,6 +625,26 @@ class Neo4jGraphStore(_BaseStore):
         ]
         return {"followed": followed, "part_of": part_of, "used_in": used_in}
 
+    def merge_persona(self, src: str, dst: str) -> int:
+        if src == dst:
+            return 0
+
+        def work(tx: Any) -> int:
+            rec = tx.run(Q.READ_CONTEXT_PAIR, src=src, dst=dst).single()
+            if rec is None or rec["s"] is None:
+                return 0
+            merged = merged_context(rec["d"], rec["s"], texts=True)
+            tx.run(Q.MOVE_PERSONA_WEIGHTS, src=src, dst=dst).consume()
+            tx.run(Q.MOVE_PERSONA_USED_IN, src=src, dst=dst).consume()
+            tx.run(Q.SET_PERSONA_CONTEXT, src=src, dst=dst, props=merged).consume()
+            return int(rec["s"].get("sample_count") or 0)
+
+        try:
+            with self._driver.session() as s:
+                return s.execute_write(work)
+        finally:
+            self.invalidate()
+
     def wipe(self) -> int:
         total = 0
         while True:
@@ -641,4 +728,6 @@ def connect_graph_store(settings: Any, timeout: float = 2.0) -> GraphStore:
         if store is not None:
             store.close()
         log.warning("Neo4j unavailable at %s (%s); using in-memory graph store", settings.neo4j_uri, e)
-        return InMemoryGraphStore()
+        mem = InMemoryGraphStore()
+        mem.fallback = True  # stands in for an unreachable Neo4j (persona deletes refuse to run)
+        return mem
