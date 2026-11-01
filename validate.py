@@ -44,8 +44,8 @@ class Check:
 
 
 CHECKS = [
-    Check("ruff", "python", ["uv", "run", "ruff", "check", "backend", "validate.py", "orchestrator.py"]),
-    Check("pytest", "python", ["uv", "run", "pytest", "-q"]),
+    Check("ruff", "python", ["uv", "run", "--extra", "gmail", "ruff", "check", "backend", "validate.py", "orchestrator.py"]),
+    Check("pytest", "python", ["uv", "run", "--extra", "gmail", "pytest", "-q"]),
     Check("pnpm build", "frontend", ["pnpm", "build"]),  # also produces dist/, which the Rust build needs
     Check("cargo test", "rust", ["cargo", "test", "--locked"], "src-tauri"),
     Check("cargo clippy", "rust", ["cargo", "clippy", "--all-targets", "--locked", "--", "-D", "warnings"], "src-tauri"),
