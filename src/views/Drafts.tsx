@@ -5,13 +5,34 @@ import { useDrafts, useScoresSummary } from "../queries";
 import { Bar, ErrorLine, Loading, OfflineNotice, prettyHotkey } from "../components/bits";
 import { Sparkline } from "../components/Sparkline";
 
-const COMPONENTS: { key: keyof ScoreComponents; label: string }[] = [
-  { key: "sentence_length", label: "Sentence length" },
-  { key: "punctuation", label: "Punctuation" },
-  { key: "lexical", label: "Vocabulary" },
-  { key: "function_words", label: "Function words" },
-  { key: "embedding", label: "Meaning" },
+const COMPONENTS: { key: keyof ScoreComponents; label: string; hint: string }[] = [
+  { key: "sentence_length", label: "Sentence length", hint: "How similar your sentence lengths are" },
+  { key: "punctuation", label: "Punctuation", hint: "Commas, dashes, exclamation marks and other punctuation habits" },
+  { key: "lexical", label: "Vocabulary", hint: "Word choice and variety" },
+  { key: "function_words", label: "Function words", hint: "Small words like 'the', 'just', 'actually' that form your rhythm" },
+  { key: "embedding", label: "Meaning", hint: "Whether the draft keeps the meaning of what you typed" },
 ];
+
+export interface TrendComparison {
+  /** Rounded difference in points: mean(last n) − mean(first n). */
+  delta: number;
+  /** How many drafts are averaged on each side. */
+  n: number;
+}
+
+/**
+ * Compare the average of the most recent drafts with the average of the first ones.
+ * Uses n = min(5, ⌊count/2⌋) drafts per side so the two windows never overlap.
+ * `scores` is oldest first. Returns null with fewer than 4 scores (too noisy).
+ */
+export function trendComparison(scores: number[]): TrendComparison | null {
+  const valid = scores.filter((s) => Number.isFinite(s));
+  if (valid.length < 4) return null;
+  const n = Math.min(5, Math.floor(valid.length / 2));
+  const mean = (xs: number[]) => xs.reduce((a, b) => a + b, 0) / xs.length;
+  const delta = Math.round(mean(valid.slice(-n)) - mean(valid.slice(0, n)));
+  return { delta: Object.is(delta, -0) ? 0 : delta, n };
+}
 
 /** Components arrive as 0..1 DISTANCES (0 = identical); show them as match = 1 - distance. */
 const match = (v: number | null | undefined): number | null =>
@@ -52,31 +73,47 @@ export function Drafts({ hotkey }: { hotkey: string }) {
 
 function Score({ summary }: { summary: ScoresSummary }) {
   const trend = summary.trend ?? [];
-  const delta = trend.length >= 2 ? trend[trend.length - 1].score - trend[0].score : null;
+  const cmp = trendComparison(trend.map((p) => p.score));
   return (
-    <section className="flex items-end gap-5">
-      <div className="flex-none">
-        <div className="tnum text-[44px] font-light leading-none tracking-[-0.03em]" title="0–100, where 100 reads exactly like your own writing">
-          {summary.mean == null ? "–" : Math.round(summary.mean)}
-        </div>
-        <p className="mt-1.5 text-[12px] text-text-2">
-          Style match
-          <span className="text-text-3">
-            {" "}
-            · {summary.count} {summary.count === 1 ? "draft" : "drafts"}
-          </span>
-        </p>
-      </div>
-      <div className="min-w-0 flex-1 pb-[3px]">
-        {delta != null && (
-          <p className="tnum mb-1 text-right text-[11.5px] text-text-3">
-            {delta >= 0 ? "+" : "−"}
-            {Math.abs(delta).toFixed(0)} since first
+    <section>
+      <div className="flex items-end gap-5">
+        <div className="flex-none">
+          <div className="tnum text-[44px] font-light leading-none tracking-[-0.03em]">
+            {summary.mean == null ? "–" : Math.round(summary.mean)}
+            <span className="ml-0.5 text-[15px] font-normal tracking-normal text-text-3">/100</span>
+          </div>
+          <p className="mt-1.5 text-[12px] text-text-2">
+            Average style match
+            <span className="text-text-3">
+              {" "}
+              · {summary.count} {summary.count === 1 ? "draft" : "drafts"}
+            </span>
           </p>
-        )}
-        <Sparkline points={trend} />
+        </div>
+        <div className="min-w-0 flex-1 pb-[3px]">
+          {cmp && <TrendLine cmp={cmp} />}
+          <Sparkline points={trend} />
+        </div>
       </div>
+      <p className="mt-1 text-[11.5px] text-text-3">
+        How closely your drafts sound like your own writing (100 = indistinguishable).
+      </p>
     </section>
+  );
+}
+
+function TrendLine({ cmp }: { cmp: TrendComparison }) {
+  const { delta, n } = cmp;
+  const color = delta > 0 ? "var(--color-ok)" : delta < 0 ? "var(--color-bad)" : undefined;
+  // n >= 2 always (trendComparison needs at least 4 scores).
+  const tip = `Average of your last ${n} drafts vs. your first ${n}`;
+  return (
+    <p className="tnum mb-1 text-right text-[11.5px]" title={tip}>
+      <span className={color ? undefined : "text-text-2"} style={color ? { color } : undefined}>
+        {delta === 0 ? "No change" : `${delta > 0 ? "▲" : "▼"} ${Math.abs(delta)} ${Math.abs(delta) === 1 ? "pt" : "pts"}`}
+      </span>
+      <span className="text-text-3"> recent vs. your first drafts</span>
+    </p>
   );
 }
 
@@ -106,31 +143,36 @@ function DraftRow({ draft }: { draft: Draft }) {
         className="flex w-full items-start gap-3 rounded-lg px-2 py-2.5 text-left"
       >
         <span
-          className={`tnum w-[26px] flex-none pt-px text-right text-[15px] font-medium ${s ? (low ? "text-text-3" : "text-text") : "text-text-3"}`}
+          className="flex w-[48px] flex-none flex-col items-end pt-px text-right"
           title={s?.confidence ? CONFIDENCE_HINT[s.confidence] : s ? undefined : "Not scored"}
         >
-          {s ? Math.round(s.score) : "–"}
+          <span className={`tnum text-[15px] font-medium leading-tight ${s && !low ? "text-text" : "text-text-3"}`}>
+            {s ? Math.round(s.score) : "–"}
+          </span>
+          <span className="whitespace-nowrap text-[10px] leading-tight text-text-3">{s ? "match" : "not scored"}</span>
         </span>
         <span className="min-w-0 flex-1">
           <span className={`selectable text-[13px] leading-[1.45] ${open ? "block" : "line-clamp-2"}`}>{draft.text}</span>
           <span className="mt-1 block text-[11.5px] text-text-3">
             {draft.persona} · {relativeTime(draft.created_at)}
+            {low && " · low confidence"}
           </span>
         </span>
       </button>
 
       {open && (
-        <div className="fade-in space-y-3 pb-3 pl-[46px] pr-2">
+        <div className="fade-in space-y-3 pb-3 pl-[68px] pr-2">
           <p className="selectable text-[12px] text-text-2">
             <span className="text-text-3">You typed </span>
             {draft.intent}
           </p>
           {s && (
             <div className="space-y-1.5">
+              <p className="text-[11.5px] text-text-3">How this draft matches your style (0–100 per signal)</p>
               {COMPONENTS.map((c) => {
                 const v = match(s.components[c.key]);
                 return (
-                  <div key={c.key} className="grid grid-cols-[96px_1fr_24px] items-center gap-2.5">
+                  <div key={c.key} className="grid grid-cols-[96px_1fr_24px] items-center gap-2.5" title={c.hint}>
                     <span className="text-[11.5px] text-text-2">{c.label}</span>
                     <Bar value={v} />
                     <span className="tnum text-right text-[11.5px] text-text-3">{v == null ? "–" : Math.round(v * 100)}</span>
@@ -139,7 +181,7 @@ function DraftRow({ draft }: { draft: Draft }) {
               })}
               <p className="pt-1 text-[11.5px] text-text-3">
                 {s.confidence ? `${CONFIDENCE_HINT[s.confidence] ?? s.confidence} ` : ""}
-                {draft.latency_ms} ms.
+                Drafted in {draft.latency_ms} ms.
               </p>
             </div>
           )}
