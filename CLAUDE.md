@@ -13,3 +13,10 @@
 7. `git switch main && git pull --ff-only`.
 
 Repo: https://github.com/cubeerea/polytone (private). Never commit `.env`, `credentials.json`, `token.json`, or anything under `data/`.
+
+## Unattended agent loop
+`orchestrator.py` runs headless Claude Code on one task from `progress.json` (git-ignored), checks the
+work with `validate.py` (the same checks as CI) and feeds failures back until it passes or hits
+`max_iterations`. Run it in its own worktree (`git worktree add ../polytone-agent main`) inside tmux.
+The agent commits on `agent/<task>` only; pushing, PRs and merging stay with the orchestrator/human.
+Agents must never edit `validate.py`, `orchestrator.py`, `progress.json` or `.github/`.
