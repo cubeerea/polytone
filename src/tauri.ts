@@ -92,6 +92,8 @@ export const native = {
   /** Revoke UI sessions and emit "locked". reason "expired" = the engine already dropped it. */
   lock: (reason: LockReason = "ui") => call<void>("lock", { reason }).catch(() => {}),
   getLockState: () => call<{ locked: boolean }>("get_lock_state"),
+  /** The persona list changed: rebuild the tray's Persona menu. Never throws (older app builds lack it). */
+  refreshTrayPersonas: () => call<string[]>("refresh_tray_personas").catch(() => null),
 };
 
 export interface NativeEvents {

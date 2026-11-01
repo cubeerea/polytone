@@ -10,6 +10,9 @@ Tables
 - ``ingest_runs`` one row per ingestion run of a source.
 - ``draft_edits`` text the user sent right after a Polytone inject (typing capture with
                   ``after_inject=True``). NEVER learned from; kept for future edit learning.
+- ``personas``    personas the user added, and their own wording of a built-in persona's tone
+                  (``backend/personas.py``). The tone description is the user's words, so it is
+                  encrypted like sample text; the name stays plain (it is plain in Neo4j too).
 
 Encryption at rest (CONTRACTS.md → Security): every column holding the user's words —
 ``drafts.intent/text/constraints_json``, ``samples.text/provenance_json``, ``draft_edits.text`` —
@@ -135,6 +138,12 @@ CREATE TABLE IF NOT EXISTS draft_edits (
     nearest_draft_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_draft_edits_created ON draft_edits(created_at);
+CREATE TABLE IF NOT EXISTS personas (
+    name TEXT PRIMARY KEY COLLATE NOCASE,
+    description TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 
@@ -560,6 +569,44 @@ class Database:
     def sample_personas(self) -> list[str]:
         with self.connect() as c:
             return [r[0] for r in c.execute("SELECT DISTINCT persona FROM samples ORDER BY persona")]
+
+    def count_samples_by_persona(self) -> dict[str, int]:
+        with self.connect() as c:
+            return {r[0]: int(r[1]) for r in c.execute("SELECT persona, COUNT(*) FROM samples GROUP BY persona")}
+
+    def move_samples(self, src: str, dst: str) -> int:
+        """Re-attribute every sample of persona ``src`` to ``dst``. Returns the rows moved."""
+        with self.connect() as c:
+            return c.execute("UPDATE samples SET persona = ? WHERE persona = ?", (dst, src)).rowcount
+
+    # ------------------------------------------------------------------ personas
+    def list_persona_rows(self) -> list[dict[str, str]]:
+        """Stored persona rows (custom personas and built-in tone overrides), oldest first. A
+        description that no longer decrypts (data key replaced) reads as empty."""
+        with self.connect() as c:
+            rows = c.execute("SELECT name, description, created_at FROM personas ORDER BY created_at, name").fetchall()
+        out = []
+        for r in rows:
+            try:
+                desc = _dec(r["description"], "personas.description") or ""
+            except crypto.DecryptError:
+                log.warning("persona description does not decrypt; treating it as empty")
+                desc = ""
+            out.append({"name": r["name"], "description": desc, "created_at": r["created_at"]})
+        return out
+
+    def upsert_persona_row(self, name: str, description: str) -> None:
+        now = utcnow_iso()
+        with self.connect() as c:
+            c.execute(
+                "INSERT INTO personas(name, description, created_at, updated_at) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(name) DO UPDATE SET description = excluded.description, updated_at = excluded.updated_at",
+                (name, crypto.encrypt(description, "personas.description"), now, now),
+            )
+
+    def delete_persona_row(self, name: str) -> bool:
+        with self.connect() as c:
+            return c.execute("DELETE FROM personas WHERE name = ?", (name,)).rowcount > 0
 
     # ------------------------------------------------------------------ ingest runs
     def record_ingest_run(

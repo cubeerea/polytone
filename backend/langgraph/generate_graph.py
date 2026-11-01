@@ -23,6 +23,7 @@ from typing import Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
+from backend import personas
 from backend.graph.constraints import empty_constraints
 from backend.langgraph.examples import select_examples
 from backend.langgraph.prompts import build_system_parts, build_user_prompt
@@ -67,6 +68,7 @@ class GenState(TypedDict, total=False):
     raw_intent: str
     intent: str
     persona: str
+    guidance: str | None  # the persona's tone line (backend.personas.guidance)
     model: str | None  # per-draft model override (draft_speed "fast"); None = the configured model
     app_context: str | None
     t0: float
@@ -130,8 +132,9 @@ def build_generate_graph(rt: Runtime):
             raise ValueError("intent is empty")
         cfg = rt.db.get_config()
         persona = (state.get("persona") or "").strip() or cfg.get("active_persona") or "Default"
+        persona = personas.canonical(rt.db, persona) or "Default"
         model = FAST_MODEL if cfg.get("draft_speed") == "fast" else None
-        return {"intent": intent, "persona": persona, "model": model}
+        return {"intent": intent, "persona": persona, "model": model, "guidance": personas.guidance(rt.db, persona)}
 
     def retrieve_constraints(state: GenState) -> GenState:
         try:
@@ -149,7 +152,8 @@ def build_generate_graph(rt: Runtime):
 
     def build_prompt(state: GenState) -> GenState:
         parts = build_system_parts(
-            state["constraints"], state["persona"], state.get("app_context"), state.get("examples") or []
+            state["constraints"], state["persona"], state.get("app_context"), state.get("examples") or [],
+            guidance=state.get("guidance"),
         )
         return {
             "system": "\n\n".join(p for p in parts if p),

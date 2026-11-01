@@ -5,6 +5,7 @@ import { useConfig, usePermissions } from "../queries";
 import { Disclosure, ErrorLine } from "../components/bits";
 import { PermissionsCard } from "./settings/PermissionsCard";
 import { ShortcutGroup } from "./settings/ShortcutGroup";
+import { PersonasGroup } from "./settings/PersonasGroup";
 import { CaptureGroup } from "./settings/CaptureGroup";
 import { AdvancedGroup } from "./settings/AdvancedGroup";
 import { PrivacyGroup } from "./settings/PrivacyGroup";
@@ -35,6 +36,8 @@ export function Settings({ online, health, lastRunFromEvent, generating }: Props
 
       <ShortcutGroup tauri={tauri} online={online} config={config.data} />
       {configError != null && <ErrorLine error={configError} />}
+
+      <PersonasGroup online={online} />
 
       <CaptureGroup tauri={tauri} online={online} config={config.data} />
 

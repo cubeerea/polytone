@@ -38,6 +38,18 @@ export interface IngestSource {
 export interface Persona {
   name: string;
   description: string;
+  /** Default, Boss, Friend, Investor: can be reworded and reset, never deleted. Optional: older engines omit the next three. */
+  builtin?: boolean;
+  /** The description is the user's own wording. */
+  edited?: boolean;
+  /** Writing samples learned under this persona. */
+  samples?: number;
+}
+
+export interface PersonaDeleted {
+  name: string;
+  moved_samples: number;
+  active_persona: string;
 }
 
 export type InjectMode = "paste" | "type";
@@ -276,6 +288,17 @@ export const api = {
 
   personas: () => request<Persona[]>("/personas"),
 
+  createPersona: (name: string, description: string) =>
+    request<Persona>("/personas", { method: "POST", body: { name, description } }),
+
+  /** `description: null` resets a built-in to Polytone's wording. */
+  updatePersona: (name: string, description: string | null) =>
+    request<Persona>(`/personas/${encodeURIComponent(name)}`, { method: "PUT", body: { description } }),
+
+  /** Its samples (and what the style graph learned from them) move to Default. */
+  deletePersona: (name: string) =>
+    request<PersonaDeleted>(`/personas/${encodeURIComponent(name)}`, { method: "DELETE", timeoutMs: 30_000 }),
+
   getConfig: () => request<AppConfig>("/config"),
 
   /** PUT is a partial update: omitted fields stay unchanged on the backend. */
@@ -300,10 +323,10 @@ export const api = {
 };
 
 export const DEFAULT_PERSONAS: Persona[] = [
-  { name: "Boss", description: "" },
-  { name: "Friend", description: "" },
-  { name: "Investor", description: "" },
-  { name: "Default", description: "" },
+  { name: "Default", description: "", builtin: true },
+  { name: "Boss", description: "", builtin: true },
+  { name: "Friend", description: "", builtin: true },
+  { name: "Investor", description: "", builtin: true },
 ];
 
 export const FALLBACK_CONFIG: AppConfig = { active_persona: "Default", hotkey: "CmdOrCtrl+Shift+P", inject_mode: "paste" };

@@ -54,7 +54,10 @@ with `403 {"detail":"app token required"}`. See Security → Local API auth.
 | POST | `/ingest/typed` | `{"text":str,"app":str /*bundle id*/,"app_name":str\|null,"after_inject":bool}` | `IngestResult` (see "Typing capture") |
 | GET | `/ingest/sources` | – | `[{"name":"manual"\|"gmail"\|"wispr"\|"watcher"\|"typed","enabled":bool,"status":str,"last_run":iso\|null,"items_ingested":int}]` (`typed`: `enabled` = `capture_enabled`, `status` `"listening"`\|`"disabled"`; `wispr` while live: `"live (watching flow.sqlite; last dictation picked up <iso> (<app>); <n> ingested live)"`, else `"ready (local history: flow.sqlite)"` / `"needs credentials: …"`) |
 | POST | `/ingest/sources/{name}/run` | – | `IngestResult`; `typed` → `400 {"detail":"typed is push-only"}`; unknown → 404 |
-| GET | `/personas` | – | `[{"name":str,"description":str}]` (defaults: Boss, Friend, Investor, Default) |
+| GET | `/personas` | – | `[{"name","description","builtin":bool,"edited":bool,"samples":int}]`: built-ins (Default, Boss, Friend, Investor) first, then the user's in creation order, then names that only appear on samples |
+| POST | `/personas` | `{"name":str,"description":str}` | the new persona. 400 bad name (1–30 chars: letters, digits, spaces, `- ' & . ( ) +`) or tone (1–300 chars); 409 duplicate (case-insensitive) or more than 24 of the user's own |
+| PUT | `/personas/{name}` | `{"description":str\|null}` | the persona. `null` resets a built-in to Polytone's wording; 404 unknown |
+| DELETE | `/personas/{name}` | – | `{"name","moved_samples":int,"active_persona":str}`. Its samples **and its style-graph learning move to Default** (all-persona totals unchanged); Default becomes active if it was. 400 built-in; 404 unknown; 503 graph unreachable (nothing changed) |
 | POST | `/warm` | – | `{"ok":true,"started":bool}` — Rust calls it when the hotkey goes down so the engine re-opens its model-API connection (free `GET /v1/models/{id}`, own thread) while the selection is captured. `started` false = connection already fresh (< 20 s since the API last answered), one in flight, or the mock LLM. Never fails because of the network. |
 | GET/PUT | `/config` | `{"active_persona":str,"hotkey":str,"inject_mode":"paste"\|"type","draft_speed":"quality"\|"fast" /*default quality*/,"capture_enabled":bool,"capture_apps":[str],"lock_idle_minutes":int /*1–240, default 15*/,"retention_days":int /*0–3650, 0 = keep forever (default)*/}` (PUT: every field optional, omitted = unchanged; out of range → 422; setting a non-zero `retention_days` purges at once) | same (full config) |
 | GET | `/drafts?limit=50` | – | `[{"draft_id","created_at","persona","intent","text","latency_ms","score":ScoreBreakdown\|null}]` |
@@ -68,6 +71,8 @@ with `403 {"detail":"app token required"}`. See Security → Local API auth.
 | GET | `/audit/verify` | – | `{"ok":bool,"count":int,"first_bad_seq":int\|null,"reason":str\|null}` |
 | POST | `/audit/event` *app* | `{"event":str /*e.g. "session.unlock_failed"; [a-z0-9_.]*/,"detail":{}}` | `{"seq":int}` (actor `app`) |
 | POST | `/data/wipe` | `{"confirm":"delete everything"}` (anything else → 400) | `{"deleted":{"samples":int,"drafts":int,"draft_edits":int,"graph_nodes":int}}` |
+
+Persona names are matched case-insensitively everywhere (`/ingest/*`, `/generate`, `PUT /config`) and stored in the persona's own spelling; `PUT /config` rejects an `active_persona` that isn't a persona (422). Ingest and persona create/delete are serialised, so a sample never lands half-moved.
 
 `Constraints` = `{"avg_sentence_len":float,"sentence_len_p90":float,"top_openers":[str],"top_transitions":[str],"top_bigrams":[[str,str,float]],"punctuation_rates":{str:float},"structures":[{"signature":str,"weight":float}],"lexicon":[str],"casing":"lower"|"sentence"|"mixed","contractions_rate":float,"sample_count":int}`
 
@@ -230,6 +235,10 @@ Implementation notes (backend core, additive — see `graph/queries.py`):
 - `IntentContext.name` is the persona. It also carries the persona's aggregate style counters
   (`sample_count, sentence_count, lower_starts, upper_starts, len_sum, len_hist, contractions,
   expansions, opener_keys/opener_counts, transition_keys/transition_counts`).
+- Personas: the tone description (`personas.description` in SQLite, encrypted) is the `PERSONA:` line of the system
+  prompt; the name is what samples and graph weights are attributed to. Deleting a persona re-attributes
+  (`GraphStore.merge_persona`): its `personas`/`persona_*` slots on `Word` and `FOLLOWED_BY` fold into Default's,
+  its `USED_IN` edges move to Default's `IntentContext`, and the two contexts' aggregates are summed.
 - Neo4j properties cannot be maps, so `persona_weights` is a list parallel to `personas`
   (`r.personas[i]` ↔ `r.persona_weights[i]`); `Word` likewise has `weight, personas, persona_counts`.
 - `get_constraints(persona)` blends the persona with all-persona data (see Constraints semantics above). Results are
