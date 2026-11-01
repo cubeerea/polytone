@@ -16,10 +16,13 @@ permissions:
 jobs:
   changes:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read # paths-filter lists the PR's changed files
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dorny/paths-filter@v3
         id: filter
         with:
@@ -36,12 +39,12 @@ jobs:
       # Offline: mock LLM, no embeddings, no Neo4j (those tests skip). Never a real key.
       ANTHROPIC_API_KEY: ""
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.12"
           enable-cache: true
-      - run: uv sync --frozen
+      - run: uv sync --frozen --extra gmail # gmail tests need httplib2
       - run: uv run ruff check backend
       - run: uv run pytest -q
 
@@ -50,11 +53,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: pnpm/action-setup@v4
         with:
           version: 9.15.4
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: pnpm
@@ -69,11 +72,11 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: pnpm/action-setup@v4
         with:
           version: 9.15.4
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: pnpm
@@ -94,10 +97,11 @@ jobs:
   ci:
     name: CI passed
     if: always()
-    needs: [backend, frontend, rust]
+    needs: [changes, backend, frontend, rust]
     runs-on: ubuntu-latest
     steps:
       - run: |
-          for r in "${{ needs.backend.result }}" "${{ needs.frontend.result }}" "${{ needs.rust.result }}"; do
+          for r in "${{ needs.changes.result }}" "${{ needs.backend.result }}" "${{ needs.frontend.result }}" "${{ needs.rust.result }}"; do
+            # "skipped" only happens to rust (no Rust changes); a failed "changes" job fails here first
             case "$r" in success|skipped) ;; *) echo "a job finished with: $r"; exit 1 ;; esac
           done
