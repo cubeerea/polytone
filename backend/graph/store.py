@@ -17,6 +17,10 @@ ciphertexts, never the user's words; ``Neo4jGraphStore`` decrypts on read throug
 ``key -> word`` map (filled by writes and by the first read of each key), so a warm read decrypts
 nothing. ``InMemoryGraphStore`` keeps plaintext (RAM only, nothing at rest) and breaks ranking
 ties on the same blind index, so both stores return identical aggregates.
+
+Scalability (see ``graph/trim.py``): every write is trimmed to bounded counts first, and after it
+each touched word keeps at most ``GRAPH_FANOUT`` FOLLOWED_BY edges per direction, so common words
+("the", "and") never grow into unbounded supernodes. Both stores apply the same rules.
 """
 from __future__ import annotations
 
@@ -30,9 +34,9 @@ from backend.graph.constraints import (
     Constraints,
     StyleAggregate,
     compute_constraints,
-    context_delta,
     empty_constraints,
 )
+from backend.graph.trim import GRAPH_FANOUT, chunks, prepare
 from backend.ingestion.types import Extraction
 from backend.security import crypto
 
@@ -271,6 +275,8 @@ class InMemoryGraphStore(_BaseStore):
         self.word_p: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
         self.bigrams: dict[tuple[str, str], int] = defaultdict(int)
         self.bigram_p: dict[tuple[str, str], dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        self.succ: dict[str, set[str]] = defaultdict(set)  # FOLLOWED_BY adjacency (fan-out guard)
+        self.pred: dict[str, set[str]] = defaultdict(set)
         self.structures: dict[str, int] = defaultdict(int)
         self.struct_ctx: dict[tuple[str, str], int] = defaultdict(int)
         self.word_struct: dict[tuple[str, str], int] = defaultdict(int)
@@ -287,15 +293,16 @@ class InMemoryGraphStore(_BaseStore):
     def wipe(self) -> int:
         with self._lock:
             n = len(self.words) + len(self.structures) + len(self.punct) + len(self.contexts)
-            for d in (self.words, self.word_p, self.bigrams, self.bigram_p, self.structures, self.struct_ctx,
-                      self.word_struct, self.punct, self.punct_ctx, self.contexts):
+            for d in (self.words, self.word_p, self.bigrams, self.bigram_p, self.succ, self.pred,
+                      self.structures, self.struct_ctx, self.word_struct, self.punct, self.punct_ctx,
+                      self.contexts):
                 d.clear()
         self.invalidate()
         return n
 
     def write_extraction(self, extraction: Extraction | dict[str, Any], persona: str) -> dict[str, int]:
-        ex = Extraction.from_any(extraction)
-        d = context_delta(ex)
+        full = Extraction.from_any(extraction)
+        ex, d = prepare(full)
         with self._lock:
             ctx = self.contexts.setdefault(
                 persona,
@@ -330,6 +337,9 @@ class InMemoryGraphStore(_BaseStore):
                 if bg[0] in self.words and bg[1] in self.words:  # mirrors MATCH semantics
                     self.bigrams[bg] += n
                     self.bigram_p[bg][persona] += n
+                    self.succ[bg[0]].add(bg[1])
+                    self.pred[bg[1]].add(bg[0])
+            self._prune_fanout({a for a, _ in ex.bigrams}, {b for _, b in ex.bigrams})
             for sig, n in ex.structures.items():
                 self.structures[sig] += n
                 self.struct_ctx[(sig, persona)] += n
@@ -340,7 +350,21 @@ class InMemoryGraphStore(_BaseStore):
                 self.punct[sym] += n
                 self.punct_ctx[(sym, persona)] += n
         self.invalidate()
-        return {"words_merged": len(ex.words), "sentences": ex.sentence_count}
+        return {"words_merged": len(ex.words), "sentences": full.sentence_count}
+
+    def _prune_fanout(self, firsts: set[str], seconds: set[str], cap: int = GRAPH_FANOUT) -> None:
+        """Mirror of PRUNE_FOLLOWERS then PRUNE_PREDECESSORS (caller holds the lock)."""
+        for adj, words, other in ((self.succ, firsts, 1), (self.pred, seconds, 0)):
+            for w in sorted(words):
+                if len(adj.get(w, ())) <= cap:
+                    continue
+                edges = [(w, x) if other == 1 else (x, w) for x in adj[w]]
+                edges.sort(key=lambda bg: (-self.bigrams[bg], word_key(bg[other])))
+                for bg in edges[cap:]:
+                    self.bigrams.pop(bg, None)
+                    self.bigram_p.pop(bg, None)
+                    self.succ[bg[0]].discard(bg[1])
+                    self.pred[bg[1]].discard(bg[0])
 
     def merge_persona(self, src: str, dst: str) -> int:
         if src == dst:
@@ -527,24 +551,32 @@ class Neo4jGraphStore(_BaseStore):
             self._driver.execute_query(stmt)
 
     def write_extraction(self, extraction: Extraction | dict[str, Any], persona: str) -> dict[str, int]:
-        ex = Extraction.from_any(extraction)
-        d = self._keyed_delta(context_delta(ex))
+        full = Extraction.from_any(extraction)
+        ex, delta = prepare(full)
+        d = self._keyed_delta(delta)
         words = self._word_rows(ex.words)
         bigrams = [{"a": word_key(a), "b": word_key(b), "n": n} for (a, b), n in ex.bigrams.items()]
         structs = [{"sig": s, "n": n} for s, n in ex.structures.items()]
         wstructs = [{"w": word_key(w), "sig": s, "n": n} for (w, s), n in ex.word_structures.items()]
         puncts = [{"sym": s, "n": n} for s, n in ex.punctuation.items()]
+        # sorted like the in-memory mirror (first words, then second words, key order)
+        firsts = sorted({word_key(a) for a, _ in ex.bigrams})
+        seconds = sorted({word_key(b) for _, b in ex.bigrams})
 
         def work(tx: Any) -> None:
             tx.run(Q.MERGE_CONTEXT, persona=persona, d=d).consume()
-            if words:
-                tx.run(Q.MERGE_WORDS, rows=words, persona=persona).consume()
+            for rows in chunks(words):
+                tx.run(Q.MERGE_WORDS, rows=rows, persona=persona).consume()
+            for rows in chunks(bigrams):
+                tx.run(Q.MERGE_BIGRAMS, rows=rows, persona=persona).consume()
             if bigrams:
-                tx.run(Q.MERGE_BIGRAMS, rows=bigrams, persona=persona).consume()
-            if structs:
-                tx.run(Q.MERGE_STRUCTURES, rows=structs, persona=persona).consume()
-            if wstructs:
-                tx.run(Q.MERGE_WORD_STRUCTURES, rows=wstructs).consume()
+                for query, keys in ((Q.PRUNE_FOLLOWERS, firsts), (Q.PRUNE_PREDECESSORS, seconds)):
+                    for ks in chunks(keys):
+                        tx.run(query, keys=ks, cap=GRAPH_FANOUT).consume()
+            for rows in chunks(structs):
+                tx.run(Q.MERGE_STRUCTURES, rows=rows, persona=persona).consume()
+            for rows in chunks(wstructs):
+                tx.run(Q.MERGE_WORD_STRUCTURES, rows=rows).consume()
             if puncts:
                 tx.run(Q.MERGE_PUNCTUATION, rows=puncts, persona=persona).consume()
 
@@ -553,7 +585,7 @@ class Neo4jGraphStore(_BaseStore):
                 s.execute_write(work)
         finally:
             self.invalidate()
-        return {"words_merged": len(ex.words), "sentences": ex.sentence_count}
+        return {"words_merged": len(ex.words), "sentences": full.sentence_count}
 
     def _aggregate(self, persona: str | None, k: int) -> StyleAggregate:
         """All reads for one aggregate in ONE read transaction (one session, one BEGIN/COMMIT,

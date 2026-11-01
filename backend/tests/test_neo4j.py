@@ -273,3 +273,62 @@ def test_neo4j_merge_persona_matches_in_memory(neo):
     ctx = store.execute_read("MATCH (c:IntentContext {name: $p}) RETURN properties(c) AS c", {"p": dst})[0]["c"]
     assert len(ctx["opener_keys"]) == len(ctx["opener_texts"]) == len(ctx["opener_counts"])
     assert store.merge_persona(persona, dst) == 0  # idempotent
+
+
+def test_neo4j_large_redundant_text_stays_bounded(neo):
+    """A large, repetitive sample (tens of thousands of words, common words repeated thousands
+    of times) writes bounded counts — not a node or edge per occurrence — and matches the
+    in-memory store exactly."""
+    from backend.graph import queries as Q
+    from backend.graph import trim
+    from backend.tests.test_scalability import big_text
+
+    store, tag, persona, created = neo
+    text = big_text(n_sentences=3000, n_rare=5000, prefix=tag).replace("the ", f"{tag}the ")
+    hub = f"{tag}the"
+    ex = extract(text)
+    assert len(ex.words) > trim.MAX_WORDS and ex.words[hub] > 9000
+    before = store.execute_read(Q.GRAPH_SIZE)[0]
+    t0 = time.perf_counter()
+    for _ in range(3):  # the same text again: counts grow, the graph does not
+        _write(store, created, text, persona)
+    elapsed = time.perf_counter() - t0
+    after = store.execute_read(Q.GRAPH_SIZE)[0]
+    assert elapsed < 60, f"three large writes took {elapsed:.1f}s"
+    assert after["words"] - before["words"] <= trim.MAX_WORDS
+    assert after["followed_by"] - before["followed_by"] <= trim.MAX_BIGRAMS
+    assert after["part_of"] - before["part_of"] <= trim.MAX_WORD_STRUCTURES
+    (deg,) = store.execute_read(Q.WORD_DEGREES, {"keys": [word_key(hub)]})
+    assert deg["weight"] == 3 * ex.words[hub]
+    assert deg["out"] <= trim.SAMPLE_FANOUT and deg["inn"] <= trim.SAMPLE_FANOUT
+    mem = InMemoryGraphStore()
+    for _ in range(3):
+        mem.write_extraction(ex, persona)
+    assert store._aggregate(persona, 20) == mem._aggregate(persona, 20)
+
+
+def test_neo4j_common_word_fanout_is_capped(neo):
+    """Over many samples a common word keeps only its GRAPH_FANOUT strongest FOLLOWED_BY edges
+    per direction — the same ones the in-memory store keeps."""
+    from backend.graph import queries as Q
+    from backend.graph import trim
+    from backend.tests.test_scalability import rare_words
+
+    store, tag, persona, created = neo
+    hub, cat = f"{tag}the", f"{tag}cat"
+    rare = rare_words(trim.GRAPH_FANOUT * 3, prefix=tag)
+    mem = InMemoryGraphStore()
+    for i in range(0, len(rare), 50):
+        body = " ".join(f"{hub} {w} and {w} {hub}." for w in rare[i : i + 50])
+        text = body + f" {hub} {cat} and {hub} {cat}."
+        _write(store, created, text, persona)
+        mem.write_extraction(extract(text), persona)
+    (deg,) = store.execute_read(Q.WORD_DEGREES, {"keys": [word_key(hub)]})
+    assert deg["out"] == trim.GRAPH_FANOUT and deg["inn"] == trim.GRAPH_FANOUT
+    kept = store.execute_read(
+        "MATCH (a:Word {key: $a})-[r:FOLLOWED_BY]->(b:Word) RETURN b.key AS b, r.weight AS n",
+        {"a": word_key(hub)},
+    )
+    assert {r["b"]: r["n"] for r in kept} == {word_key(b): n for (a, b), n in mem.bigrams.items() if a == hub}
+    assert {r["b"]: r["n"] for r in kept}[word_key(cat)] > 1  # the frequent edge survived
+    assert store._aggregate(persona, 20) == mem._aggregate(persona, 20)

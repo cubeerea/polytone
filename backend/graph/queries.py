@@ -106,6 +106,34 @@ SET r.persona_weights = [i IN range(0, size(r.personas) - 1) |
     coalesce(r.persona_weights[i], 0) + CASE WHEN r.personas[i] = $persona THEN row.n ELSE 0 END]
 """
 
+# Supernode guard (graph/trim.py): after a write, each touched word keeps at most $cap outgoing
+# ($keys = first words) / incoming ($keys = second words) FOLLOWED_BY edges, highest weight
+# first, ties on the other word's key. The COUNT {} check reads the degree store, so words
+# under the cap cost one lookup.
+PRUNE_FOLLOWERS = """
+UNWIND $keys AS k
+MATCH (a:Word {key: k})
+WHERE COUNT { (a)-[:FOLLOWED_BY]->() } > $cap
+MATCH (a)-[r:FOLLOWED_BY]->(b:Word)
+WITH a, r ORDER BY r.weight DESC, b.key ASC
+WITH a, collect(r) AS rs
+UNWIND rs[$cap..] AS x
+DELETE x
+RETURN count(*) AS n
+"""
+
+PRUNE_PREDECESSORS = """
+UNWIND $keys AS k
+MATCH (b:Word {key: k})
+WHERE COUNT { ()-[:FOLLOWED_BY]->(b) } > $cap
+MATCH (a:Word)-[r:FOLLOWED_BY]->(b)
+WITH b, r ORDER BY r.weight DESC, a.key ASC
+WITH b, collect(r) AS rs
+UNWIND rs[$cap..] AS x
+DELETE x
+RETURN count(*) AS n
+"""
+
 MERGE_STRUCTURES = """
 MATCH (c:IntentContext {name: $persona})
 UNWIND $rows AS row
@@ -257,6 +285,20 @@ WHERE c.name IN $ctxs AND ((x:SentenceStructure AND x.signature IN $sigs)
                            OR (x:PunctuationMark AND x.symbol IN $syms))
 RETURN CASE WHEN x:SentenceStructure THEN 's' ELSE 'p' END AS kind,
        coalesce(x.signature, x.symbol) AS key, c.name AS ctx, r.weight AS n
+"""
+
+# Size of the graph (scalability tests / diagnostics). $keys = word keys to report degrees for.
+GRAPH_SIZE = """
+RETURN COUNT { (:Word) } AS words,
+       COUNT { ()-[:FOLLOWED_BY]->() } AS followed_by,
+       COUNT { ()-[:PART_OF_STRUCTURE]->() } AS part_of
+"""
+
+WORD_DEGREES = """
+UNWIND $keys AS k
+MATCH (w:Word {key: k})
+RETURN k AS key, w.weight AS weight,
+       COUNT { (w)-[:FOLLOWED_BY]->() } AS out, COUNT { ()-[:FOLLOWED_BY]->(w) } AS inn
 """
 
 STATS = """

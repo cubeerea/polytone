@@ -81,6 +81,7 @@ _TERM_RE = re.compile(r"[.!?…]+")
 _TITLE_ABBREV = frozenset(
     ["mr", "mrs", "ms", "dr", "prof", "sr", "jr", "st", "mt", "vs", "fig", "cf", "approx", "dept", "est", "sen", "rep", "gov", "gen", "col", "lt", "capt", "sgt", "no"]
 )
+_ASCII_LETTERS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
 _END_ABBREV = frozenset(["etc", "inc", "ltd", "co", "corp", "al"])  # may also end a sentence
 
 
@@ -140,10 +141,17 @@ def mask_protected(text: str) -> str:
 
 def _is_abbrev(masked: str, dot_at: int, next_char: str) -> bool:
     """True if the single '.' at ``dot_at`` ends an abbreviation, not a sentence."""
-    m = re.search(r"([A-Za-z][A-Za-z.]*)$", masked[:dot_at])
-    if not m:
+    # the word right before the dot: the maximal [A-Za-z.] run ending there, from its first
+    # letter (what re.search(r"[A-Za-z][A-Za-z.]*$", masked[:dot_at]) finds, but without
+    # rescanning the whole prefix for every dot — that made long texts quadratic)
+    i = dot_at
+    while i > 0 and (masked[i - 1] in _ASCII_LETTERS or masked[i - 1] == "."):
+        i -= 1
+    while i < dot_at and masked[i] == ".":
+        i += 1
+    if i == dot_at:
         return False
-    word = m.group(1)
+    word = masked[i:dot_at]
     low = word.lower().rstrip(".")
     if "." in word:  # dotted abbreviation: e.g. / i.e. / U.S. / a.m.
         if low in ("e.g", "i.e", "cf"):
