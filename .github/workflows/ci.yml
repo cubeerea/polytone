@@ -56,7 +56,7 @@ jobs:
           python-version: "3.12"
           enable-cache: true
       - run: uv sync --frozen --extra gmail # gmail tests need httplib2
-      - run: uv run ruff check backend
+      - run: uv run ruff check backend validate.py orchestrator.py
       - run: uv run pytest -q
 
   frontend:
