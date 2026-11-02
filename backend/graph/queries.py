@@ -4,8 +4,8 @@ Schema (CONTRACTS.md):
   (:Word {key, text, weight, personas, persona_counts})
   (:SentenceStructure {signature, weight})
   (:PunctuationMark {symbol, weight})
-  (:IntentContext {name, sample_count, sentence_count, lower_starts, upper_starts, len_sum,
-                   len_hist, contractions, expansions,
+  (:IntentContext {name, sample_count, sample_weight, sentence_count, lower_starts, upper_starts,
+                   len_sum, len_hist, contractions, expansions,
                    opener_keys, opener_texts, opener_counts,
                    opener_phrase_keys, opener_phrase_texts, opener_phrase_counts,
                    transition_keys, transition_texts, transition_counts})
@@ -13,7 +13,10 @@ Schema (CONTRACTS.md):
   (:Word)-[:PART_OF_STRUCTURE {weight}]->(:SentenceStructure)
   (:SentenceStructure)-[:USED_IN {weight}]->(:IntentContext)
   (:PunctuationMark)-[:USED_IN {weight}]->(:IntentContext)
-  (:PolytoneMeta {name: "schema", enc_version})   -- encryption migration marker
+  (:PolytoneMeta {name: "schema", enc_version,    -- encryption migration marker
+                  decay_t0, decay_half_life_s,     -- recency-decay epoch (graph/decay.py)
+                  rebase_epoch, rebase_target_t0, rebase_factor, rebase_half_life_s})
+  every node / relationship above may carry ``decay_epoch`` (the last rebase applied to it)
 
 Encryption at rest: the user's words never reach Neo4j in plaintext. ``Word.key`` is the blind
 index (``idx1:``, unique, what MERGE / MATCH use) and ``Word.text`` the ``enc1:`` ciphertext
@@ -25,6 +28,12 @@ Read ordering ties break on ``key`` (both stores do the same, so results match).
 IntentContext.name is the persona. Per-persona weights on Word / FOLLOWED_BY are stored as
 two parallel lists (``personas[i]`` ↔ ``persona_counts[i]`` / ``persona_weights[i]``) because
 Neo4j properties cannot hold maps and we avoid APOC.
+
+Recency decay (``graph/decay.py``): weights and IntentContext counters are stored in "growing
+units" — the store multiplies every increment by ``s(now)`` in Python and passes the result as
+``row.n`` / ``$d.*``, so the Cypher below only ever adds parameters (no time arithmetic in Cypher,
+identical floats in both stores). ``sample_count`` is the raw integer count; ``sample_weight`` its
+decayed twin (missing on contexts written before decay: then it equals ``sample_count``).
 """
 
 SCHEMA = [
@@ -39,12 +48,13 @@ SCHEMA = [
 # $d.openers / $d.opener_phrases / $d.transitions are lists of {k: blind index, e: ciphertext, n}.
 MERGE_CONTEXT = """
 MERGE (c:IntentContext {name: $persona})
-ON CREATE SET c.sample_count = 0, c.sentence_count = 0, c.lower_starts = 0, c.upper_starts = 0,
+ON CREATE SET c.sample_count = 0, c.sample_weight = 0, c.sentence_count = 0, c.lower_starts = 0, c.upper_starts = 0,
               c.len_sum = 0, c.len_hist = [], c.contractions = 0, c.expansions = 0,
               c.opener_keys = [], c.opener_texts = [], c.opener_counts = [],
               c.transition_keys = [], c.transition_texts = [], c.transition_counts = [],
               c.opener_phrase_keys = [], c.opener_phrase_texts = [], c.opener_phrase_counts = []
-SET c.sample_count = c.sample_count + 1,
+SET c.sample_weight = coalesce(c.sample_weight, c.sample_count) + $d.sample_weight,
+    c.sample_count = c.sample_count + 1,
     c.sentence_count = c.sentence_count + $d.sentence_count,
     c.lower_starts = c.lower_starts + $d.lower_starts,
     c.upper_starts = c.upper_starts + $d.upper_starts,
@@ -344,6 +354,94 @@ SET c.opener_keys = row.opener_keys, c.opener_texts = row.opener_texts,
 RETURN count(c) AS n
 """
 DROP_LEGACY_WORD_CONSTRAINT = "DROP CONSTRAINT word_text IF EXISTS"
+
+# ----------------------------------------------------------------------------- recency decay
+# graph/decay.py. The epoch lives in the encryption marker node. Rebase protocol (crash-safe,
+# never double-applied): (1) BEGIN records the target t0 / half-life, the factor and a new
+# rebase_epoch in PolytoneMeta (one transaction; a pending rebase is resumed, never restarted);
+# (2) every REBASE query multiplies the decayed properties of the nodes / relationships whose
+# decay_epoch is still below that epoch by the factor AND stamps the epoch, in batches of
+# __BATCH__ rows that each commit atomically, so a crash leaves every item either fully rebased
+# and stamped or untouched, and rerunning only picks the untouched ones; (3) FINISH moves
+# decay_t0 to the target. Until then reads keep using the old t0 (the store blocks its own
+# reads and writes while it rebases). REBASE / PRUNE use ``CALL (x) {…} IN TRANSACTIONS``
+# (Neo4j ≥ 5.23; run as auto-commit queries), one scan per query however large the graph.
+# properties(m), not m.<prop>: absent keys must not log "property key does not exist" warnings
+META_DECAY = "MATCH (m:PolytoneMeta {name: 'schema'}) RETURN properties(m) AS m"
+INIT_DECAY = """
+MERGE (m:PolytoneMeta {name: 'schema'})
+WITH m, properties(m) AS p
+SET m.decay_t0 = coalesce(p.decay_t0, $now), m.decay_half_life_s = coalesce(p.decay_half_life_s, $h)
+RETURN properties(m) AS m
+"""
+# the no-op SET locks the marker, so two processes cannot begin two different rebases
+LOCK_META = """
+MERGE (m:PolytoneMeta {name: 'schema'})
+SET m.name = m.name
+RETURN properties(m) AS m
+"""
+BEGIN_REBASE = """
+MATCH (m:PolytoneMeta {name: 'schema'})
+SET m.rebase_epoch = $epoch, m.rebase_target_t0 = $target_t0, m.rebase_factor = $factor,
+    m.rebase_half_life_s = $target_h
+"""
+FINISH_REBASE = """
+MATCH (m:PolytoneMeta {name: 'schema'}) WHERE m.rebase_epoch = $epoch AND m.rebase_target_t0 IS NOT NULL
+SET m.decay_t0 = m.rebase_target_t0, m.decay_half_life_s = m.rebase_half_life_s
+REMOVE m.rebase_target_t0, m.rebase_factor, m.rebase_half_life_s
+RETURN properties(m) AS m
+"""
+# after a wipe there is nothing left to rebase: restart the epoch at $now
+RESET_DECAY = """
+MERGE (m:PolytoneMeta {name: 'schema'})
+SET m.decay_t0 = $now, m.decay_half_life_s = $h
+REMOVE m.rebase_target_t0, m.rebase_factor, m.rebase_half_life_s
+"""
+
+_REBASE_EACH = """
+MATCH {pattern} WHERE coalesce(x.decay_epoch, 0) < $epoch
+CALL (x) {{
+  SET {sets}, x.decay_epoch = $epoch
+}} IN TRANSACTIONS OF __BATCH__ ROWS
+"""
+
+
+def _rebase(pattern: str, *props: str, lists: tuple[str, ...] = ()) -> str:
+    sets = [f"x.{p} = coalesce(x.{p}, 0) * $factor" for p in props]
+    sets += [f"x.{p} = [v IN coalesce(x.{p}, []) | v * $factor]" for p in lists]
+    return _REBASE_EACH.format(pattern=pattern, sets=",\n      ".join(sets))
+
+
+_CTX_REBASE = _rebase(
+    "(x:IntentContext)", "sentence_count", "lower_starts", "upper_starts", "len_sum", "contractions",
+    "expansions", lists=("len_hist", "opener_counts", "opener_phrase_counts", "transition_counts"),
+).replace(  # sample_weight first: legacy contexts have none (= sample_count, written at t0)
+    "SET ", "SET x.sample_weight = coalesce(x.sample_weight, x.sample_count, 0) * $factor,\n      ", 1
+)
+REBASE = [  # (what, query) — run in this order, each its own auto-commit query
+    ("words", _rebase("(x:Word)", "weight", lists=("persona_counts",))),
+    ("followed_by", _rebase("()-[x:FOLLOWED_BY]->()", "weight", lists=("persona_weights",))),
+    ("part_of", _rebase("()-[x:PART_OF_STRUCTURE]->()", "weight")),
+    ("used_in", _rebase("()-[x:USED_IN]->()", "weight")),
+    ("structures", _rebase("(x:SentenceStructure)", "weight")),
+    ("punctuation", _rebase("(x:PunctuationMark)", "weight")),
+    ("contexts", _CTX_REBASE),
+]
+
+# Prune (effective weight = weight / s(now) < PRUNE_BELOW, i.e. weight < $below): faded
+# FOLLOWED_BY / PART_OF_STRUCTURE edges, then words with a faded weight and no edge left.
+_PRUNE_EACH = """
+MATCH {pattern} WHERE {where}
+CALL (x) {{
+  DELETE x
+}} IN TRANSACTIONS OF __BATCH__ ROWS
+RETURN count(*) AS n
+"""
+PRUNE = [  # (count key, query)
+    ("followed_by", _PRUNE_EACH.format(pattern="()-[x:FOLLOWED_BY]->()", where="x.weight < $below")),
+    ("part_of", _PRUNE_EACH.format(pattern="()-[x:PART_OF_STRUCTURE]->()", where="x.weight < $below")),
+    ("words", _PRUNE_EACH.format(pattern="(x:Word)", where="x.weight < $below AND NOT (x)--()")),
+]
 
 # ----------------------------------------------------------------------------- wipe
 WIPE_BATCH = """

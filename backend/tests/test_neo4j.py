@@ -14,6 +14,7 @@ import uuid
 import pytest
 
 from backend.config import Settings
+from backend.graph import queries as Q
 from backend.graph.constraints import compute_constraints
 from backend.graph.store import InMemoryGraphStore, Neo4jGraphStore, word_key
 from backend.ingestion.extract import extract
@@ -29,6 +30,7 @@ def neo():
     s = Settings(
         neo4j_uri=uri,
         neo4j_password=os.environ.get("POLYTONE_TEST_NEO4J_PASSWORD", "test-pass"),
+        polytone_decay_half_life_days=0,  # decay tests build their own stores (fake clock)
     )
     store = Neo4jGraphStore.from_settings(s)
     if not store.healthy():
@@ -332,3 +334,256 @@ def test_neo4j_common_word_fanout_is_capped(neo):
     assert {r["b"]: r["n"] for r in kept} == {word_key(b): n for (a, b), n in mem.bigrams.items() if a == hub}
     assert {r["b"]: r["n"] for r in kept}[word_key(cat)] > 1  # the frequent edge survived
     assert store._aggregate(persona, 20) == mem._aggregate(persona, 20)
+
+
+# ----------------------------------------------------------------------------- recency decay
+# graph/decay.py. The stores under test get a fake clock and their own half-life. The decay epoch
+# lives in the shared (:PolytoneMeta {name:'schema'}) node, so ``decay_neo`` pins it to the fake
+# clock for the test and restores it afterwards (rebase_epoch is kept: epochs only ever grow).
+# Rebase and prune act on the WHOLE scratch database — one more reason it must be a scratch one.
+_DECAY_META = ("decay_t0", "decay_half_life_s", "rebase_target_t0", "rebase_factor", "rebase_half_life_s")
+_START = 1_750_000_000.0
+
+
+class _Clock:
+    def __init__(self, t: float) -> None:
+        self.t = t
+
+    def __call__(self) -> float:
+        return self.t
+
+    def advance(self, days: float) -> None:
+        self.t += days * 86400.0
+
+
+@pytest.fixture
+def decay_neo(neo):
+    store, tag, persona, created = neo
+    rows = store.execute_read("MATCH (m:PolytoneMeta {name: 'schema'}) RETURN properties(m) AS m")
+    saved = {k: rows[0]["m"].get(k) for k in _DECAY_META} if rows else {}
+    clock = _Clock(_START)
+    opened: list[Neo4jGraphStore] = []
+
+    def make(half_life_days: float, rebase_at: float = 1e6, *, set_epoch: bool = True) -> Neo4jGraphStore:
+        if set_epoch:  # the epoch the in-memory twin also uses: t0 = the fake clock's start
+            store._driver.execute_query(
+                "MERGE (m:PolytoneMeta {name: 'schema'}) SET m.decay_t0 = $t0, m.decay_half_life_s = $h "
+                "REMOVE m.rebase_target_t0, m.rebase_factor, m.rebase_half_life_s",
+                {"t0": _START, "h": half_life_days * 86400.0},
+            )
+        s = Settings(
+            neo4j_uri=os.environ["POLYTONE_TEST_NEO4J_URI"],
+            neo4j_password=os.environ.get("POLYTONE_TEST_NEO4J_PASSWORD", "test-pass"),
+            polytone_decay_half_life_days=half_life_days,
+        )
+        st = Neo4jGraphStore.from_settings(s, clock=clock)
+        st.decay.rebase_at = rebase_at
+        st.decay_batch = 7  # many small inner transactions
+        opened.append(st)
+        return st
+
+    yield make, clock, store, tag, persona, created
+    for st in opened:
+        st.close()
+    if rows:
+        store._driver.execute_query(
+            "MATCH (m:PolytoneMeta {name: 'schema'}) REMOVE " + ", ".join(f"m.{k}" for k in _DECAY_META)
+            + " SET m += $set",
+            {"set": {k: v for k, v in saved.items() if v is not None}},
+        )
+    else:
+        store._driver.execute_query("MATCH (m:PolytoneMeta {name: 'schema'}) DETACH DELETE m")
+
+
+def _style_texts(tag):
+    old = [_tagged(tag, t) for t in (
+        "lol ok see u at the park. lol that was fun 😂 lol same time tmrw?",
+        "lol no way. lol u serious 😂 lol fine.",
+        "lol ok. lol brb 😂 lol later dude.",
+    )]
+    new = [_tagged(tag, t) for t in (
+        "Regarding the report, I reviewed the figures; they look solid. Regarding the budget, confirm by Friday.",
+        "Regarding the plan, the team needs a week; the rollout moves. Regarding staffing, we hire two.",
+        "Regarding the contract, legal approved the terms; signatures pend. Regarding invoices, pay Tuesday.",
+    )]
+    return old, new
+
+
+def _twin_writes(neo_store, mem, created, texts, persona):
+    for t in texts:
+        _write(neo_store, created, t, persona)
+        mem.write_extraction(extract(t), persona)
+
+
+def _edge_set(g):
+    return sorted((e["source"], e["target"], e["type"], e["weight"]) for e in g["edges"])
+
+
+def test_neo4j_decay_parity_with_in_memory(decay_neo):
+    """Same fake clock, same t0: Cypher and the in-memory store hold the same floats and return
+    identical aggregates (ranked on stored weights, divided by s(now) in Python) — exactly."""
+    make, clock, _, tag, persona, created = decay_neo
+    store = make(10)
+    mem = InMemoryGraphStore(half_life_days=10, clock=clock, t0=_START)
+    old, new = _style_texts(tag)
+    _twin_writes(store, mem, created, old, persona)
+    clock.advance(35)
+    _twin_writes(store, mem, created, new, persona)
+    assert store.decay.t0 == mem.decay.t0 == _START
+    a_neo, a_mem = store._aggregate(persona, 20), mem._aggregate(persona, 20)
+    assert a_neo == a_mem
+    assert a_neo.sample_count == 6 and isinstance(a_neo.sample_count, int)
+    assert a_neo.sample_weight == pytest.approx(3 / 2 ** 3.5 + 3)
+    c = compute_constraints(a_neo, 20)
+    assert c == compute_constraints(a_mem, 20)
+    assert c["casing"] == "sentence" and c["top_openers"][0].startswith(f"{tag}regarding")
+    # at rest: float weights, scaled at write time
+    (deg,) = store.execute_read(Q.WORD_DEGREES, {"keys": [word_key(f"{tag}regarding")]})
+    assert deg["weight"] == mem.words[f"{tag}regarding"] == pytest.approx(6 * 2 ** 3.5)
+    clock.advance(40)  # idle: still identical, effective counts lower
+    a_neo = store._aggregate(persona, 20)
+    assert a_neo == mem._aggregate(persona, 20)
+    assert a_neo.words[f"{tag}regarding"] == pytest.approx(6 / 2 ** 4)
+    g_neo, g_mem = store.get_graph(40, persona), mem.get_graph(40, persona)
+    assert g_neo["nodes"] == g_mem["nodes"] and _edge_set(g_neo) == _edge_set(g_mem)
+
+
+def test_neo4j_decay_rebase_matches_in_memory(decay_neo):
+    make, clock, _, tag, persona, created = decay_neo
+    store = make(10, rebase_at=4.0)
+    mem = InMemoryGraphStore(half_life_days=10, clock=clock, t0=_START, rebase_at=4.0)
+    old, new = _style_texts(tag)
+    _twin_writes(store, mem, created, old, persona)
+    clock.advance(30)  # s = 8 > 4
+    _twin_writes(store, mem, created, new, persona)
+    before = store._aggregate(persona, 20)
+    assert store.decay_maintenance()["rebased"] == 1 and mem.decay_maintenance()["rebased"] == 1
+    meta = store._meta()
+    assert meta["decay_t0"] == clock.t == store.decay.t0 and meta.get("rebase_target_t0") is None
+    after = store._aggregate(persona, 20)
+    assert after == mem._aggregate(persona, 20)  # same factor, same products: exact
+    assert after.sample_count == before.sample_count
+    for w, n in before.words.items():
+        assert after.words[w] == pytest.approx(n, rel=1e-12)
+    def order(a):
+        return sorted(a.words, key=lambda w: (-a.words[w], w))
+
+    assert order(after) == order(before)
+    assert compute_constraints(after, 20)["top_openers"] == compute_constraints(before, 20)["top_openers"]
+    (deg,) = store.execute_read(Q.WORD_DEGREES, {"keys": [word_key(f"{tag}regarding")]})
+    assert deg["weight"] == mem.words[f"{tag}regarding"] == pytest.approx(6.0)  # stored units shrank by 8
+    rows = store.execute_read(  # every item stamped with the epoch, exactly once
+        "MATCH (w:Word) WHERE w.key IN $keys RETURN collect(DISTINCT w.decay_epoch) AS e",
+        {"keys": [word_key(w) for w in before.words]},
+    )
+    assert rows[0]["e"] == [meta["rebase_epoch"]]
+    clock.advance(5)  # writes after the rebase are in the new units on both sides
+    _twin_writes(store, mem, created, old[:1], persona)
+    assert store._aggregate(persona, 20) == mem._aggregate(persona, 20)
+
+
+def test_neo4j_decay_rebase_resumes_after_crash(decay_neo):
+    """A crash after some REBASE queries committed: the next start-up finishes the same rebase
+    (recorded factor / target) and never multiplies an already-stamped item again."""
+    make, clock, _, tag, persona, created = decay_neo
+    store = make(10, rebase_at=4.0)
+    mem = InMemoryGraphStore(half_life_days=10, clock=clock, t0=_START, rebase_at=4.0)
+    old, new = _style_texts(tag)
+    _twin_writes(store, mem, created, old, persona)
+    clock.advance(30)
+    _twin_writes(store, mem, created, new, persona)
+    real, calls = store._run_batched, []
+
+    def crash_after_two(query, **params):
+        if len(calls) == 2:  # Word and FOLLOWED_BY are rebased and stamped, the rest is not
+            raise ConnectionError("simulated crash")
+        calls.append(query)
+        return real(query, **params)
+
+    store._run_batched = crash_after_two
+    with pytest.raises(ConnectionError):
+        store.decay_maintenance()
+    meta = store._meta()
+    assert meta["decay_t0"] == _START and meta["rebase_target_t0"] == clock.t  # pending
+    assert meta["rebase_factor"] == 0.125
+    (deg,) = store.execute_read(Q.WORD_DEGREES, {"keys": [word_key(f"{tag}regarding")]})
+    assert deg["weight"] == pytest.approx(6.0)  # half done: words already rebased
+    # "restart": a new store finishes the pending rebase before serving anything
+    restarted = make(10, rebase_at=4.0, set_epoch=False)
+    assert restarted.init_decay() == {"resumed": 1}
+    meta = restarted._meta()
+    assert meta.get("rebase_target_t0") is None and meta["decay_t0"] == restarted.decay.t0 == clock.t
+    mem.decay_maintenance()  # the clean rebase, at the same instant
+    assert restarted._aggregate(persona, 20) == mem._aggregate(persona, 20)  # nothing applied twice
+    (deg,) = store.execute_read(Q.WORD_DEGREES, {"keys": [word_key(f"{tag}regarding")]})
+    assert deg["weight"] == pytest.approx(6.0)
+    assert restarted.init_decay() == {}  # idempotent
+
+
+def test_neo4j_decay_prune_matches_in_memory(decay_neo):
+    make, clock, _, tag, persona, created = decay_neo
+    store = make(1)
+    mem = InMemoryGraphStore(half_life_days=1, clock=clock, t0=_START)
+    gone = [f"{tag}zebra", f"{tag}quokka", f"{tag}marmot"]
+    _twin_writes(store, mem, created, [f"{gone[0]} {gone[1]} {gone[2]}. {tag}the {gone[0]} {tag}sleeps."], persona)
+    clock.advance(10)  # 2^-10 < PRUNE_BELOW
+    _twin_writes(store, mem, created, [f"{tag}the {tag}cat {tag}sat. {tag}the {tag}dog {tag}sat."], persona)
+    keys = [word_key(w) for w in gone]
+    assert len(store.execute_read(Q.WORD_DEGREES, {"keys": keys})) == 3
+    out, out_mem = store.decay_maintenance(), mem.decay_maintenance()
+    assert out["rebased"] == 0
+    for k in ("followed_by", "part_of", "words"):  # the scratch DB may hold more faded data
+        assert out[k] >= out_mem[k] > 0, k
+    assert store.execute_read(Q.WORD_DEGREES, {"keys": keys}) == []
+    rows = store.execute_read(
+        "MATCH (a:Word {key: $a})-[r:FOLLOWED_BY]->(b:Word {key: $b}) RETURN r.weight AS w",
+        {"a": word_key(f"{tag}the"), "b": word_key(f"{tag}cat")},
+    )
+    assert rows and rows[0]["w"] == mem.bigrams[(f"{tag}the", f"{tag}cat")]
+    assert store._aggregate(persona, 20) == mem._aggregate(persona, 20)
+    assert store.decay_maintenance()["followed_by"] == 0
+
+
+def test_neo4j_decay_merge_persona_matches_in_memory(decay_neo):
+    make, clock, _, tag, persona, created = decay_neo
+    store = make(10)
+    mem = InMemoryGraphStore(half_life_days=10, clock=clock, t0=_START)
+    dst = persona + "_dst"
+    old, new = _style_texts(tag)
+    _twin_writes(store, mem, created, old, persona)
+    clock.advance(15)
+    _twin_writes(store, mem, created, new, dst)
+    assert store.merge_persona(persona, dst) == mem.merge_persona(persona, dst) == 3
+    assert store._aggregate(dst, 20) == mem._aggregate(dst, 20)
+    ctx = store.execute_read("MATCH (c:IntentContext {name: $p}) RETURN properties(c) AS c", {"p": dst})[0]["c"]
+    assert ctx["sample_count"] == 6 and ctx["sample_weight"] == pytest.approx(3 + 3 * 2 ** 1.5)
+
+
+def test_neo4j_decay_epoch_init_and_half_life_change(decay_neo):
+    """t0 is recorded on first start; changing the half-life (or turning decay off) rebases to
+    now with the half-life the data was written with, so effective counts carry over."""
+    make, clock, base, tag, persona, created = decay_neo
+    base._driver.execute_query(
+        "MERGE (m:PolytoneMeta {name: 'schema'}) "
+        "REMOVE m.decay_t0, m.decay_half_life_s, m.rebase_target_t0, m.rebase_factor, m.rebase_half_life_s"
+    )
+    store = make(10, set_epoch=False)
+    assert store.init_decay() == {} and store._meta()["decay_t0"] == _START  # recorded now
+    old, _ = _style_texts(tag)
+    for t in old:
+        _write(store, created, t, persona)
+    clock.advance(10)
+    before = store._aggregate(persona, 20)
+    assert before.words[f"{tag}lol"] == pytest.approx(9 / 2)  # 9 uses, one half-life ago
+    changed = make(20, set_epoch=False)
+    assert changed.init_decay() == {"rebased": 1}
+    assert changed._meta()["decay_half_life_s"] == 20 * 86400 and changed.decay.t0 == clock.t
+    for w, n in before.words.items():
+        assert changed._aggregate(persona, 20).words[w] == pytest.approx(n)
+    off = make(0, set_epoch=False)
+    assert off.init_decay() == {"rebased": 1}  # decay off: rebased to now, then s ≡ 1
+    assert off._aggregate(persona, 20).words[f"{tag}lol"] == pytest.approx(9 / 2)
+    assert off.decay_maintenance() == {}
+    back_on = make(10, set_epoch=False)
+    assert back_on.init_decay() == {"rebased": 1}  # factor 1: only the epoch moves to now
+    assert back_on._aggregate(persona, 20).words[f"{tag}lol"] == pytest.approx(9 / 2)

@@ -11,7 +11,8 @@ live Wispr Flow watcher (``mcp_servers/wispr_live.py``) and finally loads the em
 Security (CONTRACTS.md → Security): every route except ``GET /health`` needs a bearer token
 (``security/auth.py``: the app token Rust holds, or a UI session from ``POST /session``), the Host
 header must be loopback, and security-relevant actions are written to the audit log
-(``security/audit.py``). A retention task purges old typed/wispr samples and drafts daily.
+(``security/audit.py``). A retention task purges old typed/wispr samples and drafts daily and
+runs the style graph's decay maintenance (rebase + prune, ``graph/decay.py``).
 """
 from __future__ import annotations
 
@@ -231,7 +232,7 @@ def create_app(runtime: Runtime | None = None, *, api_token: str | None = None) 
         warm.start()
         app.state.warmup = warm  # tests join it
         file_hygiene.harden(r.settings.polytone_data_dir)
-        purger = retention.RetentionTask(r).start()  # purge now, then daily
+        purger = retention.RetentionTask(r).start()  # purge + graph decay upkeep now, then daily
         yield
         purger.stop()
         stopping.set()

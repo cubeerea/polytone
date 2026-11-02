@@ -21,6 +21,10 @@ Every component builds against this file. Change it only with the orchestrator's
   (`PUT /config`) sends the draft to `claude-haiku-5-5` instead (`llm.client.FAST_MODEL`; ~40% lower
   latency measured, a little less literal). Idle API connections are pooled for 300 s (SDK default 5 s).
 - Embeddings: `POLYTONE_EMBEDDINGS=none` → feature-only scoring. Tests always use `none`.
+- Recency: `POLYTONE_DECAY_HALF_LIFE_DAYS` (float, default 90; 0 = off) — half-life of the style graph's
+  exponential recency weighting (see Neo4j schema → Recency decay). A store constructed directly
+  (`InMemoryGraphStore()`, `Neo4jGraphStore(...)`) has decay off; `connect_graph_store(settings)` and
+  `Neo4jGraphStore.from_settings` apply the setting.
 - Python 3.11, managed with `uv` (`pyproject.toml` at repo root, package `backend`).
 
 ## Hotkey loop (Rust ↔ backend)
@@ -82,7 +86,11 @@ Constraints semantics (`graph/constraints.py`): persona stats are blended with a
 Scalars and cadence lists (openers, transitions, structures, punctuation) blend; once a persona has ≥3 samples,
 marks/items it never used are dropped. `lexicon`/`top_bigrams` are persona-only (lexicon = distinctive,
 non-generic words). `structures[].weight` = blended share of sentences. `top_openers` may hold 2–3 word
-phrases ("quick update on"). `punctuation_rates` keys: `, . ; : ( " ! ? !! — … emoji` (`!`/`?` per run).
+phrases ("quick update on"). With recency decay every count behind these is an *effective recent count*
+(an occurrence now = 1.0, one a half-life ago = 0.5): shares, averages and rankings follow recent writing;
+`top_bigrams[][2]` is the effective weight (float, 3 decimals); `sample_count` and `alpha` use the raw integer
+sample counts; the ≥2 minimum counts are scaled by the data's freshness (`sample_weight / sample_count`), so a
+graph nobody writes to keeps producing the same constraints. `punctuation_rates` keys: `, . ; : ( " ! ? !! — … emoji` (`!`/`?` per run).
 Signature format `LEN|<n>c|<skeleton>|<opener>|<end>`, e.g. `M|2c|,—|conj|.` (see `ingestion/extract.py`).
 
 `IngestResult` = `{"accepted":int,"rejected":int,"reasons":[str],"sentences":int,"words_merged":int}`
@@ -189,7 +197,7 @@ Learns from messages the user types and **sends** in allowlisted native apps.
 
 - `config.py` — `Settings`, `get_settings()`.
 - `storage/db.py` — SQLite (`data/polytone.sqlite3`): tables `config`, `drafts`, `samples` (ingested human text + provenance + blind index in column `sha256`), `ingest_runs`, `draft_edits` (post-inject sends; the text is never learned, only its diff from the matched draft), `corrections` (edit learning: per persona `(feature, key)` → smoothed delta + edit count; word keys are blind indexes, words `enc1:`). User-text columns are `enc1:` ciphertext, decrypted on read (see Security). `Database(path)` methods documented in that file (the old module-level wrappers are gone; use `Runtime.db`). One persistent connection per thread, WAL + `synchronous=NORMAL`; `draft_watermark()`/`drafts_since(rowid)`/`samples_watermark()` let in-process caches stay exact across processes.
-- `graph/store.py` — `GraphStore` protocol + `Neo4jGraphStore` + `InMemoryGraphStore` (tests). Cypher templates live in `graph/queries.py`.
+- `graph/store.py` — `GraphStore` protocol + `Neo4jGraphStore` + `InMemoryGraphStore` (tests). Cypher templates live in `graph/queries.py`; write trimming in `graph/trim.py`; recency decay (scale, rebase, prune constants, `RebaseLock`) in `graph/decay.py`.
 - `ingestion/extract.py` — `extract(text) -> Extraction` (pure python, deterministic, no network). Triplets: Word FOLLOWED_BY Word (weight), Word PART_OF_STRUCTURE SentenceStructure, SentenceStructure USED_IN IntentContext, PunctuationMark nodes.
 - `ingestion/firewall.py` — `HumanText` provenance gate; every rejection returns a reason string. Rejects: empty,
   `generated=True`/`origin="polytone"`, inbound mail, per-source provenance failures, < 3 words / < 10 chars,
@@ -229,15 +237,45 @@ Learns from messages the user types and **sends** in allowlisted native apps.
 
 ## Neo4j schema
 
-Nodes: `(:Word {key /*blind index*/, text /*enc1: ciphertext*/})`, `(:SentenceStructure {signature})`, `(:PunctuationMark {symbol})`, `(:IntentContext {name})`, `(:PolytoneMeta {name:"schema", enc_version})` (migration marker).
+Nodes: `(:Word {key /*blind index*/, text /*enc1: ciphertext*/})`, `(:SentenceStructure {signature})`, `(:PunctuationMark {symbol})`, `(:IntentContext {name})`, `(:PolytoneMeta {name:"schema", enc_version, decay_t0, decay_half_life_s, rebase_epoch, rebase_target_t0?, rebase_factor?, rebase_half_life_s?})` (migration marker + decay epoch).
 Rels: `(:Word)-[:FOLLOWED_BY {weight, persona_weights}]->(:Word)`, `(:Word)-[:PART_OF_STRUCTURE {weight}]->(:SentenceStructure)`, `(:SentenceStructure)-[:USED_IN {weight}]->(:IntentContext)`, `(:PunctuationMark)-[:USED_IN {weight}]->(:IntentContext)`.
 Constraints: unique `Word.key`, `SentenceStructure.signature`, `PunctuationMark.symbol`, `IntentContext.name` (the old `word_text` constraint is dropped by the migration).
-Writes are always `MERGE ... ON CREATE SET weight=0 SET weight = weight + $n`.
+Writes are always `MERGE ... ON CREATE SET weight=0 SET weight = weight + $n` (`$n` already scaled for recency, below).
+
+Recency decay (`graph/decay.py`; requires Neo4j ≥ 5.23 for `CALL (x) {…} IN TRANSACTIONS`):
+- Growing units: each write's increments are multiplied by `s(t) = 2^((t − t0)/H)` (H = half-life in seconds)
+  in Python (`trim.prepare`) and passed as parameters, so both stores do identical float arithmetic and
+  nothing is ever rewritten on read. Reads divide by `s(now)` → effective recent counts. H = 0: `s ≡ 1`,
+  integer weights, behaviour identical to no decay.
+- Decayed (floats): `Word.weight/persona_counts`, `FOLLOWED_BY.weight/persona_weights`, `PART_OF_STRUCTURE.weight`,
+  `SentenceStructure.weight`, `PunctuationMark.weight`, `USED_IN.weight`, and IntentContext `sample_weight,
+  sentence_count, lower_starts, upper_starts, len_sum, len_hist, contractions, expansions, opener_counts,
+  opener_phrase_counts, transition_counts`. NOT decayed: `IntentContext.sample_count` (raw int; the blend,
+  `Constraints.sample_count`, `/stats` and the graph view's IntentContext weight use it). `sample_weight` is its
+  decayed twin (absent on pre-decay contexts → treated as `sample_count`).
+- t0: `PolytoneMeta.decay_t0` (epoch seconds), recorded at the first start with decay on — existing weights
+  count as written at t0 (no data migration). `decay_half_life_s` records H; a different H at start-up
+  (including switching decay off/on) rebases to now with the old H first. The in-memory store keeps t0 as an
+  attribute. Both stores take an injectable `clock` (tests use a fake one).
+- Rebase (`decay_maintenance`, when `s(now) > 1e6`, ≈ 20 half-lives): every decayed value × `1/s(now)`, t0 = now.
+  Crash-safe and never double-applied: BEGIN records `rebase_epoch` (+1), `rebase_target_t0`, `rebase_factor`,
+  `rebase_half_life_s` in one transaction; each `REBASE` query multiplies AND stamps `decay_epoch` on items whose
+  `decay_epoch` is below it, in committed batches; FINISH moves `decay_t0` to the target. A pending rebase is
+  resumed at start-up (`init_decay`, called by `connect_graph_store`). The store blocks its own reads/writes
+  meanwhile (single writer process assumed). Caches are invalidated afterwards.
+- Prune (`decay_maintenance`): delete `FOLLOWED_BY` / `PART_OF_STRUCTURE` edges with effective weight
+  `< 0.05` (`weight < 0.05·s(now)`), then `Word`s with effective weight `< 0.05` and no relationship left. Same
+  rule in both stores. `USED_IN`, structures and punctuation marks are never pruned.
+- Schedule: `security/retention.py` runs `GraphStore.decay_maintenance()` with the retention purge — at server
+  start and every 24 h — on whichever store is in use (also the in-memory fallback: it is RAM-only, so pruning
+  it is harmless). Failures are logged by class name and retried next round; audited as
+  `graph.decay_maintenance` `{half_life_days, rebased, followed_by, part_of, words}` (counts only) when something
+  changed. `wipe()` restarts the epoch at now.
 Neo4j: `bolt://localhost:7687`, user `neo4j`, password `NEO4J_PASSWORD` from `.env` (shipped default `polytone-local`, replaced by a random one by `scripts/rotate-neo4j-password.sh`).
 
 Implementation notes (backend core, additive — see `graph/queries.py`):
 - `IntentContext.name` is the persona. It also carries the persona's aggregate style counters
-  (`sample_count, sentence_count, lower_starts, upper_starts, len_sum, len_hist, contractions,
+  (`sample_count, sample_weight, sentence_count, lower_starts, upper_starts, len_sum, len_hist, contractions,
   expansions, opener_keys/opener_counts, transition_keys/transition_counts`).
 - Personas: the tone description (`personas.description` in SQLite, encrypted) is the `PERSONA:` line of the system
   prompt; the name is what samples and graph weights are attributed to. Deleting a persona re-attributes
@@ -339,7 +377,7 @@ an attacker running as the same user with the Polytone window unlocked, or root.
 - Events (at least): `session.unlock`, `session.unlock_failed`, `session.lock`, `session.expired`,
   `auth.denied`, `generate` (persona, chars in/out, model, latency), `ingest` (source, accepted/rejected),
   `config.change` (keys changed, not values of secrets), `capture.start`/`capture.stop`,
-  `data.wipe`, `data.retention_purge`, `key.created`, `migration.encrypted`.
+  `data.wipe`, `data.retention_purge`, `graph.decay_maintenance`, `key.created`, `migration.encrypted`.
   Backend emitters: `session.unlock` (`POST /session`), `session.lock` (`DELETE /session[/current]`,
   detail `reason` `app`|`user`), `session.expired` (detail `reason` `idle`|`max_age`), `auth.denied`
   (rate-limited to one row per 60 s with a `count`), `generate` (also failures: `ok:false, error`),
@@ -389,7 +427,8 @@ an attacker running as the same user with the Polytone window unlocked, or root.
   and `drafts` older than N days (by `created_at`; style graph aggregates stay). `POST /data/wipe`
   `{"confirm":"delete everything"}` deletes all samples, drafts, draft_edits, corrections and the style graph, VACUUMs,
   and clears in-memory copies (decryption memo, few-shot caches). Both audited. (Ingest cursors such as
-  `wispr.history_rowid` are kept, so wiped history is not re-imported.)
+  `wispr.history_rowid` are kept, so wiped history is not re-imported.) The same daily task runs the style
+  graph's decay maintenance (rebase + prune; see Neo4j schema → Recency decay).
 - `data/` is 0700, files in it 0600 (including `backend.log`, `gmail_token.json`, `.env`); the backend
   fixes modes at start (`security/files.py`: `data/` and its subdirs 0700, its regular files 0600, plus
   `.env` and `GMAIL_TOKEN_PATH`) and writes tokens atomically with 0600. `dev.sh` chmods `.env` 0600.

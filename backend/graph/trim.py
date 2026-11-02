@@ -20,6 +20,10 @@ Two layers keep that bounded:
 
 Writes are also sent in chunks of ``WRITE_CHUNK`` rows (one transaction, several UNWINDs) so a
 single huge sample does not become one giant Cypher parameter.
+
+``prepare(ex, scale)`` also applies recency weighting (``graph/decay.py``): every count it returns
+is multiplied by the store's current scale ``s(now)``, once, here, so both stores write the same
+floats. Trimming and fan-out ranking happen on the raw per-sample counts, before scaling.
 """
 from __future__ import annotations
 
@@ -28,6 +32,7 @@ from dataclasses import replace
 from typing import Any, TypeVar
 
 from backend.graph.constraints import context_delta
+from backend.graph.decay import scaled
 from backend.ingestion.types import Extraction
 
 MAX_WORDS = 3000  # distinct Word rows per sample
@@ -88,13 +93,36 @@ def trim_extraction(ex: Extraction) -> Extraction:
     )
 
 
-def prepare(ex: Extraction) -> tuple[Extraction, dict[str, Any]]:
-    """(trimmed extraction, IntentContext delta). The delta's sentence statistics come from the
-    full sample; its opener / phrase / transition counts from the trimmed one."""
+def prepare(ex: Extraction, scale: float = 1.0) -> tuple[Extraction, dict[str, Any]]:
+    """(trimmed extraction, IntentContext delta), every graph-bound count multiplied by ``scale``
+    (the decay multiplier ``s(now)``; 1.0 leaves the integer counts untouched). The delta's
+    sentence statistics come from the full sample; its opener / phrase / transition counts from
+    the trimmed one. ``sample_weight`` is the sample's decayed weight (``scale``); the raw
+    ``sample_count`` increment is always 1 and is not part of the delta."""
     trimmed = trim_extraction(ex)
     d = context_delta(ex)
     d.update(openers=dict(trimmed.openers), opener_phrases=dict(trimmed.opener_ngrams),
              transitions=dict(trimmed.transitions))
+    d["sample_weight"] = scaled(1, scale)
+    if scale == 1.0:
+        return trimmed, d
+
+    def m(x: dict[K, int]) -> dict[K, Any]:
+        return {k: n * scale for k, n in x.items()}
+
+    for f in ("sentence_count", "lower_starts", "upper_starts", "len_sum", "contractions", "expansions"):
+        d[f] = d[f] * scale
+    d["len_hist"] = [n * scale for n in d["len_hist"]]
+    for f in ("openers", "opener_phrases", "transitions"):
+        d[f] = m(d[f])
+    trimmed = replace(
+        trimmed,
+        words=m(trimmed.words),
+        bigrams=m(trimmed.bigrams),
+        structures=m(trimmed.structures),
+        word_structures=m(trimmed.word_structures),
+        punctuation=m(trimmed.punctuation),
+    )
     return trimmed, d
 
 
