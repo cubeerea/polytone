@@ -158,6 +158,25 @@ faded to almost nothing, so long-abandoned habits also stop taking up space. Set
 every sample the same weight forever. Changing it later is safe: the graph is converted to the new half-life
 at the next start.
 
+## Does learning help?
+
+Once a week (config `learning_eval_days`, default 7; 0 = only by hand) Polytone checks that what it
+learned made drafts sound more like you. For each persona with at least 5 samples *and* something new
+since the last check (a new sample or a learned edit), it writes drafts for six fixed, neutral test
+requests three ways: with today's rules (style graph + edit corrections), with the graph alone, and with
+the rules it last accepted. Each set is scored against your 20 newest samples. Today's rules are kept
+unless another set wins by at least 2 points; if the older rules win, drafts go back to them (rolled
+back) until the next check, and if the graph alone wins, edit corrections are paused. Small differences
+never flip the decision. With a real model a check costs up to 18 short calls per persona.
+
+The Drafts page shows a small **Learning** panel: the style match this week vs. last, the current
+decision (with **Undo** for a rollback or pause), what your edits are correcting, and **Evaluate now**.
+Polytone also notes what happened to each draft: inserted (accepted), re-run with the hotkey
+(regenerated) or edited before sending; sample excerpts shaped like the drafts you kept are preferred
+as examples in the prompt (the examples are still only your own writing). Evaluation snapshots hold
+derived rules, so they are encrypted like the graph, survive the retention purge, and are deleted by a
+wipe or with their persona.
+
 ## Style score
 
 `evaluation/style_distance.py` compares a draft with the persona's human samples on sentence length,

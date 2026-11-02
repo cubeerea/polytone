@@ -1,13 +1,16 @@
 """Retention purge and full wipe. See CONTRACTS.md → Retention and files.
 
 - ``purge(rt)``: config ``retention_days`` (0 = keep forever) → delete ``typed``/``wispr``
-  samples, ``draft_edits`` and ``drafts`` older than N days. The style graph keeps its aggregates.
+  samples, ``draft_edits`` and ``drafts`` older than N days. The style graph keeps its aggregates,
+  and so do learning evaluations (``constraint_snapshots``: derived constraints like the graph's,
+  encrypted at rest; their scores/decisions are numbers). Only a wipe or a persona delete removes them.
   Runs at server start and then daily (``RetentionTask``). Audited as ``data.retention_purge``.
 - ``graph_maintenance(rt)``: the style graph's recency decay upkeep (``GraphStore.decay_maintenance``:
   rebase the epoch when due, prune edges that faded away; ``graph/decay.py``). Same schedule,
   audited as ``graph.decay_maintenance`` with counts only, when it changed something.
-- ``wipe(rt, actor)``: delete every sample, draft, draft edit and the whole style graph, VACUUM
-  the database and drop in-memory copies (decryption memo, few-shot caches). Audited as ``data.wipe``.
+- ``wipe(rt, actor)``: delete every sample, draft, draft edit, edit correction, learning evaluation
+  and override and the whole style graph, VACUUM the database and drop in-memory copies (decryption
+  memo, few-shot caches, learning-state cache). Audited as ``data.wipe``.
 """
 from __future__ import annotations
 
@@ -57,13 +60,16 @@ def wipe(rt: Any, actor: str = "ui") -> dict[str, int]:
 def _forget_memory() -> None:
     from backend.langgraph import examples
     from backend.learning import edits
+    from backend.learning import state as learning_state
     from backend.security import crypto
 
     edits.invalidate()
+    learning_state.invalidate()
 
     with examples._cache_lock:
         examples._cache.clear()
         examples._picks.clear()
+        examples._kept.clear()
     with crypto._dlock:
         crypto._dcache.clear()
 

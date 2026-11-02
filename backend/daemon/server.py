@@ -12,7 +12,8 @@ Security (CONTRACTS.md → Security): every route except ``GET /health`` needs a
 (``security/auth.py``: the app token Rust holds, or a UI session from ``POST /session``), the Host
 header must be loopback, and security-relevant actions are written to the audit log
 (``security/audit.py``). A retention task purges old typed/wispr samples and drafts daily and
-runs the style graph's decay maintenance (rebase + prune, ``graph/decay.py``).
+runs the style graph's decay maintenance (rebase + prune, ``graph/decay.py``), and a
+learning-evaluation task (``learning/evaluate.py``) checks once a day which personas are due.
 """
 from __future__ import annotations
 
@@ -88,6 +89,7 @@ class ConfigBody(BaseModel):
     draft_speed: Literal["quality", "fast"] | None = None
     lock_idle_minutes: int | None = Field(default=None, ge=MIN_IDLE_MINUTES, le=MAX_IDLE_MINUTES)
     retention_days: int | None = Field(default=None, ge=0, le=retention.MAX_RETENTION_DAYS)
+    learning_eval_days: int | None = Field(default=None, ge=0, le=90)
 
     @field_validator("capture_apps")
     @classmethod
@@ -109,6 +111,14 @@ class AuditEventBody(BaseModel):
 
 class WipeBody(BaseModel):
     confirm: str
+
+
+class DraftOutcomeBody(BaseModel):
+    outcome: Literal["accepted", "regenerated", "discarded", "edited"]  # storage.db.DRAFT_OUTCOMES
+
+
+class EvaluateBody(BaseModel):
+    persona: str | None = None
 
 
 WIPE_PHRASE = "delete everything"
@@ -133,6 +143,7 @@ def _config_out(db: Any) -> dict[str, Any]:
         "capture_apps": apps,
         "lock_idle_minutes": _int_cfg(cfg, "lock_idle_minutes", 15, MIN_IDLE_MINUTES, MAX_IDLE_MINUTES),
         "retention_days": _int_cfg(cfg, "retention_days", 0, 0, retention.MAX_RETENTION_DAYS),
+        "learning_eval_days": _int_cfg(cfg, "learning_eval_days", 7, 0, 90),
     }
 
 
@@ -233,7 +244,11 @@ def create_app(runtime: Runtime | None = None, *, api_token: str | None = None) 
         app.state.warmup = warm  # tests join it
         file_hygiene.harden(r.settings.polytone_data_dir)
         purger = retention.RetentionTask(r).start()  # purge + graph decay upkeep now, then daily
+        from backend.learning.evaluate import EvaluationTask
+
+        evaluator = EvaluationTask(r).start()  # first check after FIRST_RUN_DELAY_S, then daily
         yield
+        evaluator.stop()
         purger.stop()
         stopping.set()
         warm.join(timeout=5)  # the watcher may still be starting; never wait on the embedding load
@@ -446,9 +461,18 @@ def create_app(runtime: Runtime | None = None, *, api_token: str | None = None) 
                 "text": d["text"],
                 "latency_ms": d["latency_ms"],
                 "score": d["score"],
+                "outcome": d.get("outcome"),
             }
             for d in rt().db.list_drafts(limit)
         ]
+
+    @app.post("/drafts/{draft_id}/outcome")
+    def draft_outcome(draft_id: str, body: DraftOutcomeBody) -> dict[str, Any]:
+        """What happened to a draft (Rust: ``accepted`` after an inject). Fire-and-forget for callers."""
+        stored = rt().db.set_draft_outcome(draft_id, body.outcome)
+        if stored is None:
+            raise HTTPException(status_code=404, detail="unknown draft")
+        return {"draft_id": draft_id, "outcome": stored}
 
     @app.get("/scores/summary")
     def scores_summary() -> dict[str, Any]:
@@ -464,11 +488,44 @@ def create_app(runtime: Runtime | None = None, *, api_token: str | None = None) 
     @app.get("/learning")
     def learning(persona: str | None = None) -> dict[str, Any]:
         """What edit learning currently changes for a persona (default: the active one)."""
-        from backend.learning import edits
+        from backend.learning import edits, evaluate
 
         r = rt()
+        name = _learning_persona(r, persona)
+        return {**edits.summary(r.db, name), **evaluate.summary(r.db, name)}
+
+    def _learning_persona(r: Runtime, persona: str | None) -> str:
         name = (persona or "").strip() or r.db.get_config().get("active_persona") or "Default"
-        return edits.summary(r.db, name)
+        return persona_store.canonical(r.db, name) or "Default"
+
+    @app.get("/learning/evaluations")
+    def learning_evaluations(persona: str | None = None, limit: int = Query(20, ge=1, le=200)) -> dict[str, Any]:
+        from backend.learning import evaluate
+
+        r = rt()
+        name = _learning_persona(r, persona)
+        return {"persona": name, "evaluations": evaluate.history(r.db, name, limit)}
+
+    @app.post("/learning/evaluate")
+    def learning_evaluate(request: Request, body: EvaluateBody | None = None) -> dict[str, Any]:
+        """Evaluate now (up to 3 × 6 model calls). 409 while another evaluation runs."""
+        from backend.learning import evaluate
+
+        r = rt()
+        name = _learning_persona(r, body.persona if body else None)
+        try:
+            return evaluate.evaluate(r, name, trigger="manual", actor=actor(request))
+        except evaluate.EvaluationBusy as e:
+            raise HTTPException(status_code=409, detail=str(e)) from e
+
+    @app.delete("/learning/state")
+    def learning_state_clear(request: Request, persona: str | None = None) -> dict[str, Any]:
+        """Undo a rollback pin or a corrections pause by hand."""
+        from backend.learning import evaluate
+
+        r = rt()
+        name = _learning_persona(r, persona)
+        return {"persona": name, "state": evaluate.clear_override(r, name, actor(request))}
 
     @app.get("/graph")
     def graph(limit: int = Query(60, ge=1, le=1000), persona: str | None = None) -> dict[str, Any]:

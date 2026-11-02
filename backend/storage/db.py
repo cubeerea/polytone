@@ -13,12 +13,19 @@ Tables
                   from; only its differences from the draft are (``corrections``).
 - ``corrections`` per-persona edit learning (``backend/learning/edits.py``): one smoothed
                   delta per (feature, key). Word keys are blind indexes, the word is ciphertext.
+- ``constraint_snapshots`` learning evaluations (``backend/learning/evaluate.py``): the constraints
+                  generation would use for a persona at that time (graph + edit corrections; they hold
+                  the user's words, so ``constraints_json`` is ciphertext), the decision and the
+                  per-candidate scores (``eval_json``: numbers and labels only, plain).
+- ``learning_state`` per-persona override set by an evaluation: ``pinned`` (generation uses snapshot
+                  ``snapshot_id`` instead of graph + corrections) or ``corrections_paused``. No row = normal.
 - ``personas``    personas the user added, and their own wording of a built-in persona's tone
                   (``backend/personas.py``). The tone description is the user's words, so it is
                   encrypted like sample text; the name stays plain (it is plain in Neo4j too).
 
 Encryption at rest (CONTRACTS.md → Security): every column holding the user's words —
-``drafts.intent/text/constraints_json``, ``samples.text/provenance_json``, ``draft_edits.text`` —
+``drafts.intent/text/constraints_json``, ``samples.text/provenance_json``, ``draft_edits.text``,
+``corrections.text``, ``constraint_snapshots.constraints_json`` —
 is stored as ``enc1:`` AES-256-GCM ciphertext (AAD = ``"<table>.<column>"``) and decrypted
 transparently on read (memoized in ``security.crypto``). The ``sha256`` columns of ``drafts`` and
 ``samples`` keep their name but hold the blind index ``idx1:...`` of the stripped text
@@ -78,6 +85,8 @@ DEFAULT_CONFIG: dict[str, str] = {
     # "quality" (POLYTONE_MODEL) | "fast" (llm.client.FAST_MODEL — lower latency, less literal)
     "draft_speed": "quality",
     "retention_days": "0",
+    # days between automatic learning evaluations (backend/learning/evaluate.py); 0 = only on demand
+    "learning_eval_days": "7",
 }
 
 # AAD contexts of the encrypted columns, and the blind-index context shared by drafts and
@@ -87,13 +96,25 @@ ENC_COLUMNS: dict[str, tuple[str, ...]] = {
     "samples": ("text", "provenance_json"),
     "draft_edits": ("text",),
     "corrections": ("text",),
+    "constraint_snapshots": ("constraints_json",),
 }
 CORRECTION_WORD_CONTEXT = "corrections.key"
 CORRECTION_ALPHA = 0.2  # smoothed-mean weight of a new edit once 1/n drops below it
 MAX_CORRECTION_WORDS = 500  # word rows kept per persona (most-seen first)
+# what happened to a draft after it was shown (``drafts.outcome``). An outcome never replaces one
+# of higher rank, so a late "accepted" (the inject) cannot undo "edited" (the send)
+DRAFT_OUTCOMES = ("accepted", "regenerated", "discarded", "edited")
+_OUTCOME_RANK = {"accepted": 0, "regenerated": 1, "discarded": 1, "edited": 2}
+LEARNING_MODES = ("pinned", "corrections_paused")
 TEXT_INDEX_CONTEXT = "content.text"
 # sources whose samples the retention purge removes (CONTRACTS.md → Retention and files)
 RETENTION_SOURCES = ("typed", "wispr")
+
+# Columns added after their table first shipped. ``CREATE TABLE IF NOT EXISTS`` never alters an
+# existing table, so ``Database.init`` adds the ones an older file lacks: (table, column, type).
+_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("drafts", "outcome", "TEXT"),
+)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS config (
@@ -109,7 +130,8 @@ CREATE TABLE IF NOT EXISTS drafts (
     latency_ms INTEGER NOT NULL DEFAULT 0,
     constraints_json TEXT,
     score_json TEXT,
-    sha256 TEXT NOT NULL
+    sha256 TEXT NOT NULL,
+    outcome TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_drafts_created ON drafts(created_at);
 CREATE INDEX IF NOT EXISTS idx_drafts_sha ON drafts(sha256);
@@ -155,6 +177,23 @@ CREATE TABLE IF NOT EXISTS corrections (
     n INTEGER NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE(persona, feature, key)
+);
+CREATE TABLE IF NOT EXISTS constraint_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    persona TEXT NOT NULL COLLATE NOCASE,
+    created_at TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    constraints_json TEXT,
+    score REAL,
+    eval_json TEXT,
+    status TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_snapshots_persona ON constraint_snapshots(persona, id);
+CREATE TABLE IF NOT EXISTS learning_state (
+    persona TEXT PRIMARY KEY COLLATE NOCASE,
+    mode TEXT NOT NULL,
+    snapshot_id INTEGER,
+    updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS personas (
     name TEXT PRIMARY KEY COLLATE NOCASE,
@@ -221,6 +260,9 @@ class Database:
         self._local = threading.local()
         self._initialized = False
         self.migration: dict[str, int] = {}
+        # bumped whenever draft outcomes may have changed in this process: part of the few-shot
+        # boost cache key (``langgraph/examples.py``)
+        self.outcome_version = 0
         self.init()
 
     # ------------------------------------------------------------------ plumbing
@@ -255,11 +297,21 @@ class Database:
             with self.connect() as c:
                 c.execute("PRAGMA journal_mode=WAL")
                 c.executescript(_SCHEMA)
+                self._ensure_columns(c)
                 for k, v in DEFAULT_CONFIG.items():
                     c.execute("INSERT OR IGNORE INTO config(k, v) VALUES (?, ?)", (k, v))
             self._check_key()  # before migrating: never encrypt legacy rows with the wrong key
             self.migration = self._migrate_plaintext()
             self._initialized = True
+
+    @staticmethod
+    def _ensure_columns(c: sqlite3.Connection) -> None:
+        """Add the ``_ADDED_COLUMNS`` an older database lacks. Idempotent (checks ``table_info``)."""
+        for table, col, decl in _ADDED_COLUMNS:
+            have = {r[1] for r in c.execute(f"PRAGMA table_info({table})").fetchall()}
+            if col not in have:
+                c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+                log.info("schema: added %s.%s", table, col)
 
     # ------------------------------------------------------------------ encryption migration
     def _check_key(self) -> None:
@@ -417,6 +469,7 @@ class Database:
             "constraints": _loads_enc(r.get("constraints_json"), "drafts.constraints_json"),
             "score": _loads(r.get("score_json")),
             "sha256": r["sha256"],
+            "outcome": r.get("outcome"),
         }
 
     def get_draft(self, draft_id: str) -> dict[str, Any] | None:
@@ -442,6 +495,40 @@ class Database:
                 "UPDATE drafts SET score_json = ? WHERE draft_id = ?",
                 (json.dumps(score) if score is not None else None, draft_id),
             )
+
+    def set_draft_outcome(self, draft_id: str, outcome: str) -> str | None:
+        """Record what happened to a draft (``DRAFT_OUTCOMES``). An outcome never replaces one of
+        higher rank. Returns the outcome now stored, or None when the draft does not exist."""
+        if outcome not in _OUTCOME_RANK:
+            raise ValueError(f"unknown outcome {outcome!r}")
+        with self.connect() as c:
+            row = c.execute("SELECT outcome FROM drafts WHERE draft_id = ?", (draft_id,)).fetchone()
+            if row is None:
+                return None
+            cur = row[0]
+            if cur in _OUTCOME_RANK and _OUTCOME_RANK[cur] > _OUTCOME_RANK[outcome]:
+                return cur
+            c.execute("UPDATE drafts SET outcome = ? WHERE draft_id = ?", (outcome, draft_id))
+        self.outcome_version += 1
+        return outcome
+
+    def kept_draft_texts(self, persona: str, limit: int = 30) -> list[str]:
+        """What the user kept from ``persona``'s newest accepted / edited drafts: the draft text, or
+        for an edited draft the message actually sent (its newest linked ``draft_edits`` row)."""
+        with self.connect() as c:
+            rows = c.execute(
+                "SELECT d.outcome, d.text, (SELECT e.text FROM draft_edits e WHERE e.nearest_draft_id = d.draft_id"
+                " ORDER BY e.id DESC LIMIT 1) FROM drafts d WHERE d.persona = ? AND d.outcome IN ('accepted', 'edited')"
+                " ORDER BY d.created_at DESC, d.rowid DESC LIMIT ?",
+                (persona, int(limit)),
+            ).fetchall()
+        out = []
+        for outcome, text, sent in rows:
+            if outcome == "edited" and sent:
+                out.append(_dec(sent, "draft_edits.text") or "")
+            else:
+                out.append(_dec(text, "drafts.text") or "")
+        return [t for t in out if t]
 
     def recent_draft_id(self, within_seconds: float = 600) -> str | None:
         """Id of the newest draft created in the last ``within_seconds``, else None."""
@@ -531,6 +618,109 @@ class Database:
     def delete_corrections(self, persona: str) -> int:
         with self.connect() as c:
             return c.execute("DELETE FROM corrections WHERE persona = ?", (persona,)).rowcount
+
+    # ------------------------------------------------------------------ learning evaluations
+    def insert_snapshot(
+        self,
+        *,
+        persona: str,
+        kind: str,
+        status: str,
+        constraints: dict | None,
+        score: float | None,
+        evaluation: dict | None,
+        created_at: str | None = None,
+    ) -> int:
+        """Store an evaluation. ``constraints`` is encrypted (it holds the user's words);
+        ``evaluation`` must hold numbers and labels only (it is stored plain)."""
+        with self.connect() as c:
+            cur = c.execute(
+                "INSERT INTO constraint_snapshots(persona, created_at, kind, constraints_json, score, eval_json, status)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    persona, created_at or utcnow_iso(), kind,
+                    crypto.encrypt(json.dumps(constraints), "constraint_snapshots.constraints_json")
+                    if constraints is not None else None,
+                    None if score is None else float(score),
+                    json.dumps(evaluation) if evaluation is not None else None,
+                    status,
+                ),
+            )
+            return int(cur.lastrowid)
+
+    @staticmethod
+    def _snapshot_out(r: Any, with_constraints: bool) -> dict[str, Any]:
+        out = {
+            "id": r["id"], "persona": r["persona"], "created_at": r["created_at"], "kind": r["kind"],
+            "score": r["score"], "evaluation": _loads(r["eval_json"]) or {}, "status": r["status"],
+        }
+        if with_constraints:
+            out["constraints"] = _loads_enc(r["constraints_json"], "constraint_snapshots.constraints_json")
+        return out
+
+    def list_snapshots(
+        self, persona: str | None = None, limit: int = 50, *, status: str | None = None, with_constraints: bool = False
+    ) -> list[dict[str, Any]]:
+        """Evaluations, newest first. Constraints are decrypted only with ``with_constraints``."""
+        q, where, args = "SELECT * FROM constraint_snapshots", [], []
+        if persona:
+            where.append("persona = ?")
+            args.append(persona)
+        if status:
+            where.append("status = ?")
+            args.append(status)
+        if where:
+            q += " WHERE " + " AND ".join(where)
+        q += " ORDER BY id DESC LIMIT ?"
+        args.append(int(limit))
+        with self.connect() as c:
+            rows = c.execute(q, args).fetchall()
+        return [self._snapshot_out(r, with_constraints) for r in rows]
+
+    def get_snapshot(self, snapshot_id: int) -> dict[str, Any] | None:
+        with self.connect() as c:
+            row = c.execute("SELECT * FROM constraint_snapshots WHERE id = ?", (int(snapshot_id),)).fetchone()
+        return self._snapshot_out(row, True) if row else None
+
+    def get_learning_state(self, persona: str) -> dict[str, Any] | None:
+        """``{persona, mode, snapshot_id, updated_at}`` of ``persona``'s override, else None."""
+        with self.connect() as c:
+            row = c.execute("SELECT * FROM learning_state WHERE persona = ?", (persona,)).fetchone()
+        return dict(row) if row else None
+
+    def set_learning_state(self, persona: str, mode: str | None, snapshot_id: int | None = None) -> None:
+        """Set (one of ``LEARNING_MODES``) or clear (``mode=None``) ``persona``'s override."""
+        with self.connect() as c:
+            if mode is None:
+                c.execute("DELETE FROM learning_state WHERE persona = ?", (persona,))
+                return
+            if mode not in LEARNING_MODES:
+                raise ValueError(f"unknown learning mode {mode!r}")
+            c.execute(
+                "INSERT INTO learning_state(persona, mode, snapshot_id, updated_at) VALUES (?, ?, ?, ?)"
+                " ON CONFLICT(persona) DO UPDATE SET mode = excluded.mode, snapshot_id = excluded.snapshot_id,"
+                " updated_at = excluded.updated_at",
+                (persona, mode, snapshot_id, utcnow_iso()),
+            )
+
+    def delete_learning(self, persona: str) -> int:
+        """Drop ``persona``'s evaluations and override (persona delete). Returns snapshots deleted."""
+        with self.connect() as c:
+            n = c.execute("DELETE FROM constraint_snapshots WHERE persona = ?", (persona,)).rowcount
+            c.execute("DELETE FROM learning_state WHERE persona = ?", (persona,))
+        return n
+
+    def learning_watermark(self, persona: str) -> dict[str, int]:
+        """``{"sample_max_id", "samples", "edits"}`` of ``persona``: an evaluation is only worth
+        repeating when one of these moved (a new sample, a learned edit)."""
+        with self.connect() as c:
+            n, top = c.execute(
+                "SELECT COUNT(*), COALESCE(MAX(id), 0) FROM samples WHERE persona = ?", (persona,)
+            ).fetchone()
+            e = c.execute(
+                "SELECT n FROM corrections WHERE persona = ? AND feature = 'edits' AND key = ''", (persona,)
+            ).fetchone()
+        return {"sample_max_id": int(top), "samples": int(n), "edits": int(e[0]) if e else 0}
 
     def all_draft_texts(self) -> list[str]:
         with self.connect() as c:
@@ -729,15 +919,20 @@ class Database:
                 "draft_edits": c.execute("DELETE FROM draft_edits WHERE created_at < ?", (cutoff_iso,)).rowcount,
                 "drafts": c.execute("DELETE FROM drafts WHERE created_at < ?", (cutoff_iso,)).rowcount,
             }
+        if out["drafts"]:
+            self.outcome_version += 1
         if any(out.values()):
             self.checkpoint()
         return out
 
     def wipe_user_data(self) -> dict[str, int]:
-        """Delete every sample, draft, draft edit and edit correction (``POST /data/wipe``), then VACUUM."""
+        """Delete every sample, draft, draft edit, edit correction and learning evaluation (snapshots
+        and overrides) (``POST /data/wipe``), then VACUUM."""
         with self.connect() as c:
             out = {t: c.execute(f"DELETE FROM {t}").rowcount
-                   for t in ("samples", "drafts", "draft_edits", "corrections")}
+                   for t in ("samples", "drafts", "draft_edits", "corrections", "constraint_snapshots")}
+            c.execute("DELETE FROM learning_state")
+        self.outcome_version += 1
         self.checkpoint(vacuum=True)
         return out
 

@@ -259,8 +259,11 @@ def delete(rt: Any, name: str) -> dict[str, Any]:
         moved = rt.db.move_samples(n, DEFAULT)
         rt.db.delete_persona_row(n)
         rt.db.delete_corrections(n)  # edit corrections are per persona; Default keeps its own
+        rt.db.delete_learning(n)  # so are its learning evaluations and any pin / pause
         from backend.learning import edits as edit_learning
+        from backend.learning import state as learning_state
 
         edit_learning.invalidate(n)
+        learning_state.invalidate(n)
         examples.invalidate()  # cached picks are keyed on a samples watermark a move doesn't change
         return {"name": n, "moved_samples": moved, "active_persona": active}

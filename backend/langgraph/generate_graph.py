@@ -6,8 +6,11 @@
 (``draft_id, text, persona, latency_ms, constraints``). Generated text is recorded in SQLite
 ``drafts`` only — it is NEVER written to the graph.
 
-``retrieve_constraints`` also picks 2–3 few-shot excerpts of the user's real samples
-(``langgraph/examples.py``) for the prompt.
+``retrieve_constraints`` applies the learning layers (``learning/state.py``: graph + edit corrections,
+or the snapshot a learning evaluation pinned, or the graph alone while corrections are paused) and
+picks 2–3 few-shot excerpts of the user's real samples (``langgraph/examples.py``) for the prompt.
+``record`` also labels the draft this generation re-runs, if any, as ``regenerated``
+(``learning/outcomes.py``; off the request thread in the server).
 
 LLM failures are never papered over: the mock LLM is used only when
 ``settings.llm_backend == "mock"``. A failing / empty real completion raises
@@ -27,7 +30,9 @@ from backend import personas
 from backend.graph.constraints import empty_constraints
 from backend.langgraph.examples import select_examples
 from backend.langgraph.prompts import build_system_parts, build_user_prompt
+from backend.learning import state as learning_state
 from backend.learning.edits import corrected
+from backend.learning.outcomes import note_regeneration_safe
 from backend.llm.client import FAST_MODEL
 from backend.runtime import Runtime, get_runtime
 
@@ -142,9 +147,16 @@ def build_generate_graph(rt: Runtime):
             c = rt.store.get_constraints(state["persona"])
             out: GenState = {"constraints": dict(c), "constraints_source": "graph"}
             try:
-                out["constraints"] = corrected(rt.db, state["persona"], out["constraints"])
-            except Exception as e:  # noqa: BLE001 - edit learning is an optional layer
-                log.warning("edit corrections failed: %s", type(e).__name__)
+                # graph + edit corrections, unless the last learning evaluation pinned a snapshot
+                # or paused corrections for this persona (backend/learning/state.py)
+                out["constraints"] = learning_state.effective(rt.db, state["persona"], out["constraints"])
+            except Exception as e:  # noqa: BLE001 - the learning layers are optional
+                log.warning("learning state / edit corrections failed: %s", type(e).__name__)
+                try:
+                    out["constraints"] = corrected(rt.db, state["persona"], dict(c))
+                except Exception as e2:  # noqa: BLE001
+                    log.warning("edit corrections failed: %s", type(e2).__name__)
+                    out["constraints"] = dict(c)
         except Exception as e:  # noqa: BLE001 - graph trouble must never break generation
             log.warning("constraint retrieval failed (%s); using empty constraints", type(e).__name__)
             out = {"constraints": dict(empty_constraints()), "constraints_source": "fallback"}
@@ -195,6 +207,11 @@ def build_generate_graph(rt: Runtime):
             latency_ms=latency,
             constraints=state["constraints"],
         )
+        # the hotkey run again on an injected draft regenerates it: label the old one (off-thread)
+        if rt.score_async:
+            rt.submit(note_regeneration_safe, rt.db, state["intent"], row["draft_id"])
+        else:
+            note_regeneration_safe(rt.db, state["intent"], row["draft_id"])
         return {"draft_id": row["draft_id"], "latency_ms": latency}
 
     def score(state: GenState) -> GenState:

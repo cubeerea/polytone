@@ -1,7 +1,17 @@
 import { useState } from "react";
-import { isOffline, type Draft, type ScoreComponents, type ScoresSummary } from "../api";
-import { relativeTime } from "../hooks";
-import { useDrafts, useScoresSummary } from "../queries";
+import {
+  api,
+  isOffline,
+  type Draft,
+  type Evaluation,
+  type EvaluationResult,
+  type LearningSummary,
+  type ScoreComponents,
+  type ScoresSummary,
+} from "../api";
+import { relativeTime, useAction } from "../hooks";
+import { invalidateQueries } from "../query";
+import { AFTER_EVALUATION, useConfig, useDrafts, useEvaluations, useLearning, useScoresSummary } from "../queries";
 import { Bar, ErrorLine, Loading, OfflineNotice, prettyHotkey } from "../components/bits";
 import { Sparkline } from "../components/Sparkline";
 
@@ -58,6 +68,7 @@ export function Drafts({ hotkey }: { hotkey: string }) {
     <div className="space-y-6 pt-1">
       {summary.data && <Score summary={summary.data} />}
       <ErrorLine error={summary.error && !isOffline(summary.error) ? summary.error : null} />
+      <LearningPanel />
 
       <section aria-label="Recent drafts">
         {drafts.error != null && !drafts.data && <ErrorLine error={drafts.error} />}
@@ -114,6 +125,155 @@ function TrendLine({ cmp }: { cmp: TrendComparison }) {
       </span>
       <span className="text-text-3"> recent vs. your first drafts</span>
     </p>
+  );
+}
+
+const WEEK_MS = 7 * 24 * 3600 * 1000;
+
+export interface WeekComparison {
+  /** Style match of the newest evaluation of the last 7 days. */
+  thisWeek: number | null;
+  /** Style match of the newest evaluation 7-14 days ago. */
+  lastWeek: number | null;
+}
+
+/** `evals` newest first (GET /learning/evaluations). */
+export function weekComparison(evals: Evaluation[], now = Date.now()): WeekComparison {
+  const pick = (from: number, to: number) => {
+    const e = evals.find((x) => {
+      const age = now - Date.parse(x.created_at);
+      return age >= from && age < to && x.score != null && Number.isFinite(x.score);
+    });
+    return e?.score ?? null;
+  };
+  return { thisWeek: pick(0, WEEK_MS), lastWeek: pick(WEEK_MS, 2 * WEEK_MS) };
+}
+
+const PUNCT_NAMES: Record<string, string> = {
+  "—": "em-dashes",
+  "!": "exclamation marks",
+  "!!": "double exclamation marks",
+  "…": "ellipses",
+  ";": "semicolons",
+  "?": "question marks",
+  ",": "commas",
+  "(": "parentheses",
+  ":": "colons",
+  emoji: "emoji",
+};
+
+/** Plain-language list of what edit learning is correcting (only rules with enough edits behind them). */
+export function corrections(l: LearningSummary): string[] {
+  const ready = (d: { edits: number } | null | undefined) => d != null && d.edits >= l.min_edits;
+  const out: string[] = [];
+  if (l.avoid_words.length) out.push(`avoids ${l.avoid_words.slice(0, 4).map((w) => `“${w}”`).join(", ")}`);
+  const fewer = Object.entries(l.punctuation)
+    .filter(([, d]) => ready(d) && d.value < 0)
+    .sort((a, b) => a[1].value - b[1].value)
+    .map(([m]) => PUNCT_NAMES[m] ?? m);
+  if (fewer.length) out.push(`fewer ${fewer.slice(0, 3).join(", ")}`);
+  const len = l.sentence_len_delta;
+  if (ready(len) && len && Math.abs(len.value) >= 0.5) out.push(len.value < 0 ? "shorter sentences" : "longer sentences");
+  return out;
+}
+
+const DECISION: Record<string, { label: string; hint: string }> = {
+  accepted: { label: "Using what it learned", hint: "The latest rules sounded most like you." },
+  rolled_back: { label: "Rolled back", hint: "Newer learning sounded less like you, so drafts use the earlier rules." },
+  corrections_paused: { label: "Edit corrections paused", hint: "Drafts sounded more like you without them." },
+};
+
+function LearningPanel() {
+  const persona = useConfig().data?.active_persona ?? "Default";
+  const learning = useLearning(persona);
+  const evals = useEvaluations(persona);
+  const evaluate = useAction(api.evaluateLearning);
+  const undo = useAction(api.clearLearningState);
+  const [result, setResult] = useState<EvaluationResult | null>(null);
+  const l = learning.data;
+  if (!l) return null;
+
+  const mode = l.state?.mode ?? "normal";
+  const last = l.last_evaluation ?? null;
+  const week = weekComparison(evals.data?.evaluations ?? []);
+  const fixes = corrections(l);
+  const decision =
+    mode === "pinned"
+      ? DECISION.rolled_back
+      : mode === "corrections_paused"
+        ? DECISION.corrections_paused
+        : last
+          ? DECISION.accepted
+          : null;
+
+  const run = async () => {
+    setResult(null);
+    const r = await evaluate.run(persona);
+    if (r) setResult(r);
+    invalidateQueries(AFTER_EVALUATION);
+  };
+  const revert = async () => {
+    await undo.run(persona);
+    invalidateQueries(AFTER_EVALUATION);
+  };
+
+  return (
+    <section aria-label="Learning" className="rounded-lg bg-fill/50 px-3 py-2.5">
+      <div className="flex items-center justify-between gap-2">
+        <h2 className="text-[12px] font-medium">
+          Learning <span className="font-normal text-text-3">· {persona}</span>
+        </h2>
+        <button type="button" className="btn btn-plain" disabled={evaluate.busy} onClick={run}>
+          {evaluate.busy ? "Evaluating…" : "Evaluate now"}
+        </button>
+      </div>
+      <dl className="mt-1.5 grid grid-cols-[96px_1fr] gap-x-2.5 gap-y-1 text-[11.5px]">
+        <dt className="text-text-3">Style match</dt>
+        <dd className="tnum text-text-2" title="Drafts for fixed test intents, scored against your newest samples">
+          {week.thisWeek == null && week.lastWeek == null ? (
+            last?.score != null ? (
+              `${Math.round(last.score)} · ${relativeTime(last.created_at)}`
+            ) : (
+              <span className="text-text-3">not evaluated yet</span>
+            )
+          ) : (
+            <>
+              {week.thisWeek == null ? "–" : Math.round(week.thisWeek)} this week
+              <span className="text-text-3"> · {week.lastWeek == null ? "–" : Math.round(week.lastWeek)} last week</span>
+            </>
+          )}
+        </dd>
+        {decision && (
+          <>
+            <dt className="text-text-3">Decision</dt>
+            <dd className="text-text-2" title={decision.hint}>
+              {decision.label}
+              {mode !== "normal" && (
+                <button type="button" className="ml-2 text-text-3 underline" disabled={undo.busy} onClick={revert}>
+                  Undo
+                </button>
+              )}
+            </dd>
+          </>
+        )}
+        <dt className="text-text-3">From your edits</dt>
+        <dd className="text-text-2">
+          {fixes.length ? (
+            fixes.join(" · ")
+          ) : (
+            <span className="text-text-3">
+              {l.edits_learned ? `${l.edits_learned} edits so far, nothing to correct yet` : "no edits learned yet"}
+            </span>
+          )}
+        </dd>
+      </dl>
+      <div aria-live="polite">
+        {result && (result.status === "skipped" || result.status === "failed") && (
+          <p className="mt-1.5 text-[11.5px] text-text-3">{result.reason}</p>
+        )}
+        <ErrorLine error={evaluate.error ?? undo.error} />
+      </div>
+    </section>
   );
 }
 

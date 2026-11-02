@@ -414,6 +414,16 @@ impl BackendClient {
             .await?)
     }
 
+    /// `POST /drafts/{id}/outcome`: what happened to a draft (`"accepted"` after an inject).
+    /// Callers fire and forget it: a label for learning, never worth delaying the loop for.
+    pub async fn draft_outcome(&self, draft_id: &str, outcome: &str) -> Result<(), BackendError> {
+        let url = self.url(&format!("/drafts/{}/outcome", draft_id));
+        let body = serde_json::json!({ "outcome": outcome });
+        self.send(|h| h.post(&url).json(&body).timeout(Duration::from_secs(3)))
+            .await
+            .map(|_| ())
+    }
+
     /// `POST /session` (app token) -> a UI session token.
     pub async fn create_session(&self) -> Result<SessionInfo, BackendError> {
         let url = self.url("/session");
@@ -652,6 +662,24 @@ mod tests {
             let seen = seen.lock().unwrap();
             assert_eq!(seen[0].0, "POST /warm");
             assert_eq!(seen[0].1.as_deref(), Some("Bearer tok-w"));
+        });
+    }
+
+    #[test]
+    fn draft_outcome_posts_to_the_draft() {
+        tokio_rt().block_on(async {
+            let (url, seen) = mock_server(|line, _auth| match line {
+                "POST /drafts/d1/outcome" => (200, r#"{"draft_id":"d1","outcome":"accepted"}"#.into()),
+                _ => (404, r#"{"detail":"unknown draft"}"#.into()),
+            })
+            .await;
+            let c = BackendClient::new(url);
+            c.draft_outcome("d1", "accepted").await.unwrap();
+            assert!(matches!(
+                c.draft_outcome("gone", "accepted").await,
+                Err(BackendError::Http { status: 404, .. })
+            ));
+            assert_eq!(seen.lock().unwrap()[0].0, "POST /drafts/d1/outcome");
         });
     }
 

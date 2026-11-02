@@ -10,6 +10,8 @@ export const KEYS = {
   config: "config",
   drafts: "drafts",
   scores: "scores",
+  learning: (persona: string) => `learning:${persona}`,
+  evaluations: (persona: string) => `evaluations:${persona}`,
   graph: (persona: string) => `graph:${persona}`,
   stats: "stats",
   sources: "sources",
@@ -21,7 +23,9 @@ export const KEYS = {
 } as const;
 
 /** What a finished generation can change. */
-export const AFTER_GENERATION = [KEYS.drafts, KEYS.scores, "graph:", KEYS.stats, KEYS.hotkey];
+export const AFTER_GENERATION = [KEYS.drafts, KEYS.scores, "graph:", KEYS.stats, KEYS.hotkey, "learning:"];
+/** What an evaluation (or undoing its decision) can change. */
+export const AFTER_EVALUATION = ["learning:", "evaluations:"];
 /** What learning from new writing can change. */
 export const AFTER_INGEST = ["graph:", KEYS.stats, KEYS.sources];
 
@@ -68,6 +72,9 @@ export function patchConfigLocally(patch: Partial<AppConfig>) {
 
 export const useDrafts = () => useQuery(KEYS.drafts, () => api.drafts(50), { pollMs: DRAFTS_POLL });
 export const useScoresSummary = () => useQuery(KEYS.scores, api.scoresSummary, { pollMs: DRAFTS_POLL });
+export const useLearning = (persona: string) => useQuery(KEYS.learning(persona), () => api.learning(persona));
+export const useEvaluations = (persona: string) =>
+  useQuery(KEYS.evaluations(persona), () => api.evaluations(persona, 20));
 
 export const useGraph = (persona: string) =>
   useQuery(KEYS.graph(persona), () => api.graph(60, persona), { keepPrevious: true });
