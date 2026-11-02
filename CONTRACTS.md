@@ -62,6 +62,7 @@ with `403 {"detail":"app token required"}`. See Security → Local API auth.
 | GET/PUT | `/config` | `{"active_persona":str,"hotkey":str,"inject_mode":"paste"\|"type","draft_speed":"quality"\|"fast" /*default quality*/,"capture_enabled":bool,"capture_apps":[str],"lock_idle_minutes":int /*1–240, default 15*/,"retention_days":int /*0–3650, 0 = keep forever (default)*/}` (PUT: every field optional, omitted = unchanged; out of range → 422; setting a non-zero `retention_days` purges at once) | same (full config) |
 | GET | `/drafts?limit=50` | – | `[{"draft_id","created_at","persona","intent","text","latency_ms","score":ScoreBreakdown\|null}]` |
 | GET | `/scores/summary` | – | `{"mean":float\|null,"count":int,"trend":[{"t":iso,"score":float}]}` |
+| GET | `/learning` | `?persona=` (default: active) | edit learning for the persona: `{"persona","edits_learned","min_edits","sentence_len_delta","contractions_delta","lowercase_delta":{"value","edits"}\|null,"punctuation":{mark:{"value","edits"}},"avoid_words":[str]}` |
 | GET | `/graph?limit=60&persona=` | – | `{"nodes":[{"id":str,"label":"Word"\|"SentenceStructure"\|"PunctuationMark"\|"IntentContext","name":str,"weight":float}],"edges":[{"source":str,"target":str,"type":"FOLLOWED_BY"\|"PART_OF_STRUCTURE"\|"USED_IN","weight":float}]}` |
 | GET | `/stats` | – | `{"words":int,"structures":int,"samples":int,"avg_sentence_len":float\|null}` |
 | POST | `/session` *app* | – | `{"token":str,"idle_timeout_s":int,"expires_at":iso /*absolute cap: now + 12 h*/}` |
@@ -70,7 +71,7 @@ with `403 {"detail":"app token required"}`. See Security → Local API auth.
 | GET | `/audit?limit=100&before_seq=` | – | `{"entries":[{"seq","ts","event","actor","detail","prev","mac"}] /*newest first*/,"head_seq":int}` |
 | GET | `/audit/verify` | – | `{"ok":bool,"count":int,"first_bad_seq":int\|null,"reason":str\|null}` |
 | POST | `/audit/event` *app* | `{"event":str /*e.g. "session.unlock_failed"; [a-z0-9_.]*/,"detail":{}}` | `{"seq":int}` (actor `app`) |
-| POST | `/data/wipe` | `{"confirm":"delete everything"}` (anything else → 400) | `{"deleted":{"samples":int,"drafts":int,"draft_edits":int,"graph_nodes":int}}` |
+| POST | `/data/wipe` | `{"confirm":"delete everything"}` (anything else → 400) | `{"deleted":{"samples":int,"drafts":int,"draft_edits":int,"corrections":int,"graph_nodes":int}}` |
 
 Persona names are matched case-insensitively everywhere (`/ingest/*`, `/generate`, `PUT /config`) and stored in the persona's own spelling; `PUT /config` rejects an `active_persona` that isn't a persona (422). Ingest and persona create/delete are serialised, so a sample never lands half-moved.
 
@@ -129,9 +130,12 @@ Learns from messages the user types and **sends** in allowlisted native apps.
   Monitoring/Accessibility → the tap can't be created: `running=false`, `last_error` says which
   permission (also set when a read fails because Accessibility was revoked). Startup reads `/config`
   (`sync_from_backend_config`).
-- Backend `POST /ingest/typed`: `after_inject=true` → never learned; stored in SQLite `draft_edits`
-  (`id, created_at, app, text, nearest_draft_id` = newest draft of the last 10 min or null) and returns
-  `{"accepted":0,"rejected":1,"reasons":["after_polytone_inject: stored for edit learning"],...}`.
+- Backend `POST /ingest/typed`: `after_inject=true` → never ingested as a sample; stored in SQLite
+  `draft_edits` (`id, created_at, app, text, nearest_draft_id` = the draft of the last 10 min whose
+  3-word shingles the text contains most, ≥ 0.3, else null). With a match, edit learning
+  (`learning/edits.py`) folds the differences from that draft into its persona's `corrections` and
+  the reason is `"after_polytone_inject: learned from your edits to the draft"`; without one it is
+  `"after_polytone_inject: stored for edit learning"`. Returns `{"accepted":0,"rejected":1,...}`.
   Otherwise, if `capture_enabled` is false → rejected (`"typing capture is disabled ..."`); else the full
   ingest graph with source `typed`, provenance `{"typed":true,"app":...,"app_name"?}`, persona `Default`
   (the global pool — not the active persona). Text capped at 5000 chars.
@@ -184,7 +188,7 @@ Learns from messages the user types and **sends** in allowlisted native apps.
 ## Python module boundaries (backend/)
 
 - `config.py` — `Settings`, `get_settings()`.
-- `storage/db.py` — SQLite (`data/polytone.sqlite3`): tables `config`, `drafts`, `samples` (ingested human text + provenance + blind index in column `sha256`), `ingest_runs`, `draft_edits` (post-inject sends; never learned). User-text columns are `enc1:` ciphertext, decrypted on read (see Security). `Database(path)` methods documented in that file (the old module-level wrappers are gone; use `Runtime.db`). One persistent connection per thread, WAL + `synchronous=NORMAL`; `draft_watermark()`/`drafts_since(rowid)`/`samples_watermark()` let in-process caches stay exact across processes.
+- `storage/db.py` — SQLite (`data/polytone.sqlite3`): tables `config`, `drafts`, `samples` (ingested human text + provenance + blind index in column `sha256`), `ingest_runs`, `draft_edits` (post-inject sends; the text is never learned, only its diff from the matched draft), `corrections` (edit learning: per persona `(feature, key)` → smoothed delta + edit count; word keys are blind indexes, words `enc1:`). User-text columns are `enc1:` ciphertext, decrypted on read (see Security). `Database(path)` methods documented in that file (the old module-level wrappers are gone; use `Runtime.db`). One persistent connection per thread, WAL + `synchronous=NORMAL`; `draft_watermark()`/`drafts_since(rowid)`/`samples_watermark()` let in-process caches stay exact across processes.
 - `graph/store.py` — `GraphStore` protocol + `Neo4jGraphStore` + `InMemoryGraphStore` (tests). Cypher templates live in `graph/queries.py`.
 - `ingestion/extract.py` — `extract(text) -> Extraction` (pure python, deterministic, no network). Triplets: Word FOLLOWED_BY Word (weight), Word PART_OF_STRUCTURE SentenceStructure, SentenceStructure USED_IN IntentContext, PunctuationMark nodes.
 - `ingestion/firewall.py` — `HumanText` provenance gate; every rejection returns a reason string. Rejects: empty,
@@ -383,7 +387,7 @@ an attacker running as the same user with the Polytone window unlocked, or root.
 - Config `retention_days` (0 = keep forever, default 0, max 3650): purge at server start, then every
   24 h, and right after `PUT /config` sets a non-zero value — `samples` from `typed`/`wispr`, `draft_edits`
   and `drafts` older than N days (by `created_at`; style graph aggregates stay). `POST /data/wipe`
-  `{"confirm":"delete everything"}` deletes all samples, drafts, draft_edits and the style graph, VACUUMs,
+  `{"confirm":"delete everything"}` deletes all samples, drafts, draft_edits, corrections and the style graph, VACUUMs,
   and clears in-memory copies (decryption memo, few-shot caches). Both audited. (Ingest cursors such as
   `wispr.history_rowid` are kept, so wiped history is not re-imported.)
 - `data/` is 0700, files in it 0600 (including `backend.log`, `gmail_token.json`, `.env`); the backend

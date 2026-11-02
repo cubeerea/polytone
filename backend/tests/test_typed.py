@@ -85,8 +85,11 @@ def test_typed_after_inject_goes_to_draft_edits_only(client, runtime):
     assert r.json() == {"accepted": 0, "rejected": 1, "sentences": 0, "words_merged": 0,
                         "reasons": ["after_polytone_inject: stored for edit learning"]}
     [edit] = runtime.db.list_draft_edits()
-    assert edit["text"] == text and edit["app"] == SLACK and edit["nearest_draft_id"] == draft["draft_id"]
+    # unrelated to the draft (no shared shingles): stored, but not linked and nothing learned
+    assert edit["text"] == text and edit["app"] == SLACK and edit["nearest_draft_id"] is None
+    assert runtime.db.get_corrections("Default") == []
     assert runtime.db.count_samples() == 0 and dict(runtime.store.words) == words_before
+    assert draft["draft_id"]
 
 
 def test_after_inject_without_recent_draft(runtime):

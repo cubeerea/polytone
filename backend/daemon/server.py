@@ -460,6 +460,15 @@ def create_app(runtime: Runtime | None = None, *, api_token: str | None = None) 
         mean = round(sum(x["score"] for x in trend) / len(trend), 2) if trend else None
         return {"mean": mean, "count": len(trend), "trend": trend[-200:]}
 
+    @app.get("/learning")
+    def learning(persona: str | None = None) -> dict[str, Any]:
+        """What edit learning currently changes for a persona (default: the active one)."""
+        from backend.learning import edits
+
+        r = rt()
+        name = (persona or "").strip() or r.db.get_config().get("active_persona") or "Default"
+        return edits.summary(r.db, name)
+
     @app.get("/graph")
     def graph(limit: int = Query(60, ge=1, le=1000), persona: str | None = None) -> dict[str, Any]:
         try:

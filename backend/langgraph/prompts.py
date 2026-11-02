@@ -158,6 +158,10 @@ def build_system_parts(
                 never.append(label)
         if use:
             rules.append("Punctuation habits — " + "; ".join(use) + ".")
+        for sym in c.get("avoid_punctuation") or []:
+            label = _NAMED_PUNCT.get(sym)
+            if label and label not in never:
+                never.append(label)
         if never:
             rules.append("Never use " + ", ".join(never) + " (the user never does).")
         structs = [s for s in (c.get("structures") or []) if s.get("signature")][:3]
@@ -176,6 +180,11 @@ def build_system_parts(
         if c.get("top_bigrams"):
             pairs = ", ".join(f'"{a} {b}"' for a, b, *_ in c["top_bigrams"][:10])
             rules.append(f"Word pairs the user often uses: {pairs}.")
+        if c.get("avoid_words"):
+            rules.append(
+                "Words the user keeps deleting from your drafts — do not use: "
+                + ", ".join(f'"{w}"' for w in c["avoid_words"]) + "."
+            )
         lines.append(f"HARD STYLE RULES (learned from {n} of the user's own writing samples — follow them):")
         lines += [f"{i}. {r}" for i, r in enumerate(rules, 1)]
     lines += [

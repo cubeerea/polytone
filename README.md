@@ -135,6 +135,17 @@ that app in the last 30 minutes (verbatim, or ≥ 80% of its shingles) and learn
 around it. If nothing learnable is left, the message is rejected as `wispr_inserted`. Your dictation is
 still learned, from its raw transcript.
 
+## Learning from your edits
+
+When you edit an injected draft before sending it, typing capture reports what you actually sent.
+Polytone finds the draft it came from (shared 3-word shingles) and learns only the *differences*:
+sentences you shortened, punctuation you removed or added, contractions, casing, and words you keep
+deleting. These are smoothed per persona (recent edits count most). After 3 edits they adjust the
+style rules: length and rates move by at most 30%, a mark you keep deleting becomes "never use",
+and pet words you remove go on a "do not use" list. The sent text itself is never learned (it is
+partly Polytone's), so the style graph and samples are untouched. `GET /learning` shows what is
+currently being corrected; deleting a persona or wiping data clears its corrections.
+
 ## Style score
 
 `evaluation/style_distance.py` compares a draft with the persona's human samples on sentence length,
