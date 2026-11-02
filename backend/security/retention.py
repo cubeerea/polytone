@@ -53,7 +53,10 @@ def wipe(rt: Any, actor: str = "ui") -> dict[str, int]:
 
 def _forget_memory() -> None:
     from backend.langgraph import examples
+    from backend.learning import edits
     from backend.security import crypto
+
+    edits.invalidate()
 
     with examples._cache_lock:
         examples._cache.clear()

@@ -32,6 +32,7 @@ SOURCES: tuple[str, ...] = ("manual", "gmail", "wispr", "watcher", "typed")
 PUSH_ONLY: frozenset[str] = frozenset({"typed"})
 TYPED_MAX_CHARS = 5000
 AFTER_INJECT_REASON = "after_polytone_inject: stored for edit learning"
+AFTER_INJECT_LEARNED = "after_polytone_inject: learned from your edits to the draft"
 DRAFT_EDIT_WINDOW_S = 600
 TYPED_PERSONA = "Default"  # "persona = null": the global pool, not the active persona
 WISPR_INSERTED_REASON = "wispr_inserted: the message is Wispr Flow dictation output"
@@ -132,7 +133,9 @@ def ingest_typed(
     """One message the user typed and sent in a native app (typing capture).
 
     ``after_inject`` → the message followed a Polytone inject in the same app, so it is (an edit
-    of) a generated draft: it is stored in ``draft_edits`` and NEVER learned from. Otherwise it
+    of) a generated draft: it is stored in ``draft_edits`` and never ingested as a sample. When it
+    matches a recent draft, the differences from that draft update the draft persona's
+    corrections (``backend/learning/edits.py``); the text itself is not learned. Otherwise it
     goes through the full ingest graph as source ``typed`` under the Default persona (the global
     pool — a typed message is not tied to whichever persona happens to be active).
     """
@@ -140,13 +143,11 @@ def ingest_typed(
 
     text = (text or "")[:TYPED_MAX_CHARS]
     if after_inject:
-        rt.db.insert_draft_edit(
-            app=app or "", text=text, nearest_draft_id=rt.db.recent_draft_id(DRAFT_EDIT_WINDOW_S)
-        )
+        learned = _learn_from_edit(rt, text, app)
         rt.audit_event_soon("ingest", {"source": "typed", "accepted": 0, "rejected": 1, "draft_edit": True,
-                                       "app": (app or "")[:100]})
+                                       "edit_learned": learned, "app": (app or "")[:100]})
         res = empty_result()
-        res.update(rejected=1, reasons=[AFTER_INJECT_REASON])
+        res.update(rejected=1, reasons=[AFTER_INJECT_LEARNED if learned else AFTER_INJECT_REASON])
         return res
     if not rt.db.capture_config()[0]:
         res = empty_result()
@@ -167,6 +168,29 @@ def ingest_typed(
         prov["wispr_removed"] = {"rowids": stripped.matched, "tokens": stripped.removed_tokens}
         text = stripped.text
     return run_ingest_batch([{"text": text, "provenance": prov}], "typed", TYPED_PERSONA, runtime=rt)
+
+
+def _learn_from_edit(rt: Runtime, text: str, app: str | None) -> bool:
+    """Store the post-inject message, linked to the draft it edits, and learn from the diff.
+    Returns True when a draft matched and its persona's corrections were updated."""
+    from backend.learning import edits
+
+    match = None
+    try:
+        match = edits.match_draft(rt.db, text, DRAFT_EDIT_WINDOW_S)
+    except Exception as e:  # noqa: BLE001 - matching is a bonus; storing the edit is not
+        log.warning("draft matching failed: %s", type(e).__name__)
+    rt.db.insert_draft_edit(app=app or "", text=text, nearest_draft_id=match[0]["draft_id"] if match else None)
+    if match is None:
+        return False
+    draft = match[0]
+    try:
+        edits.learn_edit(rt.db, draft["persona"], draft["text"], text)
+    except Exception as e:  # noqa: BLE001 - never fail the capture request over learning
+        log.warning("edit learning failed: %s", type(e).__name__)
+        return False
+    edits.invalidate(draft["persona"])
+    return True
 
 
 def _strip_wispr(text: str, app: str | None) -> Any:

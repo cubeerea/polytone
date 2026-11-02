@@ -9,7 +9,10 @@ Tables
 - ``samples``     ingested *human* text, unique by sha256, with provenance.
 - ``ingest_runs`` one row per ingestion run of a source.
 - ``draft_edits`` text the user sent right after a Polytone inject (typing capture with
-                  ``after_inject=True``). NEVER learned from; kept for future edit learning.
+                  ``after_inject=True``), linked to the draft it edits. The text is NEVER learned
+                  from; only its differences from the draft are (``corrections``).
+- ``corrections`` per-persona edit learning (``backend/learning/edits.py``): one smoothed
+                  delta per (feature, key). Word keys are blind indexes, the word is ciphertext.
 - ``personas``    personas the user added, and their own wording of a built-in persona's tone
                   (``backend/personas.py``). The tone description is the user's words, so it is
                   encrypted like sample text; the name stays plain (it is plain in Neo4j too).
@@ -83,7 +86,11 @@ ENC_COLUMNS: dict[str, tuple[str, ...]] = {
     "drafts": ("intent", "text", "constraints_json"),
     "samples": ("text", "provenance_json"),
     "draft_edits": ("text",),
+    "corrections": ("text",),
 }
+CORRECTION_WORD_CONTEXT = "corrections.key"
+CORRECTION_ALPHA = 0.2  # smoothed-mean weight of a new edit once 1/n drops below it
+MAX_CORRECTION_WORDS = 500  # word rows kept per persona (most-seen first)
 TEXT_INDEX_CONTEXT = "content.text"
 # sources whose samples the retention purge removes (CONTRACTS.md → Retention and files)
 RETENTION_SOURCES = ("typed", "wispr")
@@ -138,6 +145,17 @@ CREATE TABLE IF NOT EXISTS draft_edits (
     nearest_draft_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_draft_edits_created ON draft_edits(created_at);
+CREATE TABLE IF NOT EXISTS corrections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    persona TEXT NOT NULL COLLATE NOCASE,
+    feature TEXT NOT NULL,
+    key TEXT NOT NULL,
+    text TEXT,
+    value REAL NOT NULL,
+    n INTEGER NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(persona, feature, key)
+);
 CREATE TABLE IF NOT EXISTS personas (
     name TEXT PRIMARY KEY COLLATE NOCASE,
     description TEXT NOT NULL,
@@ -455,6 +473,65 @@ class Database:
             ).fetchall()
         return [{**dict(r), "text": _dec(r["text"], "draft_edits.text")} for r in rows]
 
+    def drafts_within(self, within_seconds: float = 600, limit: int = 20) -> list[dict[str, Any]]:
+        """``{draft_id, persona, text}`` of drafts created in the last ``within_seconds``, newest first."""
+        cutoff = datetime.fromtimestamp(datetime.now(UTC).timestamp() - within_seconds, UTC)
+        with self.connect() as c:
+            rows = c.execute(
+                "SELECT draft_id, persona, text FROM drafts WHERE created_at >= ?"
+                " ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                (cutoff.isoformat(timespec="milliseconds"), int(limit)),
+            ).fetchall()
+        return [{"draft_id": r[0], "persona": r[1], "text": _dec(r[2], "drafts.text") or ""} for r in rows]
+
+    # ------------------------------------------------------------------ corrections (edit learning)
+    def update_corrections(self, persona: str, rows: list[tuple[str, str, str | None, float]]) -> None:
+        """Fold one edit into ``persona``'s corrections. ``rows`` = (feature, key, text, x); a row with
+        ``text`` (a word) is keyed by its blind index and stores the word encrypted. Each value is a
+        smoothed mean: ``value += (x - value) * max(1/n, CORRECTION_ALPHA)``."""
+        now = utcnow_iso()
+        with self.connect() as c:
+            for feature, key, text, x in rows:
+                if text is not None:
+                    key = crypto.blind_index(text, CORRECTION_WORD_CONTEXT)
+                cur = c.execute(
+                    "SELECT value, n FROM corrections WHERE persona = ? AND feature = ? AND key = ?",
+                    (persona, feature, key),
+                ).fetchone()
+                if cur is None:
+                    c.execute(
+                        "INSERT INTO corrections(persona, feature, key, text, value, n, updated_at)"
+                        " VALUES (?, ?, ?, ?, ?, 1, ?)",
+                        (persona, feature, key,
+                         crypto.encrypt(text, "corrections.text") if text is not None else None, float(x), now),
+                    )
+                else:
+                    n = int(cur["n"]) + 1
+                    value = float(cur["value"]) + (float(x) - float(cur["value"])) * max(1.0 / n, CORRECTION_ALPHA)
+                    c.execute(
+                        "UPDATE corrections SET value = ?, n = ?, updated_at = ?"
+                        " WHERE persona = ? AND feature = ? AND key = ?",
+                        (value, n, now, persona, feature, key),
+                    )
+            c.execute(  # bound the word rows: keep the most-seen, then the most recent
+                "DELETE FROM corrections WHERE persona = ? AND feature = 'word' AND id NOT IN ("
+                " SELECT id FROM corrections WHERE persona = ? AND feature = 'word'"
+                " ORDER BY n DESC, updated_at DESC, id DESC LIMIT ?)",
+                (persona, persona, MAX_CORRECTION_WORDS),
+            )
+
+    def get_corrections(self, persona: str) -> list[dict[str, Any]]:
+        """``{feature, key, text, value, n, updated_at}`` rows of ``persona`` (``text`` decrypted)."""
+        with self.connect() as c:
+            rows = c.execute(
+                "SELECT feature, key, text, value, n, updated_at FROM corrections WHERE persona = ?", (persona,)
+            ).fetchall()
+        return [{**dict(r), "text": _dec(r["text"], "corrections.text")} for r in rows]
+
+    def delete_corrections(self, persona: str) -> int:
+        with self.connect() as c:
+            return c.execute("DELETE FROM corrections WHERE persona = ?", (persona,)).rowcount
+
     def all_draft_texts(self) -> list[str]:
         with self.connect() as c:
             rows = c.execute("SELECT text FROM drafts ORDER BY rowid").fetchall()
@@ -657,9 +734,10 @@ class Database:
         return out
 
     def wipe_user_data(self) -> dict[str, int]:
-        """Delete every sample, draft and draft edit (``POST /data/wipe``), then VACUUM."""
+        """Delete every sample, draft, draft edit and edit correction (``POST /data/wipe``), then VACUUM."""
         with self.connect() as c:
-            out = {t: c.execute(f"DELETE FROM {t}").rowcount for t in ("samples", "drafts", "draft_edits")}
+            out = {t: c.execute(f"DELETE FROM {t}").rowcount
+                   for t in ("samples", "drafts", "draft_edits", "corrections")}
         self.checkpoint(vacuum=True)
         return out
 

@@ -27,6 +27,7 @@ from backend import personas
 from backend.graph.constraints import empty_constraints
 from backend.langgraph.examples import select_examples
 from backend.langgraph.prompts import build_system_parts, build_user_prompt
+from backend.learning.edits import corrected
 from backend.llm.client import FAST_MODEL
 from backend.runtime import Runtime, get_runtime
 
@@ -140,6 +141,10 @@ def build_generate_graph(rt: Runtime):
         try:
             c = rt.store.get_constraints(state["persona"])
             out: GenState = {"constraints": dict(c), "constraints_source": "graph"}
+            try:
+                out["constraints"] = corrected(rt.db, state["persona"], out["constraints"])
+            except Exception as e:  # noqa: BLE001 - edit learning is an optional layer
+                log.warning("edit corrections failed: %s", type(e).__name__)
         except Exception as e:  # noqa: BLE001 - graph trouble must never break generation
             log.warning("constraint retrieval failed (%s); using empty constraints", type(e).__name__)
             out = {"constraints": dict(empty_constraints()), "constraints_source": "fallback"}

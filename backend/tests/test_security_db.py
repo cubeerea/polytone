@@ -162,7 +162,7 @@ def test_purge_and_wipe(tmp_path):
     out = db.purge_older_than("2026-01-01T00:00:00.000+00:00")
     assert out == {"samples": 2, "draft_edits": 1, "drafts": 1}
     assert sorted(s["text"] for s in db.list_samples()) == ["manual long ago by me", "typed just now by me"]
-    assert db.wipe_user_data() == {"samples": 2, "drafts": 0, "draft_edits": 0}
+    assert db.wipe_user_data() == {"samples": 2, "drafts": 0, "draft_edits": 0, "corrections": 0}
     assert db.count_samples() == 0
 
 
