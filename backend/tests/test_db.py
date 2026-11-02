@@ -67,11 +67,11 @@ def test_threads_share_one_database(tmp_path):
 
 
 def test_draft_watermark_and_since(db: Database):
-    assert db.draft_watermark() == (0, 0) and db.drafts_since(0) == []
+    assert db.draft_watermark() == (0, 0, "") and db.drafts_since(0) == []
     a = db.insert_draft(persona="P", intent="i", text="one two three")
-    db.insert_draft(persona="P", intent="i", text="four five six")
-    n, top = db.draft_watermark()
-    assert n == 2 and top >= 2
+    b = db.insert_draft(persona="P", intent="i", text="four five six")
+    n, top, top_id = db.draft_watermark()
+    assert n == 2 and top >= 2 and top_id == b["draft_id"]
     rows = db.drafts_since(0)
     assert [r[2] for r in rows] == ["one two three", "four five six"] and rows[0][1] == a["sha256"]
     assert [r[2] for r in db.drafts_since(rows[0][0])] == ["four five six"]

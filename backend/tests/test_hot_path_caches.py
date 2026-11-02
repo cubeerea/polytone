@@ -68,6 +68,25 @@ def test_draft_index_sees_other_process_writes_and_deletes(tmp_path):
     assert snap.has_hash(sha256_text(text))  # an older snapshot is unaffected (append-only view)
 
 
+def test_draft_index_sees_new_draft_that_reuses_a_deleted_rowid(tmp_path):
+    # wipe (or a retention purge) deletes every draft; SQLite then hands the next draft the same
+    # rowid, so COUNT and MAX(rowid) are what the index saw before: it must still notice the swap
+    db = Database(tmp_path / "r.sqlite3")
+    old, new = "old draft about the launch on friday", "sounds good, i will send the deck over tonight"
+    db.insert_draft(persona="P", intent="i", text=old)
+    assert draft_match_reason(old, db) == "matches a Polytone-generated draft"
+    db.wipe_user_data()
+    db.insert_draft(persona="P", intent="i", text=new)
+    assert draft_match_reason(new, db) == "matches a Polytone-generated draft"
+    assert draft_match_reason(old, db) is None
+    # more drafts than before the wipe: MAX(rowid) grows, but rowid 1 is a different draft again
+    db.wipe_user_data()
+    db.insert_draft(persona="P", intent="i", text=old)
+    db.insert_draft(persona="P", intent="i", text="another draft that goes to the team")
+    assert draft_match_reason(old, db) == "matches a Polytone-generated draft"
+    assert draft_match_reason(new, db) is None
+
+
 def test_draft_index_threads(tmp_path):
     db = Database(tmp_path / "t.sqlite3")
     errors: list[BaseException] = []

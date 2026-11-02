@@ -144,7 +144,7 @@ class _DraftIndex:
         self._reset()
 
     def _reset(self) -> None:
-        self._mark: tuple[int, int] = (0, 0)  # (rows indexed, max rowid indexed)
+        self._mark: tuple[int, int, str] = (0, 0, "")  # (rows indexed, max rowid indexed, its draft_id)
         self._rows: list[tuple[str, int, frozenset, str]] = []
         self._postings: dict[tuple, list[int]] = {}
         self._hash_pos: dict[str, int] = {}
@@ -159,15 +159,26 @@ class _DraftIndex:
             self._postings.setdefault(g, []).append(pos)
 
     def snapshot(self, db: Any) -> DraftSnapshot:
-        count, top = db.draft_watermark()
+        count, top, top_id = db.draft_watermark()
         with self._lock:
-            if (count, top) != self._mark:
-                if count < self._mark[0] or top < self._mark[1]:  # drafts were deleted: rebuild
+            if (count, top, top_id) != self._mark:
+                last = self._mark[1]
+                rebuild = count < self._mark[0] or top < last  # drafts were deleted
+                new = db.drafts_since(last - 1) if last and not rebuild else []
+                if last and not rebuild:
+                    # SQLite reuses deleted rowids (e.g. after a wipe): the newest draft indexed
+                    # must still be there, else the rows below it may be different drafts now
+                    if new and new[0][0] == last and new[0][3] == self._mark[2]:
+                        new = new[1:]
+                    else:
+                        rebuild = True
+                if rebuild or not last:
                     self._reset()
-                new = db.drafts_since(self._mark[1])
-                for _, sha, text in new:
+                    new = db.drafts_since(0)
+                for _, sha, text, _id in new:
                     self._add(sha, text)
-                self._mark = (len(self._rows), new[-1][0] if new else self._mark[1])
+                if new:
+                    self._mark = (len(self._rows), new[-1][0], new[-1][3])
             return DraftSnapshot(self._rows, self._postings, self._hash_pos, len(self._rows))
 
 
