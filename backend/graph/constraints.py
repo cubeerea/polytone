@@ -32,6 +32,16 @@ the persona has no samples, and then ``sample_count`` reports the global count.)
   ``top_bigrams`` are the persona's bigrams by persona weight; ``lexicon`` ranks the persona's
   non-generic words by ``count * log2(1 + ratio)`` where ``ratio`` is the word's persona
   frequency over its global frequency (distinctive for this persona, not generic English).
+
+Recency (``graph/decay.py``)
+----------------------------
+Every count in a ``StyleAggregate`` except ``sample_count`` is an *effective recent count* (an
+occurrence now = 1.0, one a half-life ago = 0.5), so shares, averages and rankings follow recent
+writing. ``sample_count`` stays the raw number of samples (it drives ``alpha`` and the ``>= 5``
+switch). Minimum counts are scaled by the aggregate's freshness ``sample_weight / sample_count``
+(1.0 when decay is off or everything was written just now): decay is relative, so a graph nobody
+writes to for a year keeps producing the same constraints, while an item seen twice long ago in a
+mostly recent corpus falls under the threshold and is forgotten.
 """
 from __future__ import annotations
 
@@ -39,6 +49,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, TypedDict
 
+from backend.graph.decay import FRESH_TOLERANCE
 from backend.ingestion.text import (
     EXPANDED_FORMS,
     FUNCTION_WORDS,
@@ -86,44 +97,83 @@ def empty_constraints() -> Constraints:
 
 @dataclass
 class StyleAggregate:
-    """Raw counts for one persona (or all personas merged)."""
+    """Counts for one persona (or all personas merged). Everything but ``sample_count`` is a
+    decayed weight (int when decay is off, float otherwise): stored values while a store builds
+    the aggregate, effective recent counts once it called ``rescale(s(now))``."""
 
-    sample_count: int = 0
-    sentence_count: int = 0
-    lower_starts: int = 0
-    upper_starts: int = 0
-    len_sum: int = 0
-    len_hist: list[int] = field(default_factory=lambda: [0] * LEN_HIST_SIZE)
-    contractions: int = 0
-    expansions: int = 0
-    openers: dict[str, int] = field(default_factory=dict)
-    opener_phrases: dict[str, int] = field(default_factory=dict)
-    transitions: dict[str, int] = field(default_factory=dict)
-    words: dict[str, int] = field(default_factory=dict)  # top words by (persona) count
-    word_totals: dict[str, int] = field(default_factory=dict)  # global count of those words
-    bigrams: dict[tuple[str, str], int] = field(default_factory=dict)  # top bigrams
-    structures: dict[str, int] = field(default_factory=dict)
-    punctuation: dict[str, int] = field(default_factory=dict)
+    sample_count: int = 0  # raw number of samples (never decayed)
+    sample_weight: float = 0  # decayed number of samples
+    sentence_count: float = 0
+    lower_starts: float = 0
+    upper_starts: float = 0
+    len_sum: float = 0
+    len_hist: list[float] = field(default_factory=lambda: [0] * LEN_HIST_SIZE)
+    contractions: float = 0
+    expansions: float = 0
+    openers: dict[str, float] = field(default_factory=dict)
+    opener_phrases: dict[str, float] = field(default_factory=dict)
+    transitions: dict[str, float] = field(default_factory=dict)
+    words: dict[str, float] = field(default_factory=dict)  # top words by (persona) count
+    word_totals: dict[str, float] = field(default_factory=dict)  # global count of those words
+    bigrams: dict[tuple[str, str], float] = field(default_factory=dict)  # top bigrams
+    structures: dict[str, float] = field(default_factory=dict)
+    punctuation: dict[str, float] = field(default_factory=dict)
 
     def merge_context(self, ctx: dict[str, Any]) -> None:
         """Add an IntentContext node's aggregate properties (Neo4j/in-memory shape)."""
         self.sample_count += int(ctx.get("sample_count") or 0)
-        self.sentence_count += int(ctx.get("sentence_count") or 0)
-        self.lower_starts += int(ctx.get("lower_starts") or 0)
-        self.upper_starts += int(ctx.get("upper_starts") or 0)
-        self.len_sum += int(ctx.get("len_sum") or 0)
-        self.contractions += int(ctx.get("contractions") or 0)
-        self.expansions += int(ctx.get("expansions") or 0)
+        self.sample_weight += sample_weight(ctx)
+        self.sentence_count += _num(ctx.get("sentence_count"))
+        self.lower_starts += _num(ctx.get("lower_starts"))
+        self.upper_starts += _num(ctx.get("upper_starts"))
+        self.len_sum += _num(ctx.get("len_sum"))
+        self.contractions += _num(ctx.get("contractions"))
+        self.expansions += _num(ctx.get("expansions"))
         for i, n in enumerate(ctx.get("len_hist") or []):
             if i < LEN_HIST_SIZE:
-                self.len_hist[i] += int(n or 0)
+                self.len_hist[i] += _num(n)
         for keys_f, counts_f, target in (
             ("opener_keys", "opener_counts", self.openers),
             ("opener_phrase_keys", "opener_phrase_counts", self.opener_phrases),
             ("transition_keys", "transition_counts", self.transitions),
         ):
             for k, n in zip(ctx.get(keys_f) or [], ctx.get(counts_f) or [], strict=False):
-                target[k] = target.get(k, 0) + int(n or 0)
+                target[k] = target.get(k, 0) + _num(n)
+
+    def rescale(self, s: float) -> StyleAggregate:
+        """Divide every decayed count by ``s`` (= ``s(now)``: stored weights → effective recent
+        counts). ``sample_count`` is untouched. A no-op when ``s == 1``. Returns ``self``."""
+        if s == 1.0:
+            return self
+        for f in ("sample_weight", "sentence_count", "lower_starts", "upper_starts", "len_sum",
+                  "contractions", "expansions"):
+            setattr(self, f, getattr(self, f) / s)
+        self.len_hist = [n / s for n in self.len_hist]
+        for f in ("openers", "opener_phrases", "transitions", "words", "word_totals", "bigrams",
+                  "structures", "punctuation"):
+            setattr(self, f, {k: n / s for k, n in getattr(self, f).items()})
+        return self
+
+    @property
+    def freshness(self) -> float:
+        """Mean effective weight of a sample (1.0 = all written now / decay off)."""
+        if self.sample_count <= 0:
+            return 1.0
+        return self.sample_weight / self.sample_count
+
+
+def _num(v: Any) -> Any:
+    """A stored count as a number (int stays int, float stays float; never truncated)."""
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return v
+    return float(v or 0)
+
+
+def sample_weight(ctx: dict[str, Any]) -> Any:
+    """IntentContext's decayed sample count. Contexts written before decay existed have none and
+    count as written at ``t0`` (weight = ``sample_count``)."""
+    w = ctx.get("sample_weight")
+    return _num(w) if w is not None else int(ctx.get("sample_count") or 0)
 
 
 def context_delta(ex: Extraction) -> dict[str, Any]:
@@ -158,19 +208,19 @@ def _ranked(scores: dict[Any, float], k: int) -> list[Any]:
     return [key for key, _ in sorted(scores.items(), key=lambda kv: (-kv[1], str(kv[0])))[:k]]
 
 
-def _p90(hist: list[int], total: int) -> float:
+def _p90(hist: list[float], total: float) -> float:
     if total <= 0:
         return 0.0
     target = 0.9 * total
     acc = 0
     for i, n in enumerate(hist):
         acc += n
-        if acc >= target:
+        if acc >= target * (1 - FRESH_TOLERANCE):  # decayed counts: ignore float rounding
             return float(i)
     return float(len(hist) - 1)
 
 
-def _shares(d: dict[Any, int], total: int) -> dict[Any, float]:
+def _shares(d: dict[Any, float], total: float) -> dict[Any, float]:
     return {key: n / total for key, n in d.items() if n > 0} if total > 0 else {}
 
 
@@ -181,15 +231,26 @@ def _blend_dicts(
     return {key: alpha * p.get(key, 0.0) + (1 - alpha) * g.get(key, 0.0) for key in keys}
 
 
+def _threshold(a: StyleAggregate, min_count: int) -> float:
+    """``min_count`` raw occurrences as an effective count of aggregate ``a``: scaled by its
+    freshness (see module docstring). ``min_count <= 1`` means "any occurrence" → 0."""
+    if min_count <= 1:
+        return 0.0
+    return min_count * a.freshness * (1 - FRESH_TOLERANCE)
+
+
 def _blend_counts(
     p: StyleAggregate, g: StyleAggregate, attr: str, alpha: float, min_count: int = 1
 ) -> dict[Any, float]:
-    """Blended per-sentence shares of ``p.<attr>`` / ``g.<attr>`` (see module docstring)."""
+    """Blended per-sentence shares of ``p.<attr>`` / ``g.<attr>`` (see module docstring). An item
+    needs ``min_count`` occurrences in the persona's or in the global data (each threshold scaled
+    by that aggregate's freshness)."""
     pc, gc = getattr(p, attr), getattr(g, attr)
     persona_only = p is not g and p.sample_count >= BLEND_PRIOR
     out = _blend_dicts(_shares(pc, p.sentence_count), _shares(gc, g.sentence_count), alpha, persona_only)
     if min_count > 1:
-        out = {key: v for key, v in out.items() if max(pc.get(key, 0), gc.get(key, 0)) >= min_count}
+        tp, tg = _threshold(p, min_count), _threshold(g, min_count)
+        out = {key: v for key, v in out.items() if pc.get(key, 0) >= tp or gc.get(key, 0) >= tg}
     return out
 
 
@@ -219,7 +280,7 @@ def is_lexicon_word(w: str) -> bool:
 
 def _lexicon(p: StyleAggregate, g: StyleAggregate, k: int) -> list[str]:
     distinct = g.sample_count > p.sample_count and p.len_sum > 0 and g.len_sum > 0
-    min_count = _min_count(p)
+    min_count = _threshold(p, _min_count(p))
     scores: dict[str, float] = {}
     for w, n in p.words.items():
         if n < min_count or not is_lexicon_word(w):
@@ -278,17 +339,19 @@ def compute_constraints(agg: StyleAggregate, k: int = 20, global_agg: StyleAggre
         c["avg_sentence_len"] = round(_mix(avg(p), avg(g), alpha), 2)
         c["sentence_len_p90"] = round(_mix(p90(p), p90(g), alpha), 1)
         lower_share = _mix(lower(p), lower(g), alpha)
-        c["casing"] = "lower" if lower_share >= 0.6 else "sentence" if lower_share <= 0.2 else "mixed"
+        eps = FRESH_TOLERANCE  # decayed counts: a share on a boundary must not flip on float rounding
+        c["casing"] = "lower" if lower_share >= 0.6 - eps else "sentence" if lower_share <= 0.2 + eps else "mixed"
         rates = _blend_counts(p, g, "punctuation", alpha)
         c["punctuation_rates"] = {sym: round(r, 3) for sym, r in sorted(rates.items()) if r > 0}
     c["contractions_rate"] = round(_mix(contr(p), contr(g), alpha), 3)
     c["top_openers"] = _openers(p, g, alpha, min(k, 8))
     trans = _blend_counts(p, g, "transitions", alpha, _min_count(p))
     c["top_transitions"] = _ranked(trans, min(k, 8))
+    bigram_min = _threshold(p, _min_count(p))
     c["top_bigrams"] = [
-        [a, b, float(n)]
+        [a, b, round(float(n), 3)]
         for (a, b), n in sorted(p.bigrams.items(), key=lambda kv: (-kv[1], kv[0]))
-        if n >= _min_count(p)
+        if n >= bigram_min
     ][:k]
     structs = _blend_counts(p, g, "structures", alpha)
     c["structures"] = [{"signature": s, "weight": round(structs[s], 4)} for s in _ranked(structs, k)]

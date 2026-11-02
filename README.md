@@ -146,6 +146,18 @@ and pet words you remove go on a "do not use" list. The sent text itself is neve
 partly Polytone's), so the style graph and samples are untouched. `GET /learning` shows what is
 currently being corrected; deleting a persona or wiping data clears its corrections.
 
+### Recent writing counts most
+
+Your style drifts, so the style graph forgets slowly: every habit it learned (a word, an opener, a
+punctuation mark, how long your sentences are) is weighted by how recently you wrote it, with a half-life of
+`POLYTONE_DECAY_HALF_LIFE_DAYS` (default 90 days: something you wrote three months ago counts half as much as
+something you wrote today, six months ago a quarter). Nothing has to be re-learned and nothing is rewritten on
+each read — and if you simply stop writing for a while, your style stays exactly as it was, since only the
+*relative* age of your samples matters. Once a day (and at start-up) the backend drops word pairs that have
+faded to almost nothing, so long-abandoned habits also stop taking up space. Set the variable to `0` to give
+every sample the same weight forever. Changing it later is safe: the graph is converted to the new half-life
+at the next start.
+
 ## Style score
 
 `evaluation/style_distance.py` compares a draft with the persona's human samples on sentence length,
@@ -162,7 +174,7 @@ has been downloaded). Run `uv run python -m backend.evaluation.calibrate` for sa
 `.env` (see `.env.example`): `ANTHROPIC_API_KEY`, `POLYTONE_MODEL` (default `claude-sonnet-5-5`),
 `POLYTONE_LLM` (`anthropic`/`mock`), `POLYTONE_EFFORT` (`low` default; higher = more thinking, slower drafts), `NEO4J_*`, `POLYTONE_API_PORT` (8765), `POLYTONE_DATA_DIR`,
 `POLYTONE_WATCH_DIR`, `POLYTONE_USER_EMAILS`, `POLYTONE_WISPR_LOCAL`, `POLYTONE_WISPR_LIVE`, `POLYTONE_WATCHER`,
-`POLYTONE_EMBEDDINGS` (`qwen`/`none`), `GMAIL_*`, `WISPR_*`, `POLYTONE_API_TOKEN` (normally set by the app),
+`POLYTONE_EMBEDDINGS` (`qwen`/`none`), `POLYTONE_DECAY_HALF_LIFE_DAYS` (90; 0 = no recency weighting), `GMAIL_*`, `WISPR_*`, `POLYTONE_API_TOKEN` (normally set by the app),
 `POLYTONE_DATA_KEY` (base64 32-byte key overriding the Keychain — tests/CI only). App-side variables: `POLYTONE_REPO` (backend
 location for a bundled app) and `POLYTONE_START_HIDDEN=1` (start in the menu bar only; the window still opens when permissions are missing).
 

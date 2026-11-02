@@ -33,6 +33,10 @@ class Settings(BaseSettings):
 
     polytone_embeddings: str = "qwen"  # "qwen" | "none"
 
+    # recency weighting of the style graph (graph/decay.py): an occurrence this many days old
+    # counts half as much as one written now. 0 disables decay (every occurrence counts the same).
+    polytone_decay_half_life_days: float = 90.0
+
     @property
     def llm_backend(self) -> str:
         if self.polytone_llm in ("mock", "anthropic"):

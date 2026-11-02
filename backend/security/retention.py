@@ -3,6 +3,9 @@
 - ``purge(rt)``: config ``retention_days`` (0 = keep forever) → delete ``typed``/``wispr``
   samples, ``draft_edits`` and ``drafts`` older than N days. The style graph keeps its aggregates.
   Runs at server start and then daily (``RetentionTask``). Audited as ``data.retention_purge``.
+- ``graph_maintenance(rt)``: the style graph's recency decay upkeep (``GraphStore.decay_maintenance``:
+  rebase the epoch when due, prune edges that faded away; ``graph/decay.py``). Same schedule,
+  audited as ``graph.decay_maintenance`` with counts only, when it changed something.
 - ``wipe(rt, actor)``: delete every sample, draft, draft edit and the whole style graph, VACUUM
   the database and drop in-memory copies (decryption memo, few-shot caches). Audited as ``data.wipe``.
 """
@@ -65,8 +68,22 @@ def _forget_memory() -> None:
         crypto._dcache.clear()
 
 
+def graph_maintenance(rt: Any) -> dict[str, int]:
+    """Run the graph's decay maintenance; never raises (the server keeps running)."""
+    try:
+        out = dict(rt.store.decay_maintenance() or {})
+    except Exception as e:  # noqa: BLE001 - e.g. Neo4j went away; try again next round
+        log.warning("graph decay maintenance failed: %s", e.__class__.__name__)
+        return {}
+    if any(out.values()):
+        half_life = getattr(getattr(rt.store, "decay", None), "half_life_days", 0)
+        rt.audit_event("graph.decay_maintenance", {"half_life_days": half_life, **out})
+        log.info("graph decay maintenance: %s", out)
+    return out
+
+
 class RetentionTask:
-    """Purge now, then every ``interval_s`` until ``stop()``."""
+    """Purge and graph maintenance now, then every ``interval_s`` until ``stop()``."""
 
     def __init__(self, rt: Any, interval_s: float = DAY_S) -> None:
         self.rt = rt
@@ -79,12 +96,14 @@ class RetentionTask:
         return self
 
     def _run(self) -> None:
-        while not self._stop.is_set():
+        while True:  # the first round always runs, even when stop() came right after start()
             try:
                 purge(self.rt)
             except Exception as e:  # noqa: BLE001 - try again next round
                 log.warning("retention purge failed: %s", e.__class__.__name__)
-            self._stop.wait(self.interval_s)
+            graph_maintenance(self.rt)
+            if self._stop.wait(self.interval_s):
+                break
 
     def stop(self) -> None:
         self._stop.set()
