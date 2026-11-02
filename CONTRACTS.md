@@ -379,7 +379,7 @@ an attacker running as the same user with the Polytone window unlocked, or root.
   linger; Neo4j: batches of 2000 nodes, one write transaction each, selecting only unmigrated nodes
   (`Word.key IS NULL`, `IntentContext.opener_texts IS NULL`), then drops `word_text` and sets the
   `PolytoneMeta` marker (resumable after a crash). Neo4j does not compact store files, so freed plaintext
-  pages may persist until reused (documented in the README). SQLite runs with `secure_delete=ON`.
+  pages may persist until reused (documented in docs/ARCHITECTURE.md). SQLite runs with `secure_delete=ON`.
 - Embedding vectors are never stored (in-memory cache only).
 
 ### Local API auth (backend ↔ Rust ↔ UI)
