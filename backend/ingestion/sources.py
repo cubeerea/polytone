@@ -185,6 +185,12 @@ def _learn_from_edit(rt: Runtime, text: str, app: str | None) -> bool:
         return False
     draft = match[0]
     try:
+        from backend.learning.outcomes import edit_outcome
+
+        rt.db.set_draft_outcome(draft["draft_id"], edit_outcome(draft["text"], text))
+    except Exception as e:  # noqa: BLE001 - the outcome label is a bonus
+        log.warning("draft outcome update failed: %s", type(e).__name__)
+    try:
         edits.learn_edit(rt.db, draft["persona"], draft["text"], text)
     except Exception as e:  # noqa: BLE001 - never fail the capture request over learning
         log.warning("edit learning failed: %s", type(e).__name__)

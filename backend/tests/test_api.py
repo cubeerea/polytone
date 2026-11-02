@@ -59,7 +59,7 @@ def test_generate_and_drafts(client):
     assert "Sam" in body["text"] and isinstance(body["latency_ms"], int)
     drafts = client.get("/drafts?limit=5").json()
     assert drafts[0]["draft_id"] == body["draft_id"]
-    assert set(drafts[0]) == {"draft_id", "created_at", "persona", "intent", "text", "latency_ms", "score"}
+    assert set(drafts[0]) == {"draft_id", "created_at", "persona", "intent", "text", "latency_ms", "score", "outcome"}
     assert client.post("/generate", json={"intent": "  \n - "}).status_code == 422
     assert client.post("/generate", json={}).status_code == 422
 
@@ -156,6 +156,7 @@ def test_config(client):
     from backend.storage.db import DEFAULT_CAPTURE_APPS
 
     cap = {"capture_enabled": False, "capture_apps": DEFAULT_CAPTURE_APPS, "lock_idle_minutes": 15, "retention_days": 0,
+           "learning_eval_days": 7,
            "draft_speed": "quality"}
     assert client.get("/config").json() == {
         "active_persona": "Default", "hotkey": "CmdOrCtrl+Shift+P", "inject_mode": "paste", **cap}

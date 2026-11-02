@@ -68,6 +68,8 @@ export interface AppConfig {
   retention_days?: number;
   /** "quality" (Claude Sonnet) or "fast" (Claude Haiku: ~40% quicker, a little less literal). Optional: older engines omit it. */
   draft_speed?: DraftSpeed;
+  /** Days between automatic learning evaluations (0 = only "Evaluate now"). Optional: older engines omit it. */
+  learning_eval_days?: number;
 }
 
 export type DraftSpeed = "quality" | "fast";
@@ -122,6 +124,63 @@ export interface Draft {
   text: string;
   latency_ms: number;
   score: ScoreBreakdown | null;
+  /** What happened to it after it was shown. Optional: older engines omit it. */
+  outcome?: DraftOutcome | null;
+}
+
+export type DraftOutcome = "accepted" | "regenerated" | "discarded" | "edited";
+
+export type LearningMode = "normal" | "pinned" | "corrections_paused";
+
+export interface LearningState {
+  mode: LearningMode;
+  /** The pinned snapshot (mode "pinned"). */
+  snapshot_id: number | null;
+  since: string | null;
+}
+
+export type EvaluationStatus = "accepted" | "rolled_back" | "corrections_paused";
+
+export interface Evaluation {
+  id: number;
+  created_at: string;
+  status: EvaluationStatus;
+  decision: "current" | "no_corrections" | "previous" | null;
+  incumbent: string | null;
+  /** 0-100 style match of the rules generation uses after this evaluation. */
+  score: number | null;
+  scores: { current?: number; no_corrections?: number; previous?: number };
+  holdout: number | null;
+  trigger: string | null;
+}
+
+export interface EvaluationResult {
+  persona: string;
+  status: EvaluationStatus | "skipped" | "failed";
+  reason: string | null;
+  scores: Evaluation["scores"];
+  state?: LearningState;
+}
+
+export interface LearningDelta {
+  value: number;
+  edits: number;
+}
+
+/** GET /learning: what edit learning corrects, plus the evaluation state (additive fields). */
+export interface LearningSummary {
+  persona: string;
+  edits_learned: number;
+  min_edits: number;
+  sentence_len_delta: LearningDelta | null;
+  contractions_delta: LearningDelta | null;
+  lowercase_delta: LearningDelta | null;
+  punctuation: Record<string, LearningDelta>;
+  avoid_words: string[];
+  state?: LearningState;
+  last_evaluation?: Evaluation | null;
+  eval_every_days?: number;
+  min_holdout?: number;
 }
 
 export interface ScoresSummary {
@@ -307,6 +366,23 @@ export const api = {
   drafts: (limit = 50) => request<Draft[]>(`/drafts?limit=${limit}`),
 
   scoresSummary: () => request<ScoresSummary>("/scores/summary"),
+
+  learning: (persona: string) => request<LearningSummary>(`/learning?persona=${encodeURIComponent(persona)}`),
+
+  evaluations: (persona: string, limit = 20) =>
+    request<{ persona: string; evaluations: Evaluation[] }>(
+      `/learning/evaluations?persona=${encodeURIComponent(persona)}&limit=${limit}`,
+    ),
+
+  /** Up to 3 × 6 model calls with a real model: allow time. */
+  evaluateLearning: (persona: string) =>
+    request<EvaluationResult>("/learning/evaluate", { method: "POST", body: { persona }, timeoutMs: 180_000 }),
+
+  /** Undo a rollback pin or a corrections pause. */
+  clearLearningState: (persona: string) =>
+    request<{ persona: string; state: LearningState }>(`/learning/state?persona=${encodeURIComponent(persona)}`, {
+      method: "DELETE",
+    }),
 
   graph: (limit = 60, persona = "") =>
     request<GraphData>(`/graph?limit=${limit}&persona=${encodeURIComponent(persona)}`),

@@ -36,6 +36,8 @@ Every component builds against this file. Change it only with the orchestrator's
 3. Rust → `POST /generate`.
 4. Rust inject: put draft on clipboard, send Cmd+V (field text is still selected, so it is replaced),
    then restore the original clipboard after ~300ms. Fallback `inject_mode=type` types chars via enigo.
+   Once the draft is in the field Rust fires `POST /drafts/{draft_id}/outcome {"outcome":"accepted"}` on a
+   background task (never awaited by the loop; failures are logged at debug level).
 5. End-to-end budget: 5s. Rust HTTP timeout 8s → notification "Polytone timed out".
 6. `/generate` errors → Rust shows a notification and injects NOTHING (field text untouched):
    `502 {"error":"llm_failed","detail":str}` (LLM error, empty completion, or `POLYTONE_LLM=anthropic`
@@ -61,12 +63,16 @@ with `403 {"detail":"app token required"}`. See Security → Local API auth.
 | GET | `/personas` | – | `[{"name","description","builtin":bool,"edited":bool,"samples":int}]`: built-ins (Default, Boss, Friend, Investor) first, then the user's in creation order, then names that only appear on samples |
 | POST | `/personas` | `{"name":str,"description":str}` | the new persona. 400 bad name (1–30 chars: letters, digits, spaces, `- ' & . ( ) +`) or tone (1–300 chars); 409 duplicate (case-insensitive) or more than 24 of the user's own |
 | PUT | `/personas/{name}` | `{"description":str\|null}` | the persona. `null` resets a built-in to Polytone's wording; 404 unknown |
-| DELETE | `/personas/{name}` | – | `{"name","moved_samples":int,"active_persona":str}`. Its samples **and its style-graph learning move to Default** (all-persona totals unchanged); Default becomes active if it was. 400 built-in; 404 unknown; 503 graph unreachable (nothing changed) |
+| DELETE | `/personas/{name}` | – | `{"name","moved_samples":int,"active_persona":str}`. Its samples **and its style-graph learning move to Default** (all-persona totals unchanged); Default becomes active if it was. Its edit corrections, learning snapshots and pin / pause are deleted. 400 built-in; 404 unknown; 503 graph unreachable (nothing changed) |
 | POST | `/warm` | – | `{"ok":true,"started":bool}` — Rust calls it when the hotkey goes down so the engine re-opens its model-API connection (free `GET /v1/models/{id}`, own thread) while the selection is captured. `started` false = connection already fresh (< 20 s since the API last answered), one in flight, or the mock LLM. Never fails because of the network. |
-| GET/PUT | `/config` | `{"active_persona":str,"hotkey":str,"inject_mode":"paste"\|"type","draft_speed":"quality"\|"fast" /*default quality*/,"capture_enabled":bool,"capture_apps":[str],"lock_idle_minutes":int /*1–240, default 15*/,"retention_days":int /*0–3650, 0 = keep forever (default)*/}` (PUT: every field optional, omitted = unchanged; out of range → 422; setting a non-zero `retention_days` purges at once) | same (full config) |
-| GET | `/drafts?limit=50` | – | `[{"draft_id","created_at","persona","intent","text","latency_ms","score":ScoreBreakdown\|null}]` |
+| GET/PUT | `/config` | `{"active_persona":str,"hotkey":str,"inject_mode":"paste"\|"type","draft_speed":"quality"\|"fast" /*default quality*/,"capture_enabled":bool,"capture_apps":[str],"lock_idle_minutes":int /*1–240, default 15*/,"retention_days":int /*0–3650, 0 = keep forever (default)*/,"learning_eval_days":int /*0–90, default 7; 0 = evaluate only on demand*/}` (PUT: every field optional, omitted = unchanged; out of range → 422; setting a non-zero `retention_days` purges at once) | same (full config) |
+| GET | `/drafts?limit=50` | – | `[{"draft_id","created_at","persona","intent","text","latency_ms","score":ScoreBreakdown\|null,"outcome":DraftOutcome\|null}]` |
+| POST | `/drafts/{draft_id}/outcome` | `{"outcome":"accepted"\|"regenerated"\|"discarded"\|"edited"}` | `{"draft_id","outcome"}` = the outcome now stored (a lower-rank outcome never replaces a higher one: `accepted` < `regenerated` = `discarded` < `edited`). Other values → 422; unknown draft → 404. See "Learning evaluation and draft outcomes" |
 | GET | `/scores/summary` | – | `{"mean":float\|null,"count":int,"trend":[{"t":iso,"score":float}]}` |
-| GET | `/learning` | `?persona=` (default: active) | edit learning for the persona: `{"persona","edits_learned","min_edits","sentence_len_delta","contractions_delta","lowercase_delta":{"value","edits"}\|null,"punctuation":{mark:{"value","edits"}},"avoid_words":[str]}` |
+| GET | `/learning` | `?persona=` (default: active) | edit learning for the persona: `{"persona","edits_learned","min_edits","sentence_len_delta","contractions_delta","lowercase_delta":{"value","edits"}\|null,"punctuation":{mark:{"value","edits"}},"avoid_words":[str]}` plus (additive) the evaluation state: `"state":LearningState,"last_evaluation":Evaluation\|null,"eval_every_days":int,"min_holdout":int` |
+| GET | `/learning/evaluations` | `?persona=` (default: active) `&limit=20` (1–200) | `{"persona","evaluations":[Evaluation] /*newest first*/}` |
+| POST | `/learning/evaluate` | `{"persona":str\|null}` (body optional; default: active) | `EvaluationResult`; `409` while another evaluation runs. Synchronous: up to 3 × 6 model calls |
+| DELETE | `/learning/state` | `?persona=` (default: active) | `{"persona","state":LearningState}` — undo a rollback pin or a corrections pause by hand (audited `learning.state_cleared`) |
 | GET | `/graph?limit=60&persona=` | – | `{"nodes":[{"id":str,"label":"Word"\|"SentenceStructure"\|"PunctuationMark"\|"IntentContext","name":str,"weight":float}],"edges":[{"source":str,"target":str,"type":"FOLLOWED_BY"\|"PART_OF_STRUCTURE"\|"USED_IN","weight":float}]}` |
 | GET | `/stats` | – | `{"words":int,"structures":int,"samples":int,"avg_sentence_len":float\|null}` |
 | POST | `/session` *app* | – | `{"token":str,"idle_timeout_s":int,"expires_at":iso /*absolute cap: now + 12 h*/}` |
@@ -75,7 +81,7 @@ with `403 {"detail":"app token required"}`. See Security → Local API auth.
 | GET | `/audit?limit=100&before_seq=` | – | `{"entries":[{"seq","ts","event","actor","detail","prev","mac"}] /*newest first*/,"head_seq":int}` |
 | GET | `/audit/verify` | – | `{"ok":bool,"count":int,"first_bad_seq":int\|null,"reason":str\|null}` |
 | POST | `/audit/event` *app* | `{"event":str /*e.g. "session.unlock_failed"; [a-z0-9_.]*/,"detail":{}}` | `{"seq":int}` (actor `app`) |
-| POST | `/data/wipe` | `{"confirm":"delete everything"}` (anything else → 400) | `{"deleted":{"samples":int,"drafts":int,"draft_edits":int,"corrections":int,"graph_nodes":int}}` |
+| POST | `/data/wipe` | `{"confirm":"delete everything"}` (anything else → 400) | `{"deleted":{"samples":int,"drafts":int,"draft_edits":int,"corrections":int,"constraint_snapshots":int,"graph_nodes":int}}` (learning overrides are deleted too) |
 
 Persona names are matched case-insensitively everywhere (`/ingest/*`, `/generate`, `PUT /config`) and stored in the persona's own spelling; `PUT /config` rejects an `active_persona` that isn't a persona (422). Ingest and persona create/delete are serialised, so a sample never lands half-moved.
 
@@ -96,6 +102,48 @@ Signature format `LEN|<n>c|<skeleton>|<opener>|<end>`, e.g. `M|2c|,—|conj|.` (
 `IngestResult` = `{"accepted":int,"rejected":int,"reasons":[str],"sentences":int,"words_merged":int}`
 
 `ScoreBreakdown` = `{"score":float /*0-100, 100 = identical style*/,"distance":float /*0-1*/,"components":{"sentence_length":float,"punctuation":float,"lexical":float,"function_words":float,"embedding":float|null},"confidence":"low"|"medium"|"high" /*additive: trust in the number given baseline size + draft length*/}`
+
+`DraftOutcome` = `"accepted"|"regenerated"|"discarded"|"edited"`
+
+`LearningState` = `{"mode":"normal"|"pinned"|"corrections_paused","snapshot_id":int|null /*pinned snapshot*/,"since":iso|null}`
+
+`Evaluation` = `{"id":int,"created_at":iso,"status":"accepted"|"rolled_back"|"corrections_paused","decision":"current"|"no_corrections"|"previous","incumbent":str,"score":float /*0-100 match of the winner*/,"scores":{"current":float,"no_corrections":float,"previous"?:float},"holdout":int,"trigger":"manual"|"scheduled"}`
+
+`EvaluationResult` = `{"persona","status":"accepted"|"rolled_back"|"corrections_paused"|"skipped"|"failed","reason":str|null /*why skipped/failed*/,"snapshot_id":int|null,"decision":str|null,"incumbent"?:str,"scores":{...},"holdout":int,"llm_calls":int,"margin":float,"state":LearningState}`
+
+## Learning evaluation and draft outcomes (`backend/learning/evaluate.py`, `state.py`, `outcomes.py`)
+
+- **Harness**: 6 fixed neutral intents (`evaluate.INTENTS`, no user text). Holdout = the persona's newest 20
+  samples (they are also in the graph, so absolute scores flatter every candidate equally; only the comparison
+  between candidates is used). Fewer than 5 → `skipped`. Candidates: `current` (graph + edit corrections),
+  `no_corrections` (graph only), `previous` (the newest `accepted` snapshot, if any). Each candidate's prompt is
+  built exactly like `/generate` (`select_examples` → `build_system_parts`/`build_user_prompt`, persona tone,
+  `draft_speed` model), generated with `rt.llm`, post-processed, scored with `style_distance.score(…,
+  use_embeddings=False)` against the holdout; candidate score = mean over the intents. Identical prompts are
+  generated once. Evaluation drafts are never stored. A model failure → `failed`, nothing recorded.
+- **Decision** (margin 2 points, hysteresis): the incumbent is the candidate generation uses now (`current` when
+  normal, `previous` when pinned, `no_corrections` when paused). The best other candidate replaces it only if it
+  scores ≥ incumbent + 2. Winner `current` → status `accepted` (override cleared; this snapshot becomes the next
+  `previous`); `previous` → `rolled_back` (state `pinned` to that snapshot); `no_corrections` →
+  `corrections_paused`. Ties and small differences never change the state.
+- **Generation**: `retrieve_constraints` → `learning/state.effective`: `pinned` → the snapshot's constraints;
+  `corrections_paused` → graph constraints without corrections; else graph + corrections. The state is cached in
+  process per persona and invalidated on every change (evaluation, `DELETE /learning/state`, persona delete,
+  wipe). An unreadable state / missing or undecryptable snapshot → normal, with a warning; never a failed draft.
+- **Schedule**: a background task (started with the server) checks 10 min after start and then every 24 h; it
+  evaluates a persona only when it has ≥ 5 samples, its last evaluation is ≥ `learning_eval_days` old (config,
+  default 7; 0 = never automatically) **and** it gained a sample (`samples.id` watermark) or a learned edit
+  since. No LLM configured (mock while `POLYTONE_LLM=anthropic`) → nothing runs. On demand: `POST /learning/evaluate`.
+- **Draft outcomes** (`drafts.outcome`, nullable; rank `accepted` < `regenerated` = `discarded` < `edited`):
+  `accepted` — Rust after an inject; `regenerated` — `/generate` whose intent is (≥ 80% shingle containment
+  both ways) a draft of the last 10 min, i.e. the hotkey re-run on the injected draft (checked off the request
+  thread); `edited` — typing capture matched a post-inject send to the draft and it differs (an identical
+  send keeps `accepted`); `discarded` — accepted by the endpoint, no client sends it yet.
+- **Outcome-weighted few-shots** (`langgraph/examples.py`): excerpt score −= 0.25 × share of its sentences whose
+  structure signature is among the 12 most frequent signatures of what the user kept from the persona's 30
+  newest accepted/edited drafts (the draft text for `accepted`, the sent message for `edited`). Only
+  signatures are read from drafts; excerpts still come only from `samples` and are still re-checked against
+  drafts. Cached per (db, persona, `Database.outcome_version`).
 
 ## Typing capture (source `typed`; opt-in, default OFF, local only)
 
@@ -196,7 +244,7 @@ Learns from messages the user types and **sends** in allowlisted native apps.
 ## Python module boundaries (backend/)
 
 - `config.py` — `Settings`, `get_settings()`.
-- `storage/db.py` — SQLite (`data/polytone.sqlite3`): tables `config`, `drafts`, `samples` (ingested human text + provenance + blind index in column `sha256`), `ingest_runs`, `draft_edits` (post-inject sends; the text is never learned, only its diff from the matched draft), `corrections` (edit learning: per persona `(feature, key)` → smoothed delta + edit count; word keys are blind indexes, words `enc1:`). User-text columns are `enc1:` ciphertext, decrypted on read (see Security). `Database(path)` methods documented in that file (the old module-level wrappers are gone; use `Runtime.db`). One persistent connection per thread, WAL + `synchronous=NORMAL`; `draft_watermark()`/`drafts_since(rowid)`/`samples_watermark()` let in-process caches stay exact across processes.
+- `storage/db.py` — SQLite (`data/polytone.sqlite3`): tables `config`, `drafts`, `samples` (ingested human text + provenance + blind index in column `sha256`), `ingest_runs`, `draft_edits` (post-inject sends; the text is never learned, only its diff from the matched draft), `corrections` (edit learning: per persona `(feature, key)` → smoothed delta + edit count; word keys are blind indexes, words `enc1:`), `constraint_snapshots` (`id, persona, created_at, kind, constraints_json` (`enc1:`), `score, eval_json` (numbers/labels only, plain)`, status`), `learning_state` (`persona, mode, snapshot_id, updated_at`; no row = normal). Columns added after a table shipped are added by `Database.init` (`_ADDED_COLUMNS`, idempotent `ALTER TABLE … ADD COLUMN`): `drafts.outcome`. User-text columns are `enc1:` ciphertext, decrypted on read (see Security). `Database(path)` methods documented in that file (the old module-level wrappers are gone; use `Runtime.db`). One persistent connection per thread, WAL + `synchronous=NORMAL`; `draft_watermark()`/`drafts_since(rowid)`/`samples_watermark()` let in-process caches stay exact across processes.
 - `graph/store.py` — `GraphStore` protocol + `Neo4jGraphStore` + `InMemoryGraphStore` (tests). Cypher templates live in `graph/queries.py`; write trimming in `graph/trim.py`; recency decay (scale, rebase, prune constants, `RebaseLock`) in `graph/decay.py`.
 - `ingestion/extract.py` — `extract(text) -> Extraction` (pure python, deterministic, no network). Triplets: Word FOLLOWED_BY Word (weight), Word PART_OF_STRUCTURE SentenceStructure, SentenceStructure USED_IN IntentContext, PunctuationMark nodes.
 - `ingestion/firewall.py` — `HumanText` provenance gate; every rejection returns a reason string. Rejects: empty,
@@ -315,7 +363,8 @@ an attacker running as the same user with the Polytone window unlocked, or root.
   and `samples`: the firewall compares them). Neo4j contexts: `neo4j:Word.text`, `neo4j:IntentContext.<keys prop>`.
 - Every column/property holding user text is encrypted: SQLite `drafts.intent/text/constraints_json`
   (constraints carry lexicon/openers/bigrams), `samples.text`, `samples.provenance_json` (always),
-  `draft_edits.text`, and Neo4j `Word.text` + IntentContext opener/phrase/transition lists (lookup key =
+  `draft_edits.text`, `corrections.text`, `constraint_snapshots.constraints_json` (a snapshot holds lexicon,
+  openers, bigrams, avoid words), and Neo4j `Word.text` + IntentContext opener/phrase/transition lists (lookup key =
   blind index, display value = ciphertext; bigrams are relationships between keyed Words). Counts,
   timestamps, persona names, structure signatures, punctuation symbols, `drafts.score_json`, app bundle
   ids, config, cursors and `watcher_files` (file hashes + paths) stay plain.
@@ -377,7 +426,9 @@ an attacker running as the same user with the Polytone window unlocked, or root.
 - Events (at least): `session.unlock`, `session.unlock_failed`, `session.lock`, `session.expired`,
   `auth.denied`, `generate` (persona, chars in/out, model, latency), `ingest` (source, accepted/rejected),
   `config.change` (keys changed, not values of secrets), `capture.start`/`capture.stop`,
-  `data.wipe`, `data.retention_purge`, `graph.decay_maintenance`, `key.created`, `migration.encrypted`.
+  `data.wipe`, `data.retention_purge`, `graph.decay_maintenance`, `key.created`, `migration.encrypted`,
+  `learning.evaluate` (persona, status, incumbent, trigger, per-candidate scores, holdout count, llm
+  calls, snapshot id), `learning.state_cleared` (persona, previous mode).
   Backend emitters: `session.unlock` (`POST /session`), `session.lock` (`DELETE /session[/current]`,
   detail `reason` `app`|`user`), `session.expired` (detail `reason` `idle`|`max_age`), `auth.denied`
   (rate-limited to one row per 60 s with a `count`), `generate` (also failures: `ok:false, error`),
@@ -424,8 +475,10 @@ an attacker running as the same user with the Polytone window unlocked, or root.
 ### Retention and files
 - Config `retention_days` (0 = keep forever, default 0, max 3650): purge at server start, then every
   24 h, and right after `PUT /config` sets a non-zero value — `samples` from `typed`/`wispr`, `draft_edits`
-  and `drafts` older than N days (by `created_at`; style graph aggregates stay). `POST /data/wipe`
-  `{"confirm":"delete everything"}` deletes all samples, drafts, draft_edits, corrections and the style graph, VACUUMs,
+  and `drafts` older than N days (by `created_at`; style graph aggregates stay, and so do learning snapshots:
+  derived constraints like the graph's, encrypted). `POST /data/wipe`
+  `{"confirm":"delete everything"}` deletes all samples, drafts, draft_edits, corrections, learning snapshots and
+  overrides and the style graph, VACUUMs,
   and clears in-memory copies (decryption memo, few-shot caches). Both audited. (Ingest cursors such as
   `wispr.history_rowid` are kept, so wiped history is not re-imported.) The same daily task runs the style
   graph's decay maintenance (rebase + prune; see Neo4j schema → Recency decay).

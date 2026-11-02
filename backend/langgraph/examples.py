@@ -11,22 +11,32 @@ Selection (deterministic):
                             + 0.5 · |avg sentence len − persona avg| / persona avg
                             − 0.5 · share of the excerpt's sentences whose structure signature
                                     is among the persona's top-5 structures
+                            − 0.25 · share of its sentences whose signature appears in what the
+                                    user KEPT of recent drafts (outcome ``accepted``: the draft;
+                                    ``edited``: the message actually sent) — ``OUTCOME_BOOST``
 3. Greedy pick by score: at most one excerpt per sample, no two with the same opener.
 
-Memo: the result is cached per (database, persona, target length, avg, top structures, k,
-samples watermark). Drafts are append-only and only ever *remove* candidates, so a cached
+The outcome boost only re-ranks excerpts of the user's own samples: drafts are never candidates
+(only their structure signatures are read), and the draft re-check below still applies.
+Its signature set is cached per (database, persona, ``Database.outcome_version``).
+
+Memo: the result is cached per (database, persona, target length, avg, top structures, outcome
+signatures, k, samples watermark). Drafts are append-only and only ever *remove* candidates, so a cached
 pick stays exactly right as long as each chosen excerpt still passes against the drafts
 added since — that is all a cache hit re-checks (a new sample, or a deleted draft, recomputes).
 """
 from __future__ import annotations
 
+import logging
 import threading
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from typing import Any
 
 from backend.ingestion.extract import signature
 from backend.ingestion.firewall import draft_match_reason, draft_snapshot
 from backend.ingestion.text import clean_message, segment, token_spans, tokenize
+
+log = logging.getLogger(__name__)
 
 MAX_EXAMPLES = 3
 MIN_EXAMPLES = 2
@@ -34,6 +44,9 @@ MAX_EXCERPT_TOKENS = 40
 MIN_EXCERPT_TOKENS = 3
 MAX_EXCERPT_CHARS = 280
 SAMPLE_LIMIT = 200
+OUTCOME_BOOST = 0.25  # bounded: at most 0.25 off the score, half the top-structure term
+OUTCOME_DRAFTS = 30  # newest kept drafts read per persona
+OUTCOME_SIGS = 12  # most frequent signatures among them that get the boost
 
 # (excerpt text, token count, [signature per sentence], opener)
 Excerpt = tuple[str, int, tuple[str, ...], str]
@@ -45,6 +58,8 @@ _CACHE_SIZE = 4000
 # memo key -> (chosen excerpts, drafts snapshot rows object, drafts checked)
 _picks: OrderedDict[tuple, tuple[list[str], Any, int]] = OrderedDict()
 _PICKS_SIZE = 256
+# (db, persona, outcome_version) -> signatures of kept drafts
+_kept: OrderedDict[tuple, tuple[str, ...]] = OrderedDict()
 _gen = 0  # bumped by invalidate(): part of every picks key, so a selection racing it is never reused
 
 
@@ -54,6 +69,32 @@ def invalidate() -> None:
     with _cache_lock:
         _gen += 1
         _picks.clear()
+        _kept.clear()
+
+
+def _signatures(text: str) -> list[str]:
+    return [signature(seg.text, seg.bullet) for seg in segment(clean_message(text)) if token_spans(seg.text)]
+
+
+def kept_signatures(db: Any, persona: str | None) -> tuple[str, ...]:
+    """The ``OUTCOME_SIGS`` most frequent structure signatures of what the user kept from
+    ``persona``'s recent drafts (sorted; deterministic). Cached until an outcome changes."""
+    if not persona or not hasattr(db, "kept_draft_texts"):
+        return ()
+    key = (str(getattr(db, "path", id(db))), persona.lower(), getattr(db, "outcome_version", 0), _gen)
+    with _cache_lock:
+        hit = _kept.get(key)
+    if hit is not None:
+        return hit
+    counts: Counter[str] = Counter()
+    for text in db.kept_draft_texts(persona, OUTCOME_DRAFTS):
+        counts.update(_signatures(text))
+    top = tuple(sorted(sig for sig, _ in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:OUTCOME_SIGS]))
+    with _cache_lock:
+        _kept[key] = top
+        while len(_kept) > _PICKS_SIZE:
+            _kept.popitem(last=False)
+    return top
 
 
 def _excerpts_for(db_key: str, sample: dict[str, Any]) -> list[Excerpt]:
@@ -98,7 +139,12 @@ def select_examples(
     target = min(max(len(tokenize(intent)), 6), 30)
     avg = float(constraints.get("avg_sentence_len") or 0) or None
     top5 = tuple(s["signature"] for s in (constraints.get("structures") or [])[:5])
-    key = (db_key, persona or None, target, avg, top5, k, db.samples_watermark(), _gen)
+    try:
+        kept = kept_signatures(db, persona)
+    except Exception as e:  # noqa: BLE001 - the outcome boost is optional
+        log.warning("kept-draft signatures failed: %s", type(e).__name__)
+        kept = ()
+    key = (db_key, persona or None, target, avg, top5, kept, k, db.samples_watermark(), _gen)
     drafts = draft_snapshot(db)  # one sync for every draft check below
     with _cache_lock:
         hit = _picks.get(key)
@@ -110,7 +156,7 @@ def select_examples(
             with _cache_lock:
                 _picks[key] = (chosen, drafts.rows, drafts.n)
             return list(chosen)
-    chosen = _select(db, db_key, persona, target, avg, set(top5), k, drafts)
+    chosen = _select(db, db_key, persona, target, avg, set(top5), k, drafts, set(kept))
     with _cache_lock:
         _picks[key] = (chosen, drafts.rows, drafts.n)
         while len(_picks) > _PICKS_SIZE:
@@ -119,7 +165,8 @@ def select_examples(
 
 
 def _select(
-    db: Any, db_key: str, persona: str | None, target: int, avg: float | None, top_sigs: set[str], k: int, drafts: Any
+    db: Any, db_key: str, persona: str | None, target: int, avg: float | None, top_sigs: set[str], k: int, drafts: Any,
+    kept_sigs: set[str] | None = None,
 ) -> list[str]:
     samples = [s for s in db.list_samples(persona=persona, limit=SAMPLE_LIMIT) if _usable(s)] if persona else []
     pools = [samples]
@@ -138,6 +185,8 @@ def _select(
                     score += 0.5 * abs(n / len(sigs) - avg) / avg
                 if top_sigs:
                     score -= 0.5 * sum(sig in top_sigs for sig in sigs) / len(sigs)
+                if kept_sigs:
+                    score -= OUTCOME_BOOST * sum(sig in kept_sigs for sig in sigs) / len(sigs)
                 cands.append((round(score, 6), -int(s["id"]), text, ex))
         cands.sort(key=lambda c: (c[0], c[1], c[2]))
         used_samples: set[int] = set()

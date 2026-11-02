@@ -275,8 +275,8 @@ fn run_inner(
     };
     let generated = tauri::async_runtime::block_on(state.client.generate(&req));
     phases.mark("generate");
-    let draft = match generated {
-        Ok(r) => r.text,
+    let (draft, draft_id) = match generated {
+        Ok(r) => (r.text, r.draft_id),
         Err(e) => {
             let _ = restore_clipboard(clip, &cap.saved);
             return Err(LoopError::Backend(e));
@@ -290,6 +290,7 @@ fn run_inner(
     }
     phases.mark("paste");
     let visible = phases.elapsed();
+    report_accepted(app, draft_id);
 
     // A message sent from this app soon after is (an edit of) the draft: never learn style from it.
     if let Some(f) = &front {
@@ -308,6 +309,21 @@ fn warm_engine(app: &AppHandle) {
         let client = app.state::<AppState>().client.clone();
         if let Err(e) = client.warm().await {
             log::debug!("engine warm-up request failed (generation still works): {e}");
+        }
+    });
+}
+
+/// Background `POST /drafts/{id}/outcome {"outcome":"accepted"}`: the draft is in the field.
+/// Fire and forget (learning only; a failure is logged at debug level).
+fn report_accepted(app: &AppHandle, draft_id: String) {
+    if draft_id.is_empty() {
+        return;
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let client = app.state::<AppState>().client.clone();
+        if let Err(e) = client.draft_outcome(&draft_id, "accepted").await {
+            log::debug!("draft outcome not recorded: {e}");
         }
     });
 }
