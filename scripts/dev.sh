@@ -16,7 +16,7 @@ die()  { printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 for bin in pnpm cargo uv; do
-  command -v "$bin" >/dev/null || die "$bin not found on PATH (see README → Quick start)"
+  command -v "$bin" >/dev/null || die "$bin not found on PATH (see README → Requirements)"
 done
 
 # 1. Dependencies (cheap no-ops when already installed).

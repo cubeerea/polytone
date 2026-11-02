@@ -1,274 +1,252 @@
+<div align="center">
+
 # Polytone
 
-Polytone is a macOS menu-bar app that rewrites rough intent into **your own** writing style, in any app.
+**Write rough. Send it in your own voice.**
 
-Type something rough (`- tell dana launch on track, deck thurs`) in Slack, Mail, Notes or anywhere else,
-press **⌘⇧P**, and Polytone replaces it with a draft that sounds like you wrote it: your sentence
-length, your punctuation habits, your openers, your casing. It learns that style only from text you
-actually wrote yourself: text you paste in, your sent Gmail, raw Wispr Flow dictation, and files you drop
-into a folder. Every draft gets a 0–100 style score showing how close it sits to your real writing.
+A macOS menu-bar app that turns rough notes into messages that sound like you wrote them, in any app.
 
-Personas (Boss, Friend, Investor, Default, plus any tag you ingest samples under) keep separate
-registers. Writing to your manager and texting a friend shouldn't sound the same.
+[![CI](https://github.com/cubeerea/polytone/actions/workflows/ci.yml/badge.svg)](https://github.com/cubeerea/polytone/actions/workflows/ci.yml)
+![Platform: macOS](https://img.shields.io/badge/platform-macOS-lightgrey)
+![Status: early preview](https://img.shields.io/badge/status-early%20preview-orange)
 
-## Architecture
+[Quick start](#quick-start) · [Using Polytone](#using-polytone) · [Privacy](#privacy) · [Troubleshooting](#troubleshooting) · [Docs](#documentation)
+
+</div>
+
+---
+
+## What it does
+
+Type something rough in Slack, Mail, Notes, a browser or anywhere else:
 
 ```
- any app (Slack, Mail, …)                         Polytone.app  (Tauri v2, src-tauri/, Rust)
- ┌──────────────────────┐   ⌘⇧P   ┌──────────────────────────────────────────────────────────┐
- │ rough intent ▌       │ ──────▶ │ global hotkey → capture (⌘C / ⌘A⌘C, clipboard snapshot)   │
- │                      │ ◀────── │ inject (⌘V or typed) → restore clipboard                  │
- └──────────────────────┘  draft  │ menu-bar tray: persona · pause · open                     │
-                                  │ React UI (src/): Feed · Scoreboard · Graph · Settings     │
-                                  └───────────────┬──────────────────────────────────────────┘
-                                                  │ HTTP 127.0.0.1:8765  (autostarted: uv run polytone-api)
-                                  ┌───────────────▼──────────────────────────────────────────┐
-                                  │ Python backend (backend/, FastAPI)                        │
-                                  │  generate graph (LangGraph):                              │
-                                  │    capture → constraints → prompt → LLM → post → record → score
-                                  │  ingest graph:  validate → FIREWALL → extract → write_graph │
-                                  │  sources: manual · gmail (sent only) · wispr (raw) · watcher│
-                                  │  scorer: stylometric distance + optional Qwen3 embedding   │
-                                  └──────┬───────────────────────────────┬───────────────────┘
-                                         │ bolt :7687                    │
-                              ┌──────────▼─────────┐          ┌──────────▼──────────────┐
-                              │ Neo4j (docker)     │          │ SQLite data/            │
-                              │ style graph: Word, │          │ samples, drafts+scores, │
-                              │ SentenceStructure, │          │ config, ingest runs     │
-                              │ Punctuation,Intent │          └─────────────────────────┘
-                              └────────────────────┘
+- tell dana launch on track, deck thurs
 ```
 
-`CONTRACTS.md` is the binding spec for every boundary: the HTTP API, the hotkey loop, the graph schema
-and the module layout.
+Press **⌘⇧P**. Polytone replaces it with a finished message written the way *you* write:
+
+```
+Hey Dana, launch is on track. I'll have the deck to you Thursday.
+```
+
+Polytone isn't a generic "make this sound professional" tool. It learns your sentence length,
+punctuation, openers, casing and favourite words from text **you** wrote, and holds every draft
+to those habits.
+
+## Features
+
+- **Works in any app.** One shortcut rewrites the text you're editing in place. Your clipboard is
+  put back afterwards.
+- **Learns only from you.** It learns from writing you paste in, your sent Gmail, Wispr Flow
+  dictations, files you drop in a folder and, if you opt in, messages you type and send.
+- **Never learns from AI text.** A built-in firewall rejects Polytone's own drafts and other
+  AI-written text, so your style model never drifts toward "AI voice".
+- **Personas.** Boss, Friend, Investor and Default ship built in, and you can add your own.
+  Each one keeps its own register, so messages to your manager don't sound like texts to a friend.
+- **Gets better as you use it.** When you edit a draft before sending, Polytone learns from what
+  you changed. Recent writing counts more than old writing, and a weekly check rolls back changes
+  that made drafts worse.
+- **Shows you your style.** The Style tab maps the words, openers and punctuation that make your
+  writing yours.
+- **Private by design.** Everything runs on your Mac and everything you wrote is encrypted at rest.
+  Only the text needed to write a draft goes to the model.
+
+## How it works
+
+```
+  your own writing ──▶ firewall ──────────▶ style model (on your Mac)
+  Gmail, Wispr, …      rejects AI text            │ style rules + a few excerpts
+                                                  ▼
+  rough note ──⌘⇧P──▶ Claude writes the draft ──▶ pasted in place
+                                                  │ you edit before sending
+  style model ◀──── learns from what you changed ◀┘
+```
+
+1. **Learn.** Polytone reads text you wrote and builds a model of your style, separately for each persona.
+2. **Rewrite.** When you press the shortcut, it sends your note, your style rules and a few short
+   excerpts of your own writing to Claude, and pastes the result back.
+3. **Improve.** If you edit the draft before sending, Polytone learns from the difference.
+
+The [architecture doc](docs/ARCHITECTURE.md) explains each step in detail.
+
+## Requirements
+
+- A recent version of macOS
+- An [Anthropic API key](https://console.anthropic.com/) for real drafts. Without one, Polytone
+  runs on an offline mock model, which is fine for trying it out.
+- These tools, to build and run the app:
+
+| Tool | Install |
+|---|---|
+| [Docker Desktop](https://www.docker.com/products/docker-desktop/) | Download from the site; it stores your style model |
+| [uv](https://docs.astral.sh/uv/) | `brew install uv` |
+| Node.js 20+ and [pnpm](https://pnpm.io/) | `brew install node pnpm` |
+| [Rust](https://www.rust-lang.org/tools/install) (stable) | `curl https://sh.rustup.rs -sSf \| sh` |
+
+> Polytone is an early preview and there's no signed download yet, so you build it from source.
+> It takes one command.
 
 ## Quick start
 
-Requirements: macOS, Docker, [uv](https://docs.astral.sh/uv/), Node 20+ with pnpm, and Rust (stable).
-
 ```bash
-cp .env.example .env                              # then set ANTHROPIC_API_KEY=sk-ant-…
-npm run tauri:dev                                 # or: pnpm start
+git clone https://github.com/cubeerea/polytone.git
+cd polytone
+cp .env.example .env          # open .env and set ANTHROPIC_API_KEY=sk-ant-…
+pnpm start                    # or: npm run tauri:dev
 ```
 
-`npm run tauri:dev` runs `scripts/dev.sh`, which installs missing JS/Python deps, starts Docker and Neo4j,
-stops leftovers from an earlier run (a stale backend or a vite still holding port 1420), then runs
-`pnpm tauri dev`. The app starts the backend itself (output in the terminal, or `data/backend.log` when
-launched from Finder) and the backend exits when the app does, even if the app is force-quit.
+`pnpm start` installs anything missing, starts Docker and the style database, and opens Polytone.
+The first build takes a few minutes. Polytone then lives in your menu bar. Closing the window
+keeps it running, and opening the app again brings the window back.
 
-Launching opens the Polytone window; it also lives in the menu bar. Closing the window keeps it running.
-Opening the app again while it runs brings the window back instead of starting a second copy. Without
-Accessibility permission it opens on the Settings tab with a three-step permissions guide.
+<details>
+<summary>Prefer to keep your API key out of files?</summary>
 
-- With no `ANTHROPIC_API_KEY` (or with `POLYTONE_LLM=mock`), a deterministic **mock LLM** produces drafts.
-  This is useful for development. If you set `POLYTONE_LLM=anthropic` without a key, `/generate` answers
-  `502` and the header shows "no API key". Polytone never quietly falls back to the mock.
-- To run the backend yourself: `uv run polytone-api`. The app detects a running backend and
-  uses it. A backend the app spawned is stopped when the app quits.
-- Release build: `pnpm tauri build --bundles app` produces `src-tauri/target/release/bundle/macos/Polytone.app`.
-  The DMG target scripts Finder through AppleEvents, so it needs an interactive session. When the app
-  runs outside the repo, set `POLYTONE_REPO=/path/to/polytone` so it can find the backend.
-
-### Granting macOS permissions
-
-Polytone has to send ⌘C/⌘A/⌘V to other apps, so macOS has to trust it:
-
-1. **System Settings → Privacy & Security → Accessibility**: enable **Polytone**. Under
-   `pnpm tauri dev`, enable the app that launches it (your terminal, or the `polytone` dev binary).
-   Settings → *Open System Settings* takes you straight to the pane.
-2. **Privacy & Security → Input Monitoring**: enable it too if the hotkey fires but nothing is copied or pasted.
-3. Return to Polytone. The card re-checks when the window regains focus. Some macOS versions only
-   apply the change after you relaunch the app.
-
-Rebuilt dev binaries change their code signature, so macOS may ask you to grant the permission again.
-To reset it, toggle the entry off and on, or remove it with `−` and add it back.
-
-## Using it
-
-1. Type or select rough intent in any text field.
-2. Press **⌘⇧P**. You can change the hotkey in Settings or pause it from the tray or Settings.
-3. Polytone copies the selection. If nothing is selected it copies the whole field, and if the field is
-   empty it uses what was already on the clipboard. It then generates a draft, pastes it over the text,
-   and puts your clipboard back.
-
-The whole loop should finish within 5 s. If generation fails or times out, you get a notification and
-your text is left untouched. Inject mode **Type** types the characters directly, for apps that block paste.
-
-**Clipboard restore.** On macOS, Polytone snapshots every pasteboard item in every representation
-(plain and rich text, images, file references, app-private types) and writes it all back afterwards.
-Two limitations: lazily promised data (file promises) is kept only if the source app hands it over when
-asked, and snapshots over 64 MB fall back to text, then image. If the clipboard can't be read at all,
-Polytone leaves the draft on it instead of wiping it.
-
-## Ingestion sources
-
-Everything goes through the same pipeline, `validate → firewall → extract → write_graph → record`.
-Quoted reply chains and signatures are stripped first, and only the cleaned text is learned and stored.
-
-| Source | How | Notes |
-|---|---|---|
-| **Manual** | Feed tab: paste text, tag a persona, ⌘↵ | `POST /ingest/manual` |
-| **Gmail** | Put a Google OAuth *Desktop app* client JSON at `./credentials.json` (`GMAIL_CREDENTIALS_PATH`), then run `uv run python -m backend.mcp_servers.gmail_outbound auth` once | Searches `in:sent from:me` only. Each message must carry the `SENT` label and come from your address. Incremental. Press *Run* in Feed, or `… gmail_outbound sync`. |
-| **Wispr Flow** | Automatic and live if Wispr Flow is installed: the backend watches its local history DB (`~/Library/Application Support/Wispr Flow/flow.sqlite`, read from a snapshot copy) and learns each dictation ~1.5 s after it lands | **Raw** ASR transcripts only, never the formatted or AI-polished text, under the `Default` persona tagged `kind: "spoken"`. Archived dictations count. `POLYTONE_WISPR_LIVE=0` stops the live watch (*Run* still works); `POLYTONE_WISPR_LOCAL=0` turns local history off. Optional WebSocket: `WISPR_WS_URL` + `WISPR_API_KEY`. |
-| **Watch folder** | Drop files into `data/inbox` (`POLYTONE_WATCH_DIR`). The backend watches it continuously (`POLYTONE_WATCHER=0` turns that off) | `.txt`/`.md` (paragraphs), `.mbox` (only messages **From:** one of `POLYTONE_USER_EMAILS`, comma-separated, or your Gmail address), iMessage `chat.db` and similar SQLite dumps (`is_from_me = 1` rows only). Files are tracked by sha256, so rescans are idempotent. |
-
-Each source module is also a stdio MCP server. See `backend/mcp_servers/README.md`.
-
-### The firewall guarantee
-
-**Generated text never trains the model of your style.** Drafts are written to SQLite `drafts` only,
-never to the graph. Every incoming sample has to pass `ingestion/firewall.py`, which rejects, and logs a
-reason for:
-
-- anything flagged `generated` or with `origin="polytone"`
-- inbound mail, and any per-source provenance failure (Gmail not sent by you, a Wispr transcript that
-  isn't raw, an `.mbox` message not from you)
-- text that matches a stored draft: same sha256, a draft contained in the text or the text contained in a
-  draft, shingle Jaccard ≥ 0.8, or ≥ 80% of a draft's shingles present
-- duplicates and fragments (< 3 words or < 10 characters)
-
-If you paste one of Polytone's own drafts into Feed, you get `rejected: matches a Polytone-generated draft`.
-
-Wispr Flow's output is kept out the same way: when you dictate into Slack and press Return, typing
-capture sees Wispr's AI-formatted text in the message. Polytone removes every span Wispr inserted in
-that app in the last 30 minutes (verbatim, or ≥ 80% of its shingles) and learns only what you typed
-around it. If nothing learnable is left, the message is rejected as `wispr_inserted`. Your dictation is
-still learned, from its raw transcript.
-
-## Learning from your edits
-
-When you edit an injected draft before sending it, typing capture reports what you actually sent.
-Polytone finds the draft it came from (shared 3-word shingles) and learns only the *differences*:
-sentences you shortened, punctuation you removed or added, contractions, casing, and words you keep
-deleting. These are smoothed per persona (recent edits count most). After 3 edits they adjust the
-style rules: length and rates move by at most 30%, a mark you keep deleting becomes "never use",
-and pet words you remove go on a "do not use" list. The sent text itself is never learned (it is
-partly Polytone's), so the style graph and samples are untouched. `GET /learning` shows what is
-currently being corrected; deleting a persona or wiping data clears its corrections.
-
-### Recent writing counts most
-
-Your style drifts, so the style graph forgets slowly: every habit it learned (a word, an opener, a
-punctuation mark, how long your sentences are) is weighted by how recently you wrote it, with a half-life of
-`POLYTONE_DECAY_HALF_LIFE_DAYS` (default 90 days: something you wrote three months ago counts half as much as
-something you wrote today, six months ago a quarter). Nothing has to be re-learned and nothing is rewritten on
-each read — and if you simply stop writing for a while, your style stays exactly as it was, since only the
-*relative* age of your samples matters. Once a day (and at start-up) the backend drops word pairs that have
-faded to almost nothing, so long-abandoned habits also stop taking up space. Set the variable to `0` to give
-every sample the same weight forever. Changing it later is safe: the graph is converted to the new half-life
-at the next start.
-
-## Does learning help?
-
-Once a week (config `learning_eval_days`, default 7; 0 = only by hand) Polytone checks that what it
-learned made drafts sound more like you. For each persona with at least 5 samples *and* something new
-since the last check (a new sample or a learned edit), it writes drafts for six fixed, neutral test
-requests three ways: with today's rules (style graph + edit corrections), with the graph alone, and with
-the rules it last accepted. Each set is scored against your 20 newest samples. Today's rules are kept
-unless another set wins by at least 2 points; if the older rules win, drafts go back to them (rolled
-back) until the next check, and if the graph alone wins, edit corrections are paused. Small differences
-never flip the decision. With a real model a check costs up to 18 short calls per persona.
-
-The Drafts page shows a small **Learning** panel: the style match this week vs. last, the current
-decision (with **Undo** for a rollback or pause), what your edits are correcting, and **Evaluate now**.
-Polytone also notes what happened to each draft: inserted (accepted), re-run with the hotkey
-(regenerated) or edited before sending; sample excerpts shaped like the drafts you kept are preferred
-as examples in the prompt (the examples are still only your own writing). Evaluation snapshots hold
-derived rules, so they are encrypted like the graph, survive the retention purge, and are deleted by a
-wipe or with their persona.
-
-## Style score
-
-`evaluation/style_distance.py` compares a draft with the persona's human samples on sentence length,
-punctuation, lexical choice, function words and (with `POLYTONE_EMBEDDINGS=qwen`) a Qwen3-Embedding style
-vector. Each component is a 0–1 distance. The overall score is `100 × (1 − distance)`, plus a
-`confidence` (low/medium/high) that reflects how many samples back it and how long the draft is.
-
-Scoring runs in a background thread, so it never delays a draft. The embedding model is warmed in the
-background when the backend starts (from the local Hugging Face cache, with no network round trips once it
-has been downloaded). Run `uv run python -m backend.evaluation.calibrate` for sanity numbers.
-
-## Configuration
-
-`.env` (see `.env.example`): `ANTHROPIC_API_KEY`, `POLYTONE_MODEL` (default `claude-sonnet-5-5`),
-`POLYTONE_LLM` (`anthropic`/`mock`), `POLYTONE_EFFORT` (`low` default; higher = more thinking, slower drafts), `NEO4J_*`, `POLYTONE_API_PORT` (8765), `POLYTONE_DATA_DIR`,
-`POLYTONE_WATCH_DIR`, `POLYTONE_USER_EMAILS`, `POLYTONE_WISPR_LOCAL`, `POLYTONE_WISPR_LIVE`, `POLYTONE_WATCHER`,
-`POLYTONE_EMBEDDINGS` (`qwen`/`none`), `POLYTONE_DECAY_HALF_LIFE_DAYS` (90; 0 = no recency weighting), `GMAIL_*`, `WISPR_*`, `POLYTONE_API_TOKEN` (normally set by the app),
-`POLYTONE_DATA_KEY` (base64 32-byte key overriding the Keychain — tests/CI only). App-side variables: `POLYTONE_REPO` (backend
-location for a bundled app) and `POLYTONE_START_HIDDEN=1` (start in the menu bar only; the window still opens when permissions are missing).
-
-## Security and privacy
-
-Full spec: `CONTRACTS.md` → *Security*. In short:
-
-- **Encrypted at rest.** Everything you wrote (samples, drafts and their intents, post-inject edits,
-  provenance) is stored in SQLite as AES-256-GCM ciphertext (`enc1:…`), and the Neo4j style graph holds
-  only blind indexes (`idx1:…`, keyed hashes used for lookups) plus ciphertext — never your words. The
-  256-bit key lives in the macOS Keychain (`com.polytone.app` / `data-key-v1`) and is created on first
-  start. **Back it up with the data**: without the Keychain item the data can't be read. On the first start
-  of this version, existing plaintext data is encrypted in place (SQLite: one transaction per table, then
-  `VACUUM`; Neo4j: batched and resumable) and recorded as `migration.encrypted` in the audit log. Neo4j does
-  not compact its store files, so old plaintext pages may remain on disk until Neo4j reuses them; for a
-  clean store, `POST /data/wipe` and re-ingest, or recreate the `polytone_neo4j_data` volume.
-- **Locked API.** Every endpoint except `GET /health` needs a bearer token. The Rust shell holds the app
-  token (`POLYTONE_API_TOKEN`, also written to `data/.api_token`, mode 0600); the UI gets a short-lived
-  session after Touch ID / your Mac password and locks after `lock_idle_minutes` (Settings, default 15) of
-  inactivity, on screen lock and on sleep. Requests with a non-loopback `Host` are refused.
-  To call the API by hand: `curl -H "Authorization: Bearer $(cat data/.api_token)" http://127.0.0.1:8765/stats`.
-- **Audit log.** `data/audit.sqlite3` is an append-only, HMAC-chained log of security events (unlock/lock,
-  denied requests, generations, ingests, config changes, wipes, purges) — counts and ids only, never text.
-  `GET /audit/verify` re-checks the chain and reports the first altered or missing row.
-- **Retention.** `retention_days` (Settings; 0 = keep forever) purges typed / Wispr samples, drafts and
-  edits older than N days, at start and daily. `POST /data/wipe {"confirm":"delete everything"}` deletes
-  all samples, drafts, edits and the style graph.
-- **Network.** Calls to Anthropic and Google require TLS 1.3. `ANTHROPIC_API_KEY` may live in the Keychain
-  instead of `.env`: `security add-generic-password -s com.polytone.app -a anthropic-api-key -w sk-ant-…`
-  (`.env` wins when both are set).
-- **Files.** `data/` is 0700 and its files 0600; `.env` is 0600. Logs never contain your text.
-- **Neo4j password.** `scripts/dev.sh` replaces the shipped `polytone-local` password with a random one on
-  the first run (`scripts/rotate-neo4j-password.sh`; it changes the password in the running container and
-  only then rewrites `NEO4J_PASSWORD` in `.env`). Run the script yourself any time to rotate again, then
-  restart the backend. Neo4j stays bound to 127.0.0.1.
-
-## Running tests
+Store it in the macOS Keychain instead of `.env`:
 
 ```bash
-uv run pytest -q                 # backend: offline (mock LLM, no embeddings); Neo4j tests skip if it's down
-uv run ruff check backend
-pnpm build                       # tsc + vite
-cd src-tauri && cargo test && cargo clippy --all-targets
-cargo test -- --ignored real_pasteboard   # optional: round-trips an image through the real macOS clipboard
+security add-generic-password -s com.polytone.app -a anthropic-api-key -w sk-ant-…
 ```
 
-The Neo4j integration tests never touch your real graph: they skip unless you point them at a scratch container:
-`docker run -d --rm --name polytone-test -p 7688:7687 -e NEO4J_AUTH=neo4j/test-pass neo4j:5-community`, then
-`POLYTONE_TEST_NEO4J_URI=bolt://localhost:7688 uv run pytest -q`.
+If both are set, `.env` wins.
+</details>
 
-Tests and benchmarks never touch the real Keychain (they use a fixed or random `POLYTONE_DATA_KEY`).
+### 1. Allow Polytone to paste for you
 
-Benchmarks (mock LLM, scratch SQLite, never touch `data/`):
+To copy and paste in other apps, Polytone needs macOS's permission. On first launch it opens on
+**Settings** with a short guide.
 
-```bash
-uv run python scripts/bench_generate.py --http                 # per-node p50/p95 of POST /generate
-uv run python scripts/bench_generate.py --neo4j bolt://localhost:7688 --ingest-every 5   # scratch Neo4j (wiped!)
-uv run python scripts/bench_startup.py --embeddings qwen       # launch → /health, → embeddings warm (port 8775)
-```
+1. Open **System Settings → Privacy & Security → Accessibility** and turn on **Polytone**.
+   *Settings → Open System Settings* takes you straight there. When you run from a terminal,
+   enable that terminal app instead.
+2. If the shortcut fires but nothing is copied or pasted, also turn it on under **Input Monitoring**.
+3. Return to Polytone. It re-checks automatically, though some macOS versions need the app relaunched.
+
+### 2. Teach it your style
+
+Polytone writes like you once it has seen some of your writing. A few dozen messages per persona
+is a good start, and more is better. Pick any of these on the **Style** tab under **Learns from**:
+
+| Source | How to set it up |
+|---|---|
+| **Pasted writing** | **Add…**, paste emails, messages or notes you wrote, choose a persona and press ⌘↵. |
+| **Gmail (sent mail)** | Run the setup once (see below), then press **Run** to import your sent mail. Inbound mail is never used. |
+| **Wispr Flow** | Automatic if Wispr Flow is installed. Polytone learns each dictation from its raw transcript, never the AI-polished version. |
+| **Watch folder** | Drop `.txt`, `.md`, `.mbox` or iMessage `chat.db` exports into `data/inbox`. Only messages you sent are kept. |
+| **What you type** *(opt-in)* | **Settings → Learning → Learn from what I type.** Learns messages you send in the apps you allow: Slack, Messages, Mail, Notes and others. Off by default. Password fields are never read. |
+
+<details>
+<summary>Connecting Gmail</summary>
+
+1. In [Google Cloud Console](https://console.cloud.google.com/apis/credentials), create an OAuth
+   client of type **Desktop app** with the Gmail API enabled, and download its JSON.
+2. Save it as `credentials.json` in the repo folder.
+3. Run this once and approve access in the browser:
+   ```bash
+   uv sync --extra gmail
+   uv run python -m backend.mcp_servers.gmail_outbound auth
+   ```
+4. Press **Run** next to Gmail on the Style tab. Later runs import only new mail.
+
+Polytone reads only mail in your Sent folder, from your own address.
+</details>
+
+## Using Polytone
+
+1. Type or select a rough note in any text field.
+2. Press **⌘⇧P**.
+3. Polytone replaces the selection with a draft. If nothing is selected it uses the whole field,
+   and if the field is empty it uses what's on your clipboard.
+
+A draft takes a few seconds. If something goes wrong, you get a notification and your text is left as it was.
+
+**Personas.** Choose the active persona from the menu-bar icon. Add your own under
+**Settings → Personas**, each with a one-line tone ("warm, brief, no exclamation marks"). Deleting
+a persona moves its samples to Default, so nothing you wrote is lost.
+
+**Tabs.**
+
+| Tab | What's there |
+|---|---|
+| **Drafts** | Every draft with what you typed, a 0–100 style-match score, and a **Learning** panel showing what your edits are teaching it. |
+| **Style** | A map of your writing habits, plus the sources Polytone learns from. |
+| **Settings** | Shortcut, insert mode, draft speed, personas, typing capture, privacy and permissions. |
+
+**Settings you'll likely touch.**
+
+- **Shortcut**: record a different key combo, or pause it. Pausing also stops typing capture.
+- **Insert by**: *Paste* (default) or *Type*, for apps that block pasting.
+- **Draft quality**: *Best* (Claude Sonnet, closest to what you wrote) or *Fast* (Claude Haiku, about 40% quicker).
+- **Auto-lock after** and **Delete captured text after**: under Privacy & security.
+
+Advanced options live in `.env` and are listed in the [configuration reference](docs/CONFIGURATION.md).
+
+## Privacy
+
+- **On your Mac.** Your writing samples, drafts and style model stay on your machine. Nothing is
+  uploaded except what's needed to write a draft.
+- **What goes to Anthropic.** Each draft request sends your rough note, your style rules and two or
+  three short excerpts of your own writing. Gmail import talks to Google. All of it goes over TLS 1.3.
+- **Encrypted at rest.** Everything you wrote is encrypted with a key kept in your macOS Keychain.
+  The style database stores only scrambled lookups, never your words. **Back up the Keychain item
+  along with `data/`**, because without it the data can't be read.
+- **Locked.** Opening the app needs Touch ID or your Mac password, and it locks again when you're
+  idle, when the screen locks and when the Mac sleeps.
+- **You decide how long data is kept.** Set a retention period in Settings, or wipe everything at once.
+- **Your data isn't used to train AI models.** Polytone only *reads* your writing to build its own
+  local rules, and never learns from text a model wrote.
+
+The full security model is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#security-and-privacy).
 
 ## Troubleshooting
 
-- **Header says "offline"**: the backend isn't running. Start it with `uv run polytone-api` and read its
-  output. The app autostart looks for `uv` on PATH, in `~/.local/bin`, `~/.cargo/bin` and `/opt/homebrew/bin`.
-- **"no graph" / "memory graph"**: Neo4j is unreachable (`docker compose up -d`, then `docker ps`). The
-  backend falls back to an in-memory graph that is **not persisted**.
-- **"no API key" / hotkey reports "The model failed"**: add `ANTHROPIC_API_KEY` to `.env` and restart the
-  backend, or set `POLYTONE_LLM=mock`.
-- **Hotkey does nothing**: check Accessibility and Input Monitoring (above), and make sure the hotkey
-  isn't paused (tray → *Pause hotkey*, or Settings → Hotkey). Another app may already own the shortcut;
-  pick a different one in Settings.
-- **Draft pasted, but my clipboard changed**: see *Clipboard restore* above. Only content that
-  couldn't be read is left replaced.
-- **Gmail shows "needs credentials"**: follow the exact command shown in the Feed row.
-- **First draft's score is missing**: scores arrive a moment after the draft. The Scoreboard refreshes
-  every 15 s, or after each hotkey run.
-- **Embeddings unavailable**: install with `uv sync --extra embeddings`. The model downloads once from
-  Hugging Face. Set `POLYTONE_EMBEDDINGS=none` for stylometric-only scoring.
+| Symptom | Fix |
+|---|---|
+| Header says **offline** | The backend isn't running. Quit and reopen Polytone, or run `uv run polytone-api` to see the error. |
+| Header says **memory graph** | Docker or the style database isn't running, so nothing learned is being saved. Start Docker Desktop, then run `docker compose up -d`. |
+| **No API key** / "The model failed" | Add `ANTHROPIC_API_KEY` to `.env` and restart Polytone. |
+| Shortcut does nothing | Check Accessibility and Input Monitoring (see above) and that the shortcut isn't paused. Another app may own ⌘⇧P, so try a different shortcut. |
+| macOS keeps asking for permission again | Development builds change signature on every rebuild. Toggle Polytone off and on in Accessibility. |
+| Text pasted but my clipboard changed | Polytone restores every clipboard format it can read. Very large items (over 64 MB) and some file promises can't be kept. |
+| Gmail shows **needs credentials** | Follow the [Gmail setup](#2-teach-it-your-style). The row shows the exact command to run. |
+| A draft's score is missing | Scores arrive a moment after the draft. |
+| "rejected: matches a Polytone-generated draft" | Working as intended: Polytone won't learn from its own output. |
+
+Still stuck? [Open an issue](https://github.com/cubeerea/polytone/issues) with the output of
+`uv run polytone-api`, or `data/backend.log` when launched from Finder.
+
+## FAQ
+
+**Does it work on Windows or Linux?** Not yet. Capturing and pasting text relies on macOS accessibility APIs.
+
+**Can I use a different model?** Drafts use Claude through the Anthropic API. Set `POLYTONE_MODEL`
+to pick another Claude model. See the [configuration reference](docs/CONFIGURATION.md).
+
+**How much does it cost?** Each draft is one short Claude request. Fast mode (Haiku) costs less.
+The optional weekly quality check makes up to 18 short requests per persona.
+
+**Will it make things up?** It's instructed to keep your content and change only the wording. Fast
+mode may add a few words of its own, so use *Best* when exact meaning matters.
+
+**How do I start over?** Settings → Privacy & security → **Delete all learned data**. This deletes all samples,
+drafts and the style model.
+
+## Documentation
+
+| Doc | For |
+|---|---|
+| [Architecture](docs/ARCHITECTURE.md) | How Polytone works: components, the learning pipeline, the firewall, scoring, security |
+| [Configuration](docs/CONFIGURATION.md) | Every environment variable and setting |
+| [Development](docs/DEVELOPMENT.md) | Building, testing, benchmarks, release builds and contributing |
+| [Contracts](CONTRACTS.md) | The binding spec: HTTP API, hotkey loop, graph schema, module layout |
+| [MCP servers](backend/mcp_servers/README.md) | Using Polytone's ingestion sources from an MCP client |
+
+## Contributing
+
+Bug reports and ideas are welcome in [issues](https://github.com/cubeerea/polytone/issues). To work
+on the code, start with [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
+
+## License
+
+No license has been chosen yet. Until one is added, all rights are reserved.
