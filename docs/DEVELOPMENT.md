@@ -106,7 +106,7 @@ implementor/evaluator pair:
 Failures and rejections are fed back until the task passes or hits `max_iterations`.
 
 ```bash
-git worktree add ../polytone-agent main     # run it in its own worktree, inside tmux
+git worktree add --detach ../polytone-agent origin/main   # its own worktree; run it inside tmux
 cd ../polytone-agent
 python3 orchestrator.py new "Task title" --details "Acceptance criteria: …"
 python3 orchestrator.py run --watch --pr --routine
@@ -116,4 +116,4 @@ python3 orchestrator.py status
 With `--routine`, it also queues routine work when idle (a validation sweep, then tests, then a bug
 hunt), every 6 hours by default. It queues none while 2 routine PRs are open. Agents commit only on
 `agent/<task>`, and they never edit `validate.py`, `orchestrator.py`, `progress.json` or `.github/`.
-See [`CLAUDE.md`](../CLAUDE.md).
+See [`CLAUDE.md`](../CLAUDE.md), and [AGENT_LOOP.md](AGENT_LOOP.md) for a full guide you can reuse in other projects.

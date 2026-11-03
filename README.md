@@ -239,6 +239,7 @@ drafts and the style model.
 | [Architecture](docs/ARCHITECTURE.md) | How Polytone works: components, the learning pipeline, the firewall, scoring, security |
 | [Configuration](docs/CONFIGURATION.md) | Every environment variable and setting |
 | [Development](docs/DEVELOPMENT.md) | Building, testing, benchmarks, release builds and contributing |
+| [Agent loop](docs/AGENT_LOOP.md) | Setting up the always-on coding agent loop, in this or any other project |
 | [Contracts](CONTRACTS.md) | The binding spec: HTTP API, hotkey loop, graph schema, module layout |
 | [MCP servers](backend/mcp_servers/README.md) | Using Polytone's ingestion sources from an MCP client |
 
