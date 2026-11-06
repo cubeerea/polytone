@@ -5,9 +5,39 @@ from backend.langgraph.generate_graph import (
     run_generation,
 )
 from backend.langgraph.ingest_graph import run_ingest
-from backend.langgraph.prompts import build_system_prompt
+from backend.langgraph.prompts import (
+    app_context_hint,
+    build_system_parts,
+    build_system_prompt,
+)
 
 from .conftest import HUMAN_SAMPLES
+
+
+def test_app_context_hint_categories():
+    assert app_context_hint(None) is None and app_context_hint("") is None
+    assert app_context_hint("Slack") == (
+        "Destination: Slack (chat). Keep it short — 1-3 sentences, no greeting line, no sign-off.")
+    assert app_context_hint("Microsoft Teams").startswith("Destination: Microsoft Teams (chat).")
+    assert app_context_hint("com.apple.mail").startswith("Destination: com.apple.mail (email).")
+    assert "never invent names" in app_context_hint("Gmail")
+    assert app_context_hint("LinkedIn") == "Destination: LinkedIn (social post). Punchy and self-contained."
+    assert app_context_hint("Notion").startswith("Destination: Notion (document).")
+    assert app_context_hint("Figma") == "Destination app: Figma."  # unknown app: name only
+
+
+def test_app_hint_stays_out_of_cached_prefix():
+    # the stable part is the prompt-cache prefix: it must not change with the destination app
+    c = dict(empty_constraints(), sample_count=5, avg_sentence_len=8.0)
+    stable_slack, volatile_slack = build_system_parts(c, "Boss", "Slack", ["ok shipping it now"])
+    stable_mail, volatile_mail = build_system_parts(c, "Boss", "Mail", ["ok shipping it now"])
+    assert stable_slack == stable_mail
+    assert "Destination" not in stable_slack and "Slack" not in stable_slack
+    assert volatile_slack.startswith("REAL EXAMPLES")
+    assert "<example>ok shipping it now</example>\n\nCONTEXT: Destination: Slack (chat)." in volatile_slack
+    assert volatile_mail.endswith(app_context_hint("Mail"))
+    assert build_system_parts(c, "Boss", None, None)[1] == ""
+    assert build_system_parts(c, "Boss", "Slack", None)[1] == "CONTEXT: " + app_context_hint("Slack")
 
 
 def test_normalize_intent():
