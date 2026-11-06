@@ -727,19 +727,24 @@ class Database:
             rows = c.execute("SELECT text FROM drafts ORDER BY rowid").fetchall()
         return [_dec(r[0], "drafts.text") for r in rows]
 
-    def draft_watermark(self) -> tuple[int, int]:
-        """``(row count, max rowid)`` of ``drafts`` — changes whenever a draft is added/removed."""
+    def draft_watermark(self) -> tuple[int, int, str]:
+        """``(row count, max rowid, draft_id at max rowid)`` of ``drafts`` — changes whenever a
+        draft is added/removed. The id is needed because SQLite reuses the rowids of deleted rows:
+        after a wipe the next draft gets rowid 1 again, so count and max rowid alone can repeat."""
         with self.connect() as c:
-            n, top = c.execute("SELECT COUNT(*), COALESCE(MAX(rowid), 0) FROM drafts").fetchone()
-        return int(n), int(top)
+            n, top, top_id = c.execute(
+                "SELECT COUNT(*), COALESCE(MAX(rowid), 0),"
+                " (SELECT draft_id FROM drafts ORDER BY rowid DESC LIMIT 1) FROM drafts"
+            ).fetchone()
+        return int(n), int(top), top_id or ""
 
-    def drafts_since(self, rowid: int = 0) -> list[tuple[int, str, str]]:
-        """``(rowid, sha256, text)`` of drafts with ``rowid > rowid``, oldest first."""
+    def drafts_since(self, rowid: int = 0) -> list[tuple[int, str, str, str]]:
+        """``(rowid, sha256, text, draft_id)`` of drafts with ``rowid > rowid``, oldest first."""
         with self.connect() as c:
             rows = c.execute(
-                "SELECT rowid, sha256, text FROM drafts WHERE rowid > ? ORDER BY rowid", (int(rowid),)
+                "SELECT rowid, sha256, text, draft_id FROM drafts WHERE rowid > ? ORDER BY rowid", (int(rowid),)
             ).fetchall()
-        return [(int(r[0]), r[1], _dec(r[2], "drafts.text")) for r in rows]
+        return [(int(r[0]), r[1], _dec(r[2], "drafts.text"), r[3]) for r in rows]
 
     def draft_hashes(self) -> set[str]:
         with self.connect() as c:
